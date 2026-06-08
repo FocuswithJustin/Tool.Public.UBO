@@ -17,9 +17,9 @@ vm-build:
 	bash tests/build-vm.sh
 
 # test-integration: boot the VM and run integration tests against it.
-# Requires: make vm-build && make build
-test-integration: build
-	PROJECT_ROOT=$(CURDIR) go test -v -tags integration -timeout 20m ./tests/
+# Requires: make vm-build.  Runs inside nix-shell so wg/ssh-keygen are in PATH.
+test-integration:
+	nix-shell --run "go build -o $(BINARY) . && PROJECT_ROOT=$(CURDIR) go test -v -tags integration -timeout 20m ./tests/"
 
 clean:
 	rm -f $(BINARY)
