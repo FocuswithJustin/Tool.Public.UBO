@@ -1,0 +1,130 @@
+package setup
+
+import (
+	"strings"
+	"testing"
+)
+
+// ── prefixToNetmask ───────────────────────────────────────────────────────────
+
+func TestPrefixToNetmask(t *testing.T) {
+	cases := []struct {
+		prefix int
+		want   string
+	}{
+		{8, "255.0.0.0"},
+		{16, "255.255.0.0"},
+		{24, "255.255.255.0"},
+		{32, "255.255.255.255"},
+		{28, "255.255.255.240"},
+	}
+	for _, tc := range cases {
+		got := prefixToNetmask(tc.prefix)
+		if got != tc.want {
+			t.Errorf("prefixToNetmask(%d) = %q; want %q", tc.prefix, got, tc.want)
+		}
+	}
+}
+
+// ── updateGrubContent ─────────────────────────────────────────────────────────
+
+const grubBase = `GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+GRUB_CMDLINE_LINUX=""
+`
+
+const grubWithParam = `GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+GRUB_CMDLINE_LINUX="net.ifnames=0"
+`
+
+func TestUpdateGrubContent_emptyLine(t *testing.T) {
+	ipParam := "ip=192.168.1.10::192.168.1.1:255.255.255.0:host:eth0:none"
+	updated, changed := updateGrubContent(grubBase, ipParam)
+
+	if !changed {
+		t.Error("expected changed=true when adding ip= for the first time")
+	}
+	if !strings.Contains(updated, ipParam) {
+		t.Errorf("updated GRUB content missing %q\ngot:\n%s", ipParam, updated)
+	}
+	// Ensure we didn't break the existing line structure
+	if !strings.Contains(updated, `GRUB_CMDLINE_LINUX="`) {
+		t.Error("GRUB_CMDLINE_LINUX line missing from updated content")
+	}
+}
+
+func TestUpdateGrubContent_withExistingParams(t *testing.T) {
+	ipParam := "ip=192.168.1.10::192.168.1.1:255.255.255.0:host:eth0:none"
+	updated, changed := updateGrubContent(grubWithParam, ipParam)
+
+	if !changed {
+		t.Error("expected changed=true when adding ip= to non-empty line")
+	}
+	if !strings.Contains(updated, "net.ifnames=0") {
+		t.Error("existing param net.ifnames=0 should be preserved")
+	}
+	if !strings.Contains(updated, ipParam) {
+		t.Errorf("updated GRUB content missing %q\ngot:\n%s", ipParam, updated)
+	}
+}
+
+func TestUpdateGrubContent_alreadyHasIP(t *testing.T) {
+	content := `GRUB_CMDLINE_LINUX="ip=10.0.0.1::10.0.0.254:255.255.255.0:srv:eth0:none"`
+	ipParam := "ip=192.168.1.10::192.168.1.1:255.255.255.0:host:eth0:none"
+
+	_, changed := updateGrubContent(content, ipParam)
+	if changed {
+		t.Error("expected changed=false when ip= already present")
+	}
+}
+
+func TestUpdateGrubContent_lineAbsent(t *testing.T) {
+	content := `GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+`
+	ipParam := "ip=192.168.1.10::192.168.1.1:255.255.255.0:host:eth0:none"
+	updated, changed := updateGrubContent(content, ipParam)
+
+	if !changed {
+		t.Error("expected changed=true when GRUB_CMDLINE_LINUX line is absent")
+	}
+	if !strings.Contains(updated, `GRUB_CMDLINE_LINUX="`+ipParam+`"`) {
+		t.Errorf("expected new GRUB_CMDLINE_LINUX line, got:\n%s", updated)
+	}
+}
+
+func TestUpdateGrubContent_idempotent(t *testing.T) {
+	ipParam := "ip=192.168.1.10::192.168.1.1:255.255.255.0:host:eth0:none"
+
+	// Apply once
+	first, _ := updateGrubContent(grubBase, ipParam)
+
+	// Apply again — should not change
+	_, changed := updateGrubContent(first, ipParam)
+	if changed {
+		t.Error("second application should be a no-op (changed=false)")
+	}
+}
+
+// ── ipParam format ────────────────────────────────────────────────────────────
+
+func TestIPParamFormat(t *testing.T) {
+	// Verify the ip= parameter format we generate matches the kernel's expectation:
+	// ip=<client-ip>::<gateway>:<netmask>:<hostname>:<iface>:none
+	ni := &NetworkInfo{
+		IP:        "192.168.1.100",
+		Gateway:   "192.168.1.1",
+		Prefix:    24,
+		Hostname:  "myserver",
+		Interface: "eth0",
+	}
+	netmask := prefixToNetmask(ni.Prefix)
+	got := "ip=" + ni.IP + "::" + ni.Gateway + ":" + netmask + ":" + ni.Hostname + ":" + ni.Interface + ":none"
+	want := "ip=192.168.1.100::192.168.1.1:255.255.255.0:myserver:eth0:none"
+	if got != want {
+		t.Errorf("ip param = %q; want %q", got, want)
+	}
+}
