@@ -172,9 +172,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				return m, tea.Quit
-			case "n", "N", "esc", "ctrl+c":
+			case "n", "N", "esc":
 				m.confirmQuit = false
 				return m, nil
+			case "ctrl+c":
+				// Force quit without saving
+				return m, tea.Quit
 			case "enter":
 				// Default Y — save
 				if err := m.save(); err != nil {

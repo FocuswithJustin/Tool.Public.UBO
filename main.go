@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -108,9 +109,21 @@ func cmdInit(cfgPath string) error {
 	return nil
 }
 
+// loadConfig wraps config.Load with a more helpful error when the file is absent.
+func loadConfig(cfgPath string) (*config.Config, error) {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("config file %q not found\nRun 'ubo init' to create one, or 'ubo configure' to open the editor", cfgPath)
+		}
+		return nil, err
+	}
+	return cfg, nil
+}
+
 // cmdRun configures the remote host.
 func cmdRun(ctx context.Context, cfgPath string) error {
-	cfg, err := config.Load(cfgPath)
+	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
 	}
@@ -194,7 +207,7 @@ func cmdRun(ctx context.Context, cfgPath string) error {
 // cmdUnlock brings up the WireGuard tunnel, connects to Dropbear, and unlocks.
 // If changeKey is true it runs cryptsetup luksChangeKey first.
 func cmdUnlock(ctx context.Context, cfgPath string, changeKey bool) error {
-	cfg, err := config.Load(cfgPath)
+	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
 	}
