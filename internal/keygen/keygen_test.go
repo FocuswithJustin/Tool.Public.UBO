@@ -166,8 +166,8 @@ func TestGenerateAll(t *testing.T) {
 		"server_wg_public.key",
 		"client_wg_private.key",
 		"client_wg_public.key",
-		"client_auth",
-		"client_auth.pub",
+		"client_auth_ed25519",
+		"client_auth_ed25519.pub",
 	}
 	for _, name := range wantFiles {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {

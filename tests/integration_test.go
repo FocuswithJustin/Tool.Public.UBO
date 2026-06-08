@@ -117,23 +117,28 @@ func waitForCloudInit(t *testing.T, timeout time.Duration) {
 	t.Fatalf("cloud-init did not complete within %v — VM not accessible via SSH key", timeout)
 }
 
-// sshRun executes a shell command on the test VM and returns trimmed output.
+// sshRun executes a shell command on the test VM and returns trimmed stdout.
+// Stderr is captured separately so SSH client warnings never corrupt the result.
 // The test fails immediately if the command returns a non-zero exit status.
 func sshRun(t *testing.T, cmd string) string {
 	t.Helper()
 	absKey, _ := filepath.Abs(tmpPath("test_ed25519"))
-	out, err := exec.Command("ssh",
+	c := exec.Command("ssh",
 		"-i", absKey,
 		"-p", fmt.Sprintf("%d", testSSHPort),
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=10",
 		"-o", "BatchMode=yes",
+		"-o", "LogLevel=ERROR",
 		"root@127.0.0.1",
 		cmd,
-	).CombinedOutput()
+	)
+	var stderr strings.Builder
+	c.Stderr = &stderr
+	out, err := c.Output() // stdout only — keeps SSH warnings out of return value
 	if err != nil {
-		t.Fatalf("ssh %q failed: %v\nOutput: %s", cmd, err, out)
+		t.Fatalf("ssh %q failed: %v\nStderr: %s", cmd, err, stderr.String())
 	}
 	return strings.TrimSpace(string(out))
 }
@@ -297,5 +302,5 @@ dir = %q
 		t.Error("initramfs does not appear to have been rebuilt after deployment")
 	}
 
-	t.Log("All integration checks passed!")
+	t.Log("Remote verification complete.")
 }

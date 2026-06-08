@@ -33,7 +33,7 @@ func GenerateAll(outputDir string) (*Keys, error) {
 	}
 
 	fmt.Println("[ubo] generating client SSH keypair...")
-	keyPath, pubKey, err := GenerateSSHKeypair("client_auth", outputDir)
+	keyPath, pubKey, err := GenerateSSHKeypair("client_auth_ed25519", outputDir)
 	if err != nil {
 		return nil, fmt.Errorf("client SSH keypair: %w", err)
 	}
