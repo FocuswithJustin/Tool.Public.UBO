@@ -175,3 +175,41 @@ func TestGenerateAll(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerateAll_reuse(t *testing.T) {
+	dir := t.TempDir()
+
+	first, err := GenerateAll(dir)
+	if err != nil {
+		if strings.Contains(err.Error(), "wg genkey") ||
+			strings.Contains(err.Error(), "ssh-keygen") ||
+			strings.Contains(err.Error(), "executable file not found") {
+			t.Skipf("required tools not in PATH; skipping: %v", err)
+		}
+		t.Fatalf("first GenerateAll: %v", err)
+	}
+
+	second, err := GenerateAll(dir)
+	if err != nil {
+		t.Fatalf("second GenerateAll: %v", err)
+	}
+
+	if second.ServerWGPrivate != first.ServerWGPrivate {
+		t.Error("ServerWGPrivate changed on second call")
+	}
+	if second.ServerWGPublic != first.ServerWGPublic {
+		t.Error("ServerWGPublic changed on second call")
+	}
+	if second.ClientWGPrivate != first.ClientWGPrivate {
+		t.Error("ClientWGPrivate changed on second call")
+	}
+	if second.ClientWGPublic != first.ClientWGPublic {
+		t.Error("ClientWGPublic changed on second call")
+	}
+	if second.ClientSSHKeyPath != first.ClientSSHKeyPath {
+		t.Error("ClientSSHKeyPath changed on second call")
+	}
+	if second.ClientSSHPubKey != first.ClientSSHPubKey {
+		t.Error("ClientSSHPubKey changed on second call")
+	}
+}

@@ -18,8 +18,16 @@ type Keys struct {
 	ClientSSHPubKey  string // authorized_keys-format public key
 }
 
-// GenerateAll generates all keypairs into outputDir and returns the key material.
+// GenerateAll returns key material for a ubo deployment.
+// If all key files already exist in outputDir they are loaded and reused —
+// this makes re-running "ubo run" idempotent without invalidating an already-
+// deployed client_wg.conf.  Delete the output directory to force fresh keys.
 func GenerateAll(outputDir string) (*Keys, error) {
+	if keys, err := loadExisting(outputDir); err == nil {
+		fmt.Printf("[ubo] reusing existing keys in %s\n", outputDir)
+		return keys, nil
+	}
+
 	fmt.Println("[ubo] generating server WireGuard keypair...")
 	serverPriv, serverPub, err := GenerateWireGuardKeypair("server_wg", outputDir)
 	if err != nil {
@@ -45,6 +53,52 @@ func GenerateAll(outputDir string) (*Keys, error) {
 		ClientWGPublic:   clientPub,
 		ClientSSHKeyPath: keyPath,
 		ClientSSHPubKey:  pubKey,
+	}, nil
+}
+
+// loadExisting reads all key files from outputDir and returns the Keys, or an
+// error if any file is missing or unreadable.
+func loadExisting(outputDir string) (*Keys, error) {
+	read := func(name string) (string, error) {
+		b, err := os.ReadFile(filepath.Join(outputDir, name))
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+
+	serverPriv, err := read("server_wg_private.key")
+	if err != nil {
+		return nil, err
+	}
+	serverPub, err := read("server_wg_public.key")
+	if err != nil {
+		return nil, err
+	}
+	clientPriv, err := read("client_wg_private.key")
+	if err != nil {
+		return nil, err
+	}
+	clientPub, err := read("client_wg_public.key")
+	if err != nil {
+		return nil, err
+	}
+	sshKeyPath := filepath.Join(outputDir, "client_auth_ed25519")
+	if _, err := os.Stat(sshKeyPath); err != nil {
+		return nil, err
+	}
+	sshPub, err := read("client_auth_ed25519.pub")
+	if err != nil {
+		return nil, err
+	}
+
+	return &Keys{
+		ServerWGPrivate:  serverPriv,
+		ServerWGPublic:   serverPub,
+		ClientWGPrivate:  clientPriv,
+		ClientWGPublic:   clientPub,
+		ClientSSHKeyPath: sshKeyPath,
+		ClientSSHPubKey:  sshPub,
 	}, nil
 }
 
