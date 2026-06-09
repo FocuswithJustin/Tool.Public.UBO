@@ -5,6 +5,46 @@ import (
 	"testing"
 )
 
+// ── isValidInterfaceName ──────────────────────────────────────────────────────
+
+func TestIsValidInterfaceName(t *testing.T) {
+	valid := []string{
+		"eth0", "ens3", "ens192", "wlan0", "lo",
+		"br-lan", "veth0", "bond0", "enp3s0", "wg0",
+		"veth.1", "eth_0",
+	}
+	for _, name := range valid {
+		if !isValidInterfaceName(name) {
+			t.Errorf("isValidInterfaceName(%q) = false; want true", name)
+		}
+	}
+
+	invalid := []string{
+		"",                       // empty
+		strings.Repeat("a", 16), // too long (>15)
+		"eth0; rm -rf /",        // shell injection
+		"eth0\neth1",            // newline
+		"eth0$HOME",             // shell variable
+		"eth0`id`",              // backtick
+		"eth0 eth1",             // space
+		"eth0|cat",              // pipe
+	}
+	for _, name := range invalid {
+		if isValidInterfaceName(name) {
+			t.Errorf("isValidInterfaceName(%q) = true; want false", name)
+		}
+	}
+}
+
+func TestIsValidInterfaceName_maxLength(t *testing.T) {
+	if !isValidInterfaceName(strings.Repeat("a", 15)) {
+		t.Error("15-char name should be valid")
+	}
+	if isValidInterfaceName(strings.Repeat("a", 16)) {
+		t.Error("16-char name should be invalid")
+	}
+}
+
 // ── prefixToNetmask ───────────────────────────────────────────────────────────
 
 func TestPrefixToNetmask(t *testing.T) {

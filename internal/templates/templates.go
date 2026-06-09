@@ -127,6 +127,9 @@ ip link set dev wg0 up
 
 // RenderInitramfsScript renders InitramfsScriptTmpl with d.
 func RenderInitramfsScript(d InitramfsScriptData) (string, error) {
+	if d.ServerIP == "" {
+		return "", fmt.Errorf("RenderInitramfsScript: ServerIP is required")
+	}
 	tmpl, err := template.New("wg-script").Parse(InitramfsScriptTmpl)
 	if err != nil {
 		return "", err
@@ -150,6 +153,12 @@ const DropbearConfigTmpl = `DROPBEAR_OPTIONS="-p {{.ServerTunnelIP}}:{{.Dropbear
 
 // RenderDropbearConfig renders DropbearConfigTmpl with d.
 func RenderDropbearConfig(d DropbearConfigData) (string, error) {
+	if d.ServerTunnelIP == "" {
+		return "", fmt.Errorf("RenderDropbearConfig: ServerTunnelIP is required")
+	}
+	if d.DropbearPort == 0 {
+		return "", fmt.Errorf("RenderDropbearConfig: DropbearPort is required")
+	}
 	tmpl, err := template.New("dropbear-conf").Parse(DropbearConfigTmpl)
 	if err != nil {
 		return "", err

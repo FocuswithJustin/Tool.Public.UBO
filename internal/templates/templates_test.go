@@ -126,6 +126,12 @@ func TestRenderInitramfsScript(t *testing.T) {
 	}
 }
 
+func TestRenderInitramfsScript_emptyServerIP(t *testing.T) {
+	if _, err := RenderInitramfsScript(InitramfsScriptData{}); err == nil {
+		t.Error("expected error for empty ServerIP")
+	}
+}
+
 // ── RenderDropbearConfig ──────────────────────────────────────────────────────
 
 func TestRenderDropbearConfig(t *testing.T) {
@@ -141,6 +147,15 @@ func TestRenderDropbearConfig(t *testing.T) {
 	}
 	if !strings.Contains(got, "-s") {
 		t.Errorf("missing -s (no password) flag in config, got: %s", got)
+	}
+}
+
+func TestRenderDropbearConfig_missingFields(t *testing.T) {
+	if _, err := RenderDropbearConfig(DropbearConfigData{DropbearPort: 22}); err == nil {
+		t.Error("expected error for empty ServerTunnelIP")
+	}
+	if _, err := RenderDropbearConfig(DropbearConfigData{ServerTunnelIP: "10.42.0.1"}); err == nil {
+		t.Error("expected error for zero DropbearPort")
 	}
 }
 
