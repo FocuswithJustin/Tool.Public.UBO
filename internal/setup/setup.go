@@ -187,6 +187,9 @@ func detectNetwork(ctx context.Context, client *gossh.Client, cfg *config.Config
 	if info.Interface == "" {
 		return nil, fmt.Errorf("could not determine network interface; set network.interface in config")
 	}
+	if !isValidInterfaceName(info.Interface) {
+		return nil, fmt.Errorf("detected interface name %q contains unexpected characters; set network.interface in config", info.Interface)
+	}
 
 	// Get prefix length from ip addr if not already set
 	if info.Prefix == 0 && info.IP != "" {
@@ -203,11 +206,15 @@ func detectNetwork(ctx context.Context, client *gossh.Client, cfg *config.Config
 			}
 		}
 		if info.Prefix == 0 {
+			fmt.Printf("[ubo]   warning: could not detect network prefix length, assuming /24\n")
 			info.Prefix = 24
 		}
 	}
 
-	hostnameOut, _ := remote.RunCommand(ctx, client, "hostname")
+	hostnameOut, hostnameErr := remote.RunCommand(ctx, client, "hostname")
+	if hostnameErr != nil {
+		fmt.Printf("[ubo]   warning: hostname detection failed, using fallback \"server\"\n")
+	}
 	info.Hostname = strings.TrimSpace(hostnameOut)
 	if info.Hostname == "" {
 		info.Hostname = "server"
@@ -327,4 +334,19 @@ func updateGrubContent(content, ipParam string) (string, bool) {
 func prefixToNetmask(prefix int) string {
 	mask := net.CIDRMask(prefix, 32)
 	return fmt.Sprintf("%d.%d.%d.%d", mask[0], mask[1], mask[2], mask[3])
+}
+
+// isValidInterfaceName returns true if name looks like a real Linux interface name.
+// Linux allows up to 15 characters; we allow alphanumeric, hyphen, underscore, dot.
+func isValidInterfaceName(name string) bool {
+	if name == "" || len(name) > 15 {
+		return false
+	}
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+			return false
+		}
+	}
+	return true
 }

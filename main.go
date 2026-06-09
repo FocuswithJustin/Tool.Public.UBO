@@ -246,7 +246,10 @@ func cmdUnlock(ctx context.Context, cfgPath string, changeKey bool) error {
 		cmd := exec.Command("wg-quick", "down", wgConfigPath)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		cmd.Run() //nolint:errcheck
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "[ubo] warning: wg-quick down failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[ubo] you may need to run manually: sudo wg-quick down %s\n", wgConfigPath)
+		}
 	}()
 
 	// Wait for tunnel
