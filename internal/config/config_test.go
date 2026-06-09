@@ -192,4 +192,7 @@ func TestOutputDir_colonInHost(t *testing.T) {
 	if strings.Contains(got, ":") {
 		t.Errorf("OutputDir() = %q; should not contain colon", got)
 	}
+	if strings.Contains(got, "[") || strings.Contains(got, "]") {
+		t.Errorf("OutputDir() = %q; should not contain brackets", got)
+	}
 }

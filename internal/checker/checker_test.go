@@ -71,3 +71,30 @@ func TestCheckTools_deduplicatesPackages(t *testing.T) {
 		t.Errorf("package name appeared %d times in error message; want 1: %q", count, msg)
 	}
 }
+
+func TestCheckTools_multiplePackages(t *testing.T) {
+	orig := runTools
+	defer func() { runTools = orig }()
+	runTools = []toolDef{
+		{"no-tool-a", "pkg-alpha"},
+		{"no-tool-b", "pkg-beta"},
+	}
+
+	err := CheckTools("run")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "no-tool-a") {
+		t.Errorf("error missing tool name no-tool-a: %q", msg)
+	}
+	if !strings.Contains(msg, "no-tool-b") {
+		t.Errorf("error missing tool name no-tool-b: %q", msg)
+	}
+	if !strings.Contains(msg, "pkg-alpha") {
+		t.Errorf("error missing package pkg-alpha: %q", msg)
+	}
+	if !strings.Contains(msg, "pkg-beta") {
+		t.Errorf("error missing package pkg-beta: %q", msg)
+	}
+}

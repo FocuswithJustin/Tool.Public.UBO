@@ -102,11 +102,14 @@ func (c *Config) Validate() error {
 }
 
 // OutputDir returns the configured output directory, defaulting to ./ubo-<host>.
+// Colons and brackets are stripped from the host so IPv6 addresses produce a
+// valid directory name (e.g. "[::1]" → "ubo---1").
 func (c *Config) OutputDir() string {
 	if c.Output.Dir != "" {
 		return c.Output.Dir
 	}
-	return "ubo-" + strings.ReplaceAll(c.Host, ":", "-")
+	host := strings.NewReplacer(":", "-", "[", "", "]", "").Replace(c.Host)
+	return "ubo-" + host
 }
 
 // WGServerTunnelIP returns the IP portion of wireguard.server_ip (without prefix).
