@@ -19,6 +19,20 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TMP="$ROOT_DIR/tmp"
 mkdir -p "$TMP"
 
+# ── 0. Check required tools ───────────────────────────────────────────────────
+echo "==> Checking required tools..."
+missing_tools=()
+for tool in ssh-keygen qemu-img qemu-system-x86_64 xorriso wget sha256sum; do
+    if ! command -v "$tool" &>/dev/null; then
+        missing_tools+=("$tool")
+    fi
+done
+if [ ${#missing_tools[@]} -gt 0 ]; then
+    echo "ERROR: Missing required tools: ${missing_tools[*]}"
+    echo "Run 'nix-shell' first to enter the development environment."
+    exit 1
+fi
+
 # ── 1. Generate test SSH key ──────────────────────────────────────────────────
 SSH_KEY="$TMP/test_ed25519"
 if [ ! -f "$SSH_KEY" ]; then
@@ -30,27 +44,41 @@ SSH_PUB_KEY=$(cat "$SSH_KEY.pub")
 
 # ── 2. Download Debian 13 cloud image ────────────────────────────────────────
 IMAGE="$TMP/debian-trixie.qcow2"
+IMAGE_SUMS="$TMP/debian-trixie.SHA256SUMS"
+IMAGE_NAME="debian-13-genericcloud-amd64.qcow2"
+
 if [ ! -f "$IMAGE" ]; then
     echo "==> Downloading Debian 13 (Trixie) genericcloud image..."
-    URLS=(
-        "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
-        "https://cloud.debian.org/images/cloud/trixie/daily/latest/debian-13-genericcloud-amd64.qcow2"
+    BASES=(
+        "https://cloud.debian.org/images/cloud/trixie/latest"
+        "https://cloud.debian.org/images/cloud/trixie/daily/latest"
     )
     downloaded=false
-    for url in "${URLS[@]}"; do
-        echo "  Trying $url ..."
-        if wget -q --show-progress -O "$IMAGE.tmp" "$url"; then
-            mv "$IMAGE.tmp" "$IMAGE"
-            downloaded=true
-            break
+    for base in "${BASES[@]}"; do
+        echo "  Trying $base ..."
+        if wget -q --show-progress -O "$IMAGE.tmp" "$base/$IMAGE_NAME" && \
+           wget -q -O "$IMAGE_SUMS" "$base/SHA256SUMS"; then
+            # Verify checksum
+            expected=$(grep "$IMAGE_NAME" "$IMAGE_SUMS" | awk '{print $1}')
+            actual=$(sha256sum "$IMAGE.tmp" | awk '{print $1}')
+            if [ "$expected" = "$actual" ]; then
+                mv "$IMAGE.tmp" "$IMAGE"
+                echo "==> Checksum verified."
+                downloaded=true
+                break
+            else
+                echo "  Checksum mismatch (got $actual, expected $expected), skipping."
+                rm -f "$IMAGE.tmp" "$IMAGE_SUMS"
+            fi
+        else
+            rm -f "$IMAGE.tmp" "$IMAGE_SUMS"
         fi
-        rm -f "$IMAGE.tmp"
     done
     if [ "$downloaded" = "false" ]; then
         echo ""
-        echo "ERROR: Could not download Debian 13 cloud image."
+        echo "ERROR: Could not download a verified Debian 13 cloud image."
         echo "Download manually and place at: $IMAGE"
-        echo "  wget -O '$IMAGE' https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+        echo "  wget -O '$IMAGE' https://cloud.debian.org/images/cloud/trixie/latest/$IMAGE_NAME"
         exit 1
     fi
     echo "==> Resizing to 8G..."

@@ -19,6 +19,7 @@ var runTools = []toolDef{
 var unlockTools = []toolDef{
 	{"wg-quick", "wireguard-tools"},
 	{"ssh", "openssh-client"},
+	{"ping", "iputils-ping"},
 }
 
 // CheckTools verifies that all tools required for the given subcommand are present.

@@ -166,7 +166,15 @@ func TestUBORun_Integration(t *testing.T) {
 	t.Log("VM ready.")
 
 	// ── Write test config ─────────────────────────────────────────────────────
-	outDir := t.TempDir()
+	// Use a persistent directory under tmp/ so artifacts survive on failure.
+	outDir := filepath.Join(projectRoot(), "tmp", "test-run-latest")
+	if err := os.RemoveAll(outDir); err != nil {
+		t.Fatalf("clean output dir: %v", err)
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		t.Fatalf("create output dir: %v", err)
+	}
+	t.Logf("output dir (preserved on failure): %s", outDir)
 	cfgPath := filepath.Join(outDir, "ubo.toml")
 	absSSHKey, _ := filepath.Abs(tmpPath("test_ed25519"))
 
