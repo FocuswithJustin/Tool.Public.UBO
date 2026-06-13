@@ -20,7 +20,7 @@ func TestIsValidInterfaceName(t *testing.T) {
 	}
 
 	invalid := []string{
-		"",                       // empty
+		"",                      // empty
 		strings.Repeat("a", 16), // too long (>15)
 		"eth0; rm -rf /",        // shell injection
 		"eth0\neth1",            // newline

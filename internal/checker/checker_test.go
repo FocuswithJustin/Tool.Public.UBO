@@ -98,3 +98,100 @@ func TestCheckTools_multiplePackages(t *testing.T) {
 		t.Errorf("error missing package pkg-beta: %q", msg)
 	}
 }
+
+func TestCheckTools_unlock_toolsPresent(t *testing.T) {
+	// In the nix-shell dev environment wg-quick, ssh and ping are available.
+	// If they're not, skip rather than fail — this is an environment issue.
+	err := CheckTools("unlock")
+	if err != nil {
+		if strings.Contains(err.Error(), "missing required tools") {
+			t.Skipf("tools not in PATH; skipping: %v", err)
+		}
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestCheckTools_unlockChange_toolsPresent(t *testing.T) {
+	// "unlock-change" maps to the same unlockTools set as "unlock".
+	err := CheckTools("unlock-change")
+	if err != nil {
+		if strings.Contains(err.Error(), "missing required tools") {
+			t.Skipf("tools not in PATH; skipping: %v", err)
+		}
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestCheckTools_unlock_errorMessage(t *testing.T) {
+	// Replace unlockTools with fake missing tools to exercise the unlock
+	// branch's error formatting (tools + packages + install instructions).
+	orig := unlockTools
+	defer func() { unlockTools = orig }()
+	unlockTools = []toolDef{
+		{"no-wg-quick-xyz", "wireguard-tools"},
+		{"no-ssh-xyz", "openssh-client"},
+		{"no-ping-xyz", "iputils-ping"},
+	}
+
+	err := CheckTools("unlock")
+	if err == nil {
+		t.Fatal("expected error for missing unlock tools")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"no-wg-quick-xyz", "no-ssh-xyz", "no-ping-xyz",
+		"wireguard-tools", "openssh-client", "iputils-ping",
+		"sudo apt install",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message missing %q: %q", want, msg)
+		}
+	}
+}
+
+func TestCheckTools_unlockChange_errorMessage(t *testing.T) {
+	// "unlock-change" uses the same unlockTools slice; verify the missing-tool
+	// path is reached via that subcommand alias too.
+	orig := unlockTools
+	defer func() { unlockTools = orig }()
+	unlockTools = []toolDef{{"no-unlock-change-tool-xyz", "uc-pkg"}}
+
+	err := CheckTools("unlock-change")
+	if err == nil {
+		t.Fatal("expected error for missing unlock-change tool")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "no-unlock-change-tool-xyz") {
+		t.Errorf("error missing tool name: %q", msg)
+	}
+	if !strings.Contains(msg, "uc-pkg") {
+		t.Errorf("error missing package name: %q", msg)
+	}
+}
+
+func TestCheckTools_unlock_partialMissing(t *testing.T) {
+	// One present tool, one missing: only the missing tool/package should be
+	// reported, exercising the false branch of the LookPath condition for the
+	// unlock path while still producing an error.
+	orig := unlockTools
+	defer func() { unlockTools = orig }()
+	unlockTools = []toolDef{
+		{"sh", "should-not-appear-pkg"}, // present in PATH
+		{"definitely-no-such-tool-xyz", "needed-pkg"},
+	}
+
+	err := CheckTools("unlock")
+	if err == nil {
+		t.Fatal("expected error when one unlock tool is missing")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "definitely-no-such-tool-xyz") {
+		t.Errorf("error missing the absent tool name: %q", msg)
+	}
+	if strings.Contains(msg, "sh,") || strings.Contains(msg, ", sh") {
+		t.Errorf("present tool 'sh' should not be listed as missing: %q", msg)
+	}
+	if strings.Contains(msg, "should-not-appear-pkg") {
+		t.Errorf("package for present tool should not appear: %q", msg)
+	}
+}

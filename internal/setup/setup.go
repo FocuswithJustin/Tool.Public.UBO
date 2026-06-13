@@ -19,6 +19,16 @@ import (
 
 const totalSteps = 11
 
+// Test seams: indirection over the remote package so tests can inject fakes
+// without a real SSH connection. Production behavior is identical to calling
+// the remote.* functions directly.
+var (
+	runCommand    = remote.RunCommand
+	readFile      = remote.ReadFile
+	writeFile     = remote.WriteFile
+	writeFileExec = remote.WriteFileExec
+)
+
 func step(n int, msg string) {
 	fmt.Printf("[ubo] step %d/%d: %s\n", n, totalSteps, msg)
 }
@@ -54,7 +64,7 @@ func Configure(ctx context.Context, client *gossh.Client, cfg *config.Config, ke
 	step(2, "installing dropbear-initramfs and wireguard-tools")
 	installCmd := "DEBIAN_FRONTEND=noninteractive apt-get update -qq && " +
 		"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dropbear-initramfs wireguard-tools"
-	if _, err := remote.RunCommand(ctx, client, installCmd); err != nil {
+	if _, err := runCommand(ctx, client, installCmd); err != nil {
 		return fmt.Errorf("step 2 install packages: %w", err)
 	}
 
@@ -90,13 +100,13 @@ func Configure(ctx context.Context, client *gossh.Client, cfg *config.Config, ke
 	if err != nil {
 		return fmt.Errorf("step 5 render WireGuard config: %w", err)
 	}
-	if err := remote.WriteFile(client, "/etc/wireguard/wg-initramfs.conf", wgServerINI, 0600); err != nil {
+	if err := writeFile(client, "/etc/wireguard/wg-initramfs.conf", wgServerINI, 0600); err != nil {
 		return fmt.Errorf("step 5 write WireGuard config: %w", err)
 	}
 
 	// Step 6: Write initramfs hook
 	step(6, "writing initramfs WireGuard hook")
-	if err := remote.WriteFileExec(client, "/etc/initramfs-tools/hooks/wireguard", templates.InitramfsHookTmpl); err != nil {
+	if err := writeFileExec(client, "/etc/initramfs-tools/hooks/wireguard", templates.InitramfsHookTmpl); err != nil {
 		return fmt.Errorf("step 6 write initramfs hook: %w", err)
 	}
 
@@ -108,14 +118,14 @@ func Configure(ctx context.Context, client *gossh.Client, cfg *config.Config, ke
 	if err != nil {
 		return fmt.Errorf("step 7 render initramfs script: %w", err)
 	}
-	if err := remote.WriteFileExec(client, "/etc/initramfs-tools/scripts/init-premount/wireguard", initScript); err != nil {
+	if err := writeFileExec(client, "/etc/initramfs-tools/scripts/init-premount/wireguard", initScript); err != nil {
 		return fmt.Errorf("step 7 write initramfs script: %w", err)
 	}
 
 	// Step 8: Write Dropbear authorized_keys
 	step(8, "configuring Dropbear authorized keys")
 	authKeysPath := dbPaths.ConfigDir + "/authorized_keys"
-	if err := remote.WriteFile(client, authKeysPath, keys.ClientSSHPubKey+"\n", 0600); err != nil {
+	if err := writeFile(client, authKeysPath, keys.ClientSSHPubKey+"\n", 0600); err != nil {
 		return fmt.Errorf("step 8 write authorized_keys: %w", err)
 	}
 
@@ -128,7 +138,7 @@ func Configure(ctx context.Context, client *gossh.Client, cfg *config.Config, ke
 	if err != nil {
 		return fmt.Errorf("step 9 render dropbear config: %w", err)
 	}
-	if err := remote.WriteFile(client, dbPaths.ConfigDir+"/dropbear.conf", dbConf, 0644); err != nil {
+	if err := writeFile(client, dbPaths.ConfigDir+"/dropbear.conf", dbConf, 0644); err != nil {
 		return fmt.Errorf("step 9 write dropbear config: %w", err)
 	}
 
@@ -140,7 +150,7 @@ func Configure(ctx context.Context, client *gossh.Client, cfg *config.Config, ke
 
 	// Step 11: Rebuild initramfs
 	step(11, "rebuilding initramfs (this may take a minute)")
-	if _, err := remote.RunCommand(ctx, client, "update-initramfs -u -k all"); err != nil {
+	if _, err := runCommand(ctx, client, "update-initramfs -u -k all"); err != nil {
 		return fmt.Errorf("step 11 update-initramfs: %w", err)
 	}
 
@@ -165,7 +175,7 @@ func detectNetwork(ctx context.Context, client *gossh.Client, cfg *config.Config
 	}
 
 	// Parse default route: "default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.100 ..."
-	routeOut, err := remote.RunCommand(ctx, client, "ip route show default")
+	routeOut, err := runCommand(ctx, client, "ip route show default")
 	if err != nil {
 		return nil, fmt.Errorf("ip route: %w", err)
 	}
@@ -193,7 +203,7 @@ func detectNetwork(ctx context.Context, client *gossh.Client, cfg *config.Config
 
 	// Get prefix length from ip addr if not already set
 	if info.Prefix == 0 && info.IP != "" {
-		addrOut, addrErr := remote.RunCommand(ctx, client, "ip addr show dev "+info.Interface)
+		addrOut, addrErr := runCommand(ctx, client, "ip addr show dev "+info.Interface)
 		if addrErr == nil {
 			re := regexp.MustCompile(`inet (\d+\.\d+\.\d+\.\d+/\d+)`)
 			for _, m := range re.FindAllStringSubmatch(addrOut, -1) {
@@ -211,7 +221,7 @@ func detectNetwork(ctx context.Context, client *gossh.Client, cfg *config.Config
 		}
 	}
 
-	hostnameOut, hostnameErr := remote.RunCommand(ctx, client, "hostname")
+	hostnameOut, hostnameErr := runCommand(ctx, client, "hostname")
 	if hostnameErr != nil {
 		fmt.Printf("[ubo]   warning: hostname detection failed, using fallback \"server\"\n")
 	}
@@ -232,7 +242,7 @@ func detectNetwork(ctx context.Context, client *gossh.Client, cfg *config.Config
 
 // detectDropbearPaths returns the dropbear-initramfs config directory and host key path.
 func detectDropbearPaths(ctx context.Context, client *gossh.Client) (*dropbearPaths, error) {
-	out, err := remote.RunCommand(ctx, client,
+	out, err := runCommand(ctx, client,
 		`if [ -d /etc/dropbear/initramfs ]; then echo /etc/dropbear/initramfs; `+
 			`elif [ -d /etc/dropbear-initramfs ]; then echo /etc/dropbear-initramfs; `+
 			`else echo NOTFOUND; fi`)
@@ -252,13 +262,13 @@ func detectDropbearPaths(ctx context.Context, client *gossh.Client) (*dropbearPa
 // generateDropbearHostKey regenerates the Dropbear ed25519 host key and returns
 // its public key in authorized_keys format (e.g. "ssh-ed25519 AAAA...").
 func generateDropbearHostKey(ctx context.Context, client *gossh.Client, keyFile string) (string, error) {
-	remote.RunCommand(ctx, client, "rm -f "+keyFile) //nolint:errcheck
+	runCommand(ctx, client, "rm -f "+keyFile) //nolint:errcheck
 
-	if _, err := remote.RunCommand(ctx, client, "dropbearkey -t ed25519 -f "+keyFile); err != nil {
+	if _, err := runCommand(ctx, client, "dropbearkey -t ed25519 -f "+keyFile); err != nil {
 		return "", fmt.Errorf("dropbearkey: %w", err)
 	}
 
-	out, err := remote.RunCommand(ctx, client, "dropbearkey -y -f "+keyFile+" 2>/dev/null")
+	out, err := runCommand(ctx, client, "dropbearkey -y -f "+keyFile+" 2>/dev/null")
 	if err != nil {
 		return "", fmt.Errorf("dropbearkey -y: %w", err)
 	}
@@ -276,7 +286,7 @@ func generateDropbearHostKey(ctx context.Context, client *gossh.Client, keyFile 
 // initramfs static networking, then runs update-grub.
 func configureGrub(ctx context.Context, client *gossh.Client, netInfo *NetworkInfo) error {
 	grubPath := "/etc/default/grub"
-	content, err := remote.ReadFile(client, grubPath)
+	content, err := readFile(client, grubPath)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", grubPath, err)
 	}
@@ -291,10 +301,10 @@ func configureGrub(ctx context.Context, client *gossh.Client, netInfo *NetworkIn
 		return nil
 	}
 
-	if err := remote.WriteFile(client, grubPath, updated, 0644); err != nil {
+	if err := writeFile(client, grubPath, updated, 0644); err != nil {
 		return fmt.Errorf("write %s: %w", grubPath, err)
 	}
-	if _, err := remote.RunCommand(ctx, client, "update-grub 2>&1"); err != nil {
+	if _, err := runCommand(ctx, client, "update-grub 2>&1"); err != nil {
 		return fmt.Errorf("update-grub: %w", err)
 	}
 	fmt.Printf("[ubo]   added to GRUB_CMDLINE_LINUX: %s\n", ipParam)

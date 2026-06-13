@@ -10,12 +10,12 @@ import (
 
 // Config holds the full ubo.toml configuration.
 type Config struct {
-	Host      string    `toml:"host"`
-	SSH       SSHConfig `toml:"ssh"`
-	WireGuard WGConfig  `toml:"wireguard"`
-	Dropbear  DBConfig  `toml:"dropbear"`
-	Output    OutConfig `toml:"output"`
-	Network   NetConfig `toml:"network"`
+	Host      string     `toml:"host"`
+	SSH       SSHConfig  `toml:"ssh"`
+	WireGuard WGConfig   `toml:"wireguard"`
+	Dropbear  DBConfig   `toml:"dropbear"`
+	Output    OutConfig  `toml:"output"`
+	Network   NetConfig  `toml:"network"`
 	LUKS      LUKSConfig `toml:"luks"`
 }
 

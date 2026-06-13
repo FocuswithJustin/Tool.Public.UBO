@@ -74,6 +74,82 @@ func TestValidate_badWGIP(t *testing.T) {
 	}
 }
 
+func TestValidate_emptySSHUser(t *testing.T) {
+	c := Default()
+	c.Host = "host"
+	c.SSH.User = ""
+	if err := c.Validate(); err == nil {
+		t.Error("expected error for empty ssh.user")
+	}
+}
+
+// TestValidate_table exercises each boolean sub-condition of every Validate
+// decision independently (MC/DC spirit). For each port range check
+// (port <= 0 || port > 65535) we provide a low value that trips only the
+// first operand, a high value that trips only the second operand, and the
+// valid boundary values (1 and 65535) where neither operand is true.
+func TestValidate_table(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr bool
+	}{
+		{"valid baseline", func(c *Config) {}, false},
+		{"missing host", func(c *Config) { c.Host = "" }, true},
+		{"empty ssh.user", func(c *Config) { c.SSH.User = "" }, true},
+
+		// ssh.port: first operand (<= 0)
+		{"ssh.port zero", func(c *Config) { c.SSH.Port = 0 }, true},
+		{"ssh.port negative", func(c *Config) { c.SSH.Port = -1 }, true},
+		// ssh.port: second operand (> 65535)
+		{"ssh.port too high", func(c *Config) { c.SSH.Port = 65536 }, true},
+		// ssh.port: valid boundaries (neither operand true)
+		{"ssh.port low boundary", func(c *Config) { c.SSH.Port = 1 }, false},
+		{"ssh.port high boundary", func(c *Config) { c.SSH.Port = 65535 }, false},
+
+		// wireguard.port: first operand (<= 0)
+		{"wg.port zero", func(c *Config) { c.WireGuard.Port = 0 }, true},
+		{"wg.port negative", func(c *Config) { c.WireGuard.Port = -5 }, true},
+		// wireguard.port: second operand (> 65535)
+		{"wg.port too high", func(c *Config) { c.WireGuard.Port = 70000 }, true},
+		// wireguard.port: valid boundaries
+		{"wg.port low boundary", func(c *Config) { c.WireGuard.Port = 1 }, false},
+		{"wg.port high boundary", func(c *Config) { c.WireGuard.Port = 65535 }, false},
+
+		// server CIDR
+		{"server CIDR invalid", func(c *Config) { c.WireGuard.ServerIP = "not-a-cidr" }, true},
+		{"server CIDR empty", func(c *Config) { c.WireGuard.ServerIP = "" }, true},
+
+		// client CIDR
+		{"client CIDR invalid", func(c *Config) { c.WireGuard.ClientIP = "10.0.0.999/32" }, true},
+		{"client CIDR empty", func(c *Config) { c.WireGuard.ClientIP = "" }, true},
+
+		// dropbear.port: first operand (<= 0)
+		{"dropbear.port zero", func(c *Config) { c.Dropbear.Port = 0 }, true},
+		{"dropbear.port negative", func(c *Config) { c.Dropbear.Port = -1 }, true},
+		// dropbear.port: second operand (> 65535)
+		{"dropbear.port too high", func(c *Config) { c.Dropbear.Port = 65536 }, true},
+		// dropbear.port: valid boundaries
+		{"dropbear.port low boundary", func(c *Config) { c.Dropbear.Port = 1 }, false},
+		{"dropbear.port high boundary", func(c *Config) { c.Dropbear.Port = 65535 }, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := Default()
+			c.Host = "192.168.1.100"
+			tt.mutate(c)
+			err := c.Validate()
+			if tt.wantErr && err == nil {
+				t.Errorf("Validate() = nil; want error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("Validate() = %v; want nil", err)
+			}
+		})
+	}
+}
+
 func TestOutputDir_auto(t *testing.T) {
 	c := Default()
 	c.Host = "192.168.1.1"
@@ -104,6 +180,42 @@ func TestWGClientTunnelIP(t *testing.T) {
 	c.WireGuard.ClientIP = "10.42.0.2/32"
 	if got := c.WGClientTunnelIP(); got != "10.42.0.2" {
 		t.Errorf("WGClientTunnelIP() = %q; want 10.42.0.2", got)
+	}
+}
+
+func TestWGServerTunnelIP_invalid(t *testing.T) {
+	// Invalid/empty CIDR -> ParseCIDR yields nil ip -> empty string.
+	for _, in := range []string{"", "garbage", "10.0.0.1"} {
+		c := Default()
+		c.WireGuard.ServerIP = in
+		if got := c.WGServerTunnelIP(); got != "" {
+			t.Errorf("WGServerTunnelIP(%q) = %q; want empty", in, got)
+		}
+	}
+}
+
+func TestWGClientTunnelIP_invalid(t *testing.T) {
+	for _, in := range []string{"", "garbage", "10.0.0.2"} {
+		c := Default()
+		c.WireGuard.ClientIP = in
+		if got := c.WGClientTunnelIP(); got != "" {
+			t.Errorf("WGClientTunnelIP(%q) = %q; want empty", in, got)
+		}
+	}
+}
+
+func TestLoad_malformedTOML(t *testing.T) {
+	// Syntactically invalid TOML should exercise the DecodeFile error path
+	// (distinct from the missing-file case).
+	f, err := os.CreateTemp(t.TempDir(), "*.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString("this is = = not valid toml [[[")
+	f.Close()
+
+	if _, err := Load(f.Name()); err == nil {
+		t.Error("expected error loading malformed TOML")
 	}
 }
 

@@ -101,14 +101,14 @@ var fields = []fieldDef{
 
 // styles
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
-	sectionStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("241")).PaddingTop(1)
-	labelStyle    = lipgloss.NewStyle().Width(20).Foreground(lipgloss.Color("246"))
+	titleStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
+	sectionStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("241")).PaddingTop(1)
+	labelStyle       = lipgloss.NewStyle().Width(20).Foreground(lipgloss.Color("246"))
 	activeLabelStyle = lipgloss.NewStyle().Width(20).Foreground(lipgloss.Color("212")).Bold(true)
-	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	savedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	helpStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).PaddingTop(1)
-	confirmStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+	errorStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	savedStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	helpStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).PaddingTop(1)
+	confirmStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 )
 
 type model struct {

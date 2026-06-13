@@ -1,10 +1,10 @@
 package templates
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"text/template"
-	"bytes"
 )
 
 // WireGuardServerConfig builds a WireGuard server configuration.

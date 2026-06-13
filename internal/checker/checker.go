@@ -7,8 +7,8 @@ import (
 )
 
 type toolDef struct {
-	name    string
-	pkg     string
+	name string
+	pkg  string
 }
 
 var runTools = []toolDef{

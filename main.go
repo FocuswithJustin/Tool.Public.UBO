@@ -32,6 +32,7 @@ Subcommands:
   configure      Open interactive TUI to create or edit config (default: ./ubo.toml)
   init           Write a default config file non-interactively
   run            Configure the remote host — generates keys, installs WireGuard+Dropbear
+  status         Report whether the output dir is configured and ready to unlock
   unlock         Bring up WireGuard, SSH to Dropbear, unlock disk, tear down tunnel
   unlock change  Change LUKS passphrase, then optionally unlock
 
@@ -81,6 +82,8 @@ func dispatch(args []string) error {
 		return cmdInit(*cfgPath)
 	case "run":
 		return cmdRun(ctx, *cfgPath)
+	case "status":
+		return cmdStatus(*cfgPath)
 	case "unlock":
 		return cmdUnlock(ctx, *cfgPath, false)
 	case "unlock-change":
@@ -201,6 +204,85 @@ func cmdRun(ctx context.Context, cfgPath string) error {
 	fmt.Printf("[ubo] output directory: %s\n", outDir)
 	fmt.Printf("[ubo] to unlock on next boot: sudo ubo unlock --config %s\n", cfgPath)
 	fmt.Printf("[ubo] see %s for manual instructions\n", readmePath)
+	return nil
+}
+
+// statusFile names a file expected in the output directory and whether its
+// presence is required for unlock to be possible.
+type statusFile struct {
+	name              string
+	requiredForUnlock bool
+}
+
+// unlockArtifacts are the files cmdUnlock needs; the rest are produced by run
+// but not strictly required to unlock.
+var statusArtifacts = []statusFile{
+	{"server_wg_private.key", false},
+	{"server_wg_public.key", false},
+	{"client_wg_private.key", false},
+	{"client_wg_public.key", false},
+	{"client_auth_ed25519", true},
+	{"client_auth_ed25519.pub", false},
+	{"dropbear_host_key.pub", true},
+	{"client_wg.conf", true},
+	{"README.txt", false},
+}
+
+// statusReport inspects outDir and returns, for each expected artifact, whether
+// it is present, plus an overall readiness flag (true only when every file
+// required for unlock is present).
+func statusReport(outDir string) (ready bool, present map[string]bool) {
+	present = make(map[string]bool, len(statusArtifacts))
+	ready = true
+	for _, a := range statusArtifacts {
+		_, err := os.Stat(filepath.Join(outDir, a.name))
+		ok := err == nil
+		present[a.name] = ok
+		if a.requiredForUnlock && !ok {
+			ready = false
+		}
+	}
+	return ready, present
+}
+
+// cmdStatus reports whether the output directory contains the artifacts that
+// 'ubo run' produces and whether 'ubo unlock' can proceed. It is local-only and
+// makes no network connections.
+func cmdStatus(cfgPath string) error {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return err
+	}
+	outDir := cfg.OutputDir()
+	fmt.Printf("[ubo] host:           %s\n", cfg.Host)
+	fmt.Printf("[ubo] output dir:     %s\n", outDir)
+
+	if _, err := os.Stat(outDir); err != nil {
+		fmt.Printf("[ubo] not configured: output dir does not exist\n")
+		fmt.Printf("[ubo] run 'ubo run --config %s' to configure the target\n", cfgPath)
+		return nil
+	}
+
+	ready, present := statusReport(outDir)
+	fmt.Println("[ubo] artifacts:")
+	for _, a := range statusArtifacts {
+		mark := "✗"
+		if present[a.name] {
+			mark = "✓"
+		}
+		req := ""
+		if a.requiredForUnlock {
+			req = "  (required for unlock)"
+		}
+		fmt.Printf("        %s %s%s\n", mark, a.name, req)
+	}
+
+	if ready {
+		fmt.Printf("\n[ubo] ready to unlock: sudo ubo unlock --config %s\n", cfgPath)
+	} else {
+		fmt.Printf("\n[ubo] not ready to unlock — missing required artifacts\n")
+		fmt.Printf("[ubo] run 'ubo run --config %s' to (re)configure the target\n", cfgPath)
+	}
 	return nil
 }
 
