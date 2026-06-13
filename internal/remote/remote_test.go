@@ -403,6 +403,7 @@ func TestRunCommand_Success(t *testing.T) {
 
 func TestRunCommand_NonZeroExit(t *testing.T) {
 	installFakeSSH(t)
+	t.Setenv("FAKE_SSH_STDOUT", "partial\n")
 	t.Setenv("FAKE_SSH_STDERR", "boom\n")
 	t.Setenv("FAKE_SSH_EXIT", "3")
 	c := newTOFUClient(t)
@@ -410,8 +411,30 @@ func TestRunCommand_NonZeroExit(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "remote command failed") {
 		t.Fatalf("expected failure, got %v", err)
 	}
-	if out != "boom" {
-		t.Fatalf("expected captured 'boom', got %q", out)
+	// On failure, stdout is returned and stderr is folded into the error.
+	if out != "partial" {
+		t.Fatalf("expected stdout 'partial' returned, got %q", out)
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("expected stderr 'boom' in error, got %v", err)
+	}
+}
+
+// TestRunCommand_StderrDoesNotPolluteStdout guards the regression where the
+// local ssh client prints warnings to stderr (e.g. unsupported ssh_config
+// options). Those must NOT be merged into the returned remote stdout, or
+// downstream parsing of the result (paths, device names) breaks.
+func TestRunCommand_StderrDoesNotPolluteStdout(t *testing.T) {
+	installFakeSSH(t)
+	t.Setenv("FAKE_SSH_STDOUT", "/etc/dropbear/initramfs\n")
+	t.Setenv("FAKE_SSH_STDERR", `/etc/ssh/ssh_config line 53: Unsupported option "gssapiauthentication"`+"\n")
+	c := newTOFUClient(t)
+	out, err := RunCommand(context.Background(), c, "echo path")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if out != "/etc/dropbear/initramfs" {
+		t.Fatalf("stderr leaked into stdout, got %q", out)
 	}
 }
 

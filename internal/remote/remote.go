@@ -7,6 +7,7 @@ package remote
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -185,16 +186,23 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// RunCommand executes cmd on the remote via `ssh` and returns the combined
-// stdout+stderr, trimmed of surrounding whitespace.
+// RunCommand executes cmd on the remote via `ssh` and returns the remote
+// command's stdout, trimmed of surrounding whitespace. Stderr is captured
+// separately and only surfaced in the error message on failure, so local ssh
+// client warnings (e.g. unsupported ssh_config options) never corrupt the
+// returned value.
 func RunCommand(ctx context.Context, c *Client, cmd string) (string, error) {
 	args := append(c.sshArgs(), cmd)
-	out, err := exec.CommandContext(ctx, "ssh", args...).CombinedOutput()
-	trimmed := strings.TrimSpace(string(out))
+	command := exec.CommandContext(ctx, "ssh", args...)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	out := strings.TrimSpace(stdout.String())
 	if err != nil {
-		return trimmed, fmt.Errorf("remote command failed: %w\noutput: %s", err, trimmed)
+		return out, fmt.Errorf("remote command failed: %w\noutput: %s", err, strings.TrimSpace(stderr.String()))
 	}
-	return trimmed, nil
+	return out, nil
 }
 
 // WriteFile writes content to remotePath on the remote host. It creates the
