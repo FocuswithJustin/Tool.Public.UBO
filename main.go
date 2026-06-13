@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,35 @@ import (
 	"ubo/internal/setup"
 	"ubo/internal/templates"
 	"ubo/internal/tui"
+)
+
+// Seams: indirections over the few non-deterministic / external operations in
+// the unlock flow, so cmdUnlock can be exercised end-to-end in unit tests
+// without root, a real WireGuard tunnel, or a live Dropbear server. Production
+// code uses the real implementations assigned here; tests reassign them.
+var (
+	osGetuid                     = os.Getuid
+	remoteConnect                = remote.Connect
+	interactiveSession           = remote.InteractiveSession
+	waitForTunnelFn              = waitForTunnel
+	keygenGenerateAll            = keygen.GenerateAll
+	setupConfigure               = setup.Configure
+	checkTools                   = checker.CheckTools
+	tuiRun                       = tui.Run
+	unlockStdin        io.Reader = os.Stdin
+
+	wgQuickUp = func(ctx context.Context, cfgPath string) error {
+		cmd := exec.CommandContext(ctx, "wg-quick", "up", cfgPath)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+	wgQuickDown = func(cfgPath string) error {
+		cmd := exec.Command("wg-quick", "down", cfgPath)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
 )
 
 const usage = `ubo — Unlock Before Operation
@@ -77,7 +107,7 @@ func dispatch(args []string) error {
 
 	switch sub {
 	case "configure":
-		return tui.Run(*cfgPath)
+		return tuiRun(*cfgPath)
 	case "init":
 		return cmdInit(*cfgPath)
 	case "run":
@@ -133,7 +163,7 @@ func cmdRun(ctx context.Context, cfgPath string) error {
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
-	if err := checker.CheckTools("run"); err != nil {
+	if err := checkTools("run"); err != nil {
 		return err
 	}
 
@@ -144,14 +174,14 @@ func cmdRun(ctx context.Context, cfgPath string) error {
 	fmt.Printf("[ubo] output directory: %s\n", outDir)
 
 	// Generate all keys locally
-	keys, err := keygen.GenerateAll(outDir)
+	keys, err := keygenGenerateAll(outDir)
 	if err != nil {
 		return err
 	}
 
 	// Connect to remote host (TOFU: save host key on first connect)
 	fmt.Printf("[ubo] connecting to %s:%d as %s...\n", cfg.Host, cfg.SSH.Port, cfg.SSH.User)
-	client, err := remote.Connect(ctx, &remote.ConnectOptions{
+	client, err := remoteConnect(ctx, &remote.ConnectOptions{
 		Host:           cfg.Host,
 		Port:           cfg.SSH.Port,
 		User:           cfg.SSH.User,
@@ -164,7 +194,7 @@ func cmdRun(ctx context.Context, cfgPath string) error {
 	defer client.Close()
 
 	// Run all 11 setup steps on the remote
-	if err := setup.Configure(ctx, client, cfg, keys, outDir); err != nil {
+	if err := setupConfigure(ctx, client, cfg, keys, outDir); err != nil {
 		return err
 	}
 
@@ -296,10 +326,10 @@ func cmdUnlock(ctx context.Context, cfgPath string, changeKey bool) error {
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
-	if err := checker.CheckTools("unlock"); err != nil {
+	if err := checkTools("unlock"); err != nil {
 		return err
 	}
-	if os.Getuid() != 0 {
+	if osGetuid() != 0 {
 		return fmt.Errorf("unlock requires root privileges\nRun: sudo ubo unlock --config %s", cfgPath)
 	}
 
@@ -316,19 +346,13 @@ func cmdUnlock(ctx context.Context, cfgPath string, changeKey bool) error {
 
 	// Bring up WireGuard tunnel
 	fmt.Println("[ubo] bringing up WireGuard tunnel...")
-	wgUp := exec.CommandContext(ctx, "wg-quick", "up", wgConfigPath)
-	wgUp.Stdout = os.Stdout
-	wgUp.Stderr = os.Stderr
-	if err := wgUp.Run(); err != nil {
+	if err := wgQuickUp(ctx, wgConfigPath); err != nil {
 		return fmt.Errorf("wg-quick up: %w", err)
 	}
 	// Always tear down on exit
 	defer func() {
 		fmt.Println("[ubo] tearing down WireGuard tunnel...")
-		cmd := exec.Command("wg-quick", "down", wgConfigPath)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
+		if err := wgQuickDown(wgConfigPath); err != nil {
 			fmt.Fprintf(os.Stderr, "[ubo] warning: wg-quick down failed: %v\n", err)
 			fmt.Fprintf(os.Stderr, "[ubo] you may need to run manually: sudo wg-quick down %s\n", wgConfigPath)
 		}
@@ -337,13 +361,13 @@ func cmdUnlock(ctx context.Context, cfgPath string, changeKey bool) error {
 	// Wait for tunnel
 	serverTunnelIP := cfg.WGServerTunnelIP()
 	fmt.Printf("[ubo] waiting for tunnel to %s...\n", serverTunnelIP)
-	if err := waitForTunnel(serverTunnelIP, 10); err != nil {
+	if err := waitForTunnelFn(serverTunnelIP, 10); err != nil {
 		return err
 	}
 
 	// Connect to Dropbear with pinned host key
 	fmt.Printf("[ubo] connecting to Dropbear at %s:%d...\n", serverTunnelIP, cfg.Dropbear.Port)
-	client, err := remote.Connect(ctx, &remote.ConnectOptions{
+	client, err := remoteConnect(ctx, &remote.ConnectOptions{
 		Host:          serverTunnelIP,
 		Port:          cfg.Dropbear.Port,
 		User:          "root",
@@ -365,12 +389,12 @@ func cmdUnlock(ctx context.Context, cfgPath string, changeKey bool) error {
 		}
 
 		fmt.Println("[ubo] changing LUKS passphrase (enter current passphrase, then new passphrase twice)...")
-		if err := remote.InteractiveSession(client, changeCmd); err != nil {
+		if err := interactiveSession(client, changeCmd); err != nil {
 			return fmt.Errorf("luksChangeKey: %w", err)
 		}
 
 		fmt.Print("\nChange complete. Unlock and boot now? [Y/n]: ")
-		reader := bufio.NewReader(os.Stdin)
+		reader := bufio.NewReader(unlockStdin)
 		answer, _ := reader.ReadString('\n')
 		answer = strings.TrimSpace(strings.ToLower(answer))
 		if answer != "" && answer != "y" {
@@ -380,7 +404,7 @@ func cmdUnlock(ctx context.Context, cfgPath string, changeKey bool) error {
 	}
 
 	fmt.Println("[ubo] unlocking disk (enter LUKS passphrase when prompted)...")
-	if err := remote.InteractiveSession(client, "cryptroot-unlock"); err != nil {
+	if err := interactiveSession(client, "cryptroot-unlock"); err != nil {
 		return fmt.Errorf("cryptroot-unlock: %w", err)
 	}
 

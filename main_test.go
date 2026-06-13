@@ -2,13 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"ubo/internal/config"
+	"ubo/internal/keygen"
+	"ubo/internal/remote"
 )
+
+// errBoom is a generic failure used to drive seamed error branches.
+var errBoom = errors.New("boom")
 
 // captureStdout swaps os.Stdout for a pipe, runs fn, and returns everything
 // written to stdout. It always restores os.Stdout.
@@ -458,6 +464,224 @@ func TestCmdRun_invalidConfig(t *testing.T) {
 	}
 }
 
+// --- dispatch routing for configure / unlock -------------------------------
+
+// dispatch("configure") routes to tuiRun; we seam it to avoid opening a real
+// interactive editor.
+func TestDispatch_configure(t *testing.T) {
+	orig := tuiRun
+	t.Cleanup(func() { tuiRun = orig })
+	called := ""
+	tuiRun = func(path string) error { called = path; return nil }
+	if err := dispatch([]string{"configure", "--config", "/tmp/x.toml"}); err != nil {
+		t.Fatalf("dispatch(configure) error = %v", err)
+	}
+	if called != "/tmp/x.toml" {
+		t.Errorf("tuiRun got %q; want /tmp/x.toml", called)
+	}
+}
+
+// dispatch("unlock") (single word) routes to cmdUnlock with changeKey=false.
+func TestDispatch_unlock(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("test assumes non-root execution")
+	}
+	dir := t.TempDir()
+	cfgPath := writeValidConfig(t, dir, filepath.Join(dir, "out"))
+	err := dispatch([]string{"unlock", "--config", cfgPath})
+	if err == nil || !strings.Contains(err.Error(), "requires root") {
+		t.Fatalf("error = %v; want 'requires root'", err)
+	}
+}
+
+// --- cmdRun (full flow via seams) -------------------------------------------
+
+// setRunSeams snapshots and restores the cmdRun external-call seams.
+func setRunSeams(t *testing.T) {
+	t.Helper()
+	o1, o2, o3 := keygenGenerateAll, remoteConnect, setupConfigure
+	t.Cleanup(func() { keygenGenerateAll, remoteConnect, setupConfigure = o1, o2, o3 })
+}
+
+// happyRunSeams installs seams for a successful cmdRun: keys generated,
+// connection established, all setup steps succeeding.
+func happyRunSeams(t *testing.T) {
+	t.Helper()
+	setRunSeams(t)
+	keygenGenerateAll = func(outDir string) (*keygen.Keys, error) {
+		return &keygen.Keys{
+			ServerWGPublic:  "serverpubkey",
+			ClientWGPrivate: "clientprivkey",
+		}, nil
+	}
+	remoteConnect = func(ctx context.Context, opts *remote.ConnectOptions) (*remote.Client, error) {
+		return &remote.Client{}, nil
+	}
+	setupConfigure = func(ctx context.Context, c *remote.Client, cfg *config.Config, k *keygen.Keys, outDir string) error {
+		return nil
+	}
+}
+
+func TestCmdRun_success(t *testing.T) {
+	happyRunSeams(t)
+	dir := t.TempDir()
+	outDir := filepath.Join(dir, "out")
+	cfgPath := writeValidConfig(t, dir, outDir)
+	out := captureStdout(t, func() {
+		if err := cmdRun(context.Background(), cfgPath); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	if !strings.Contains(out, "configuration complete") {
+		t.Errorf("output = %q; want 'configuration complete'", out)
+	}
+	// The two local artifacts must have been written.
+	for _, n := range []string{"client_wg.conf", "README.txt"} {
+		if _, err := os.Stat(filepath.Join(outDir, n)); err != nil {
+			t.Errorf("expected %s written: %v", n, err)
+		}
+	}
+}
+
+func TestCmdRun_keygenFails(t *testing.T) {
+	happyRunSeams(t)
+	keygenGenerateAll = func(outDir string) (*keygen.Keys, error) { return nil, errBoom }
+	dir := t.TempDir()
+	cfgPath := writeValidConfig(t, dir, filepath.Join(dir, "out"))
+	_ = captureStdout(t, func() {
+		if err := cmdRun(context.Background(), cfgPath); err != errBoom {
+			t.Fatalf("error = %v; want errBoom", err)
+		}
+	})
+}
+
+func TestCmdRun_connectFails(t *testing.T) {
+	happyRunSeams(t)
+	remoteConnect = func(ctx context.Context, opts *remote.ConnectOptions) (*remote.Client, error) {
+		return nil, errBoom
+	}
+	dir := t.TempDir()
+	cfgPath := writeValidConfig(t, dir, filepath.Join(dir, "out"))
+	_ = captureStdout(t, func() {
+		if err := cmdRun(context.Background(), cfgPath); err != errBoom {
+			t.Fatalf("error = %v; want errBoom", err)
+		}
+	})
+}
+
+func TestCmdRun_setupFails(t *testing.T) {
+	happyRunSeams(t)
+	setupConfigure = func(ctx context.Context, c *remote.Client, cfg *config.Config, k *keygen.Keys, outDir string) error {
+		return errBoom
+	}
+	dir := t.TempDir()
+	cfgPath := writeValidConfig(t, dir, filepath.Join(dir, "out"))
+	_ = captureStdout(t, func() {
+		if err := cmdRun(context.Background(), cfgPath); err != errBoom {
+			t.Fatalf("error = %v; want errBoom", err)
+		}
+	})
+}
+
+func TestCmdRun_checkToolsFails(t *testing.T) {
+	happyRunSeams(t)
+	orig := checkTools
+	t.Cleanup(func() { checkTools = orig })
+	checkTools = func(sub string) error { return errBoom }
+	dir := t.TempDir()
+	cfgPath := writeValidConfig(t, dir, filepath.Join(dir, "out"))
+	if err := cmdRun(context.Background(), cfgPath); err != errBoom {
+		t.Fatalf("error = %v; want errBoom", err)
+	}
+}
+
+func TestCmdRun_mkdirFails(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+	happyRunSeams(t)
+	// Output dir lives inside a read-only parent so MkdirAll fails.
+	dir := t.TempDir()
+	ro := filepath.Join(dir, "ro")
+	if err := os.Mkdir(ro, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(ro, 0700) })
+	cfgPath := writeValidConfig(t, dir, filepath.Join(ro, "sub", "out"))
+	_ = captureStdout(t, func() {
+		err := cmdRun(context.Background(), cfgPath)
+		if err == nil || !strings.Contains(err.Error(), "create output dir") {
+			t.Fatalf("error = %v; want 'create output dir'", err)
+		}
+	})
+}
+
+func TestCmdRun_writeClientConfigFails(t *testing.T) {
+	happyRunSeams(t)
+	dir := t.TempDir()
+	outDir := filepath.Join(dir, "out")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-create client_wg.conf as a DIRECTORY so os.WriteFile to that path fails.
+	if err := os.Mkdir(filepath.Join(outDir, "client_wg.conf"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeValidConfig(t, dir, outDir)
+	_ = captureStdout(t, func() {
+		err := cmdRun(context.Background(), cfgPath)
+		if err == nil || !strings.Contains(err.Error(), "client_wg.conf") {
+			t.Fatalf("error = %v; want client_wg.conf write failure", err)
+		}
+	})
+}
+
+func TestCmdRun_writeReadmeFails(t *testing.T) {
+	happyRunSeams(t)
+	dir := t.TempDir()
+	outDir := filepath.Join(dir, "out")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// README.txt as a directory: client_wg.conf write succeeds, README fails.
+	if err := os.Mkdir(filepath.Join(outDir, "README.txt"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeValidConfig(t, dir, outDir)
+	_ = captureStdout(t, func() {
+		err := cmdRun(context.Background(), cfgPath)
+		if err == nil || !strings.Contains(err.Error(), "README.txt") {
+			t.Fatalf("error = %v; want README.txt write failure", err)
+		}
+	})
+}
+
+func TestCmdUnlock_checkToolsFails(t *testing.T) {
+	happyUnlockSeams(t)
+	orig := checkTools
+	t.Cleanup(func() { checkTools = orig })
+	checkTools = func(sub string) error { return errBoom }
+	cfgPath := writeUnlockReady(t, "")
+	if err := cmdUnlock(context.Background(), cfgPath, false); err != errBoom {
+		t.Fatalf("error = %v; want errBoom", err)
+	}
+}
+
+func TestCmdRun_marshalINIFails(t *testing.T) {
+	happyRunSeams(t)
+	// Empty key material makes WireGuardClientConfig.MarshalINI fail its
+	// required-field validation, exercising the render error branch.
+	keygenGenerateAll = func(outDir string) (*keygen.Keys, error) { return &keygen.Keys{}, nil }
+	dir := t.TempDir()
+	cfgPath := writeValidConfig(t, dir, filepath.Join(dir, "out"))
+	_ = captureStdout(t, func() {
+		err := cmdRun(context.Background(), cfgPath)
+		if err == nil || !strings.Contains(err.Error(), "render client WireGuard config") {
+			t.Fatalf("error = %v; want 'render client WireGuard config'", err)
+		}
+	})
+}
+
 // --- cmdUnlock (error paths only) -------------------------------------------
 
 func TestCmdUnlock_missingConfig(t *testing.T) {
@@ -515,6 +739,264 @@ func TestCmdUnlock_changeRequiresRoot(t *testing.T) {
 	if !strings.Contains(err.Error(), "requires root") {
 		t.Errorf("error = %v; want 'requires root'", err)
 	}
+}
+
+// --- cmdUnlock (full flow via seams) ----------------------------------------
+
+// unlockRecorder captures which seamed operations cmdUnlock invoked.
+type unlockRecorder struct {
+	upCalled, downCalled bool
+	sessions             []string // remote commands passed to interactiveSession, in order
+}
+
+// setUnlockSeams snapshots every unlock seam and restores it on cleanup, so a
+// test may freely reassign them.
+func setUnlockSeams(t *testing.T) {
+	t.Helper()
+	o1, o2, o3 := osGetuid, remoteConnect, interactiveSession
+	o4, o5 := waitForTunnelFn, unlockStdin
+	o6, o7 := wgQuickUp, wgQuickDown
+	t.Cleanup(func() {
+		osGetuid, remoteConnect, interactiveSession = o1, o2, o3
+		waitForTunnelFn, unlockStdin = o4, o5
+		wgQuickUp, wgQuickDown = o6, o7
+	})
+}
+
+// happyUnlockSeams installs seams that simulate a fully successful unlock:
+// running as root, tunnel up/reachable, connect ok, every interactive session
+// succeeding. Tests override individual seams to exercise failure branches.
+func happyUnlockSeams(t *testing.T) *unlockRecorder {
+	setUnlockSeams(t)
+	rec := &unlockRecorder{}
+	osGetuid = func() int { return 0 }
+	wgQuickUp = func(ctx context.Context, p string) error { rec.upCalled = true; return nil }
+	wgQuickDown = func(p string) error { rec.downCalled = true; return nil }
+	waitForTunnelFn = func(ip string, n int) error { return nil }
+	remoteConnect = func(ctx context.Context, opts *remote.ConnectOptions) (*remote.Client, error) {
+		return &remote.Client{}, nil
+	}
+	interactiveSession = func(c *remote.Client, cmd string) error {
+		rec.sessions = append(rec.sessions, cmd)
+		return nil
+	}
+	unlockStdin = strings.NewReader("")
+	return rec
+}
+
+// writeUnlockReady creates an output dir containing the three artifacts
+// cmdUnlock requires, plus a valid config pointing at it. If luksDevice is
+// non-empty it is written under [luks].
+func writeUnlockReady(t *testing.T, luksDevice string) string {
+	t.Helper()
+	dir := t.TempDir()
+	outDir := filepath.Join(dir, "out")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"client_wg.conf", "client_auth_ed25519", "dropbear_host_key.pub"} {
+		touch(t, outDir, n)
+	}
+	cfg := `host = "192.168.1.100"
+
+[ssh]
+user = "root"
+port = 22
+
+[wireguard]
+port = 51820
+server_ip = "10.42.0.1/24"
+client_ip = "10.42.0.2/32"
+
+[dropbear]
+port = 22
+
+[output]
+dir = "` + outDir + `"
+`
+	if luksDevice != "" {
+		cfg += "\n[luks]\ndevice = \"" + luksDevice + "\"\n"
+	}
+	p := filepath.Join(dir, "ubo.toml")
+	if err := os.WriteFile(p, []byte(cfg), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestCmdUnlock_missingFiles(t *testing.T) {
+	setUnlockSeams(t)
+	osGetuid = func() int { return 0 }
+	// Valid config but the output dir has no artifacts.
+	dir := t.TempDir()
+	cfgPath := writeValidConfig(t, dir, filepath.Join(dir, "out"))
+	err := cmdUnlock(context.Background(), cfgPath, false)
+	if err == nil || !strings.Contains(err.Error(), "missing file") {
+		t.Fatalf("error = %v; want 'missing file'", err)
+	}
+}
+
+func TestCmdUnlock_wgUpFails(t *testing.T) {
+	rec := happyUnlockSeams(t)
+	wgQuickUp = func(ctx context.Context, p string) error { return errBoom }
+	cfgPath := writeUnlockReady(t, "")
+	out := captureStdout(t, func() {
+		err := cmdUnlock(context.Background(), cfgPath, false)
+		if err == nil || !strings.Contains(err.Error(), "wg-quick up") {
+			t.Fatalf("error = %v; want 'wg-quick up'", err)
+		}
+	})
+	_ = out
+	// Tunnel-down must NOT run when bring-up failed (defer registered after).
+	if rec.downCalled {
+		t.Errorf("wgQuickDown should not run when wg-quick up failed")
+	}
+}
+
+func TestCmdUnlock_tunnelTimeout(t *testing.T) {
+	rec := happyUnlockSeams(t)
+	waitForTunnelFn = func(ip string, n int) error { return errBoom }
+	cfgPath := writeUnlockReady(t, "")
+	_ = captureStdout(t, func() {
+		err := cmdUnlock(context.Background(), cfgPath, false)
+		if err == nil {
+			t.Fatal("expected tunnel timeout error")
+		}
+	})
+	if !rec.upCalled || !rec.downCalled {
+		t.Errorf("up=%v down=%v; both should run (down via defer)", rec.upCalled, rec.downCalled)
+	}
+}
+
+func TestCmdUnlock_connectFails(t *testing.T) {
+	happyUnlockSeams(t)
+	remoteConnect = func(ctx context.Context, opts *remote.ConnectOptions) (*remote.Client, error) {
+		return nil, errBoom
+	}
+	cfgPath := writeUnlockReady(t, "")
+	_ = captureStdout(t, func() {
+		err := cmdUnlock(context.Background(), cfgPath, false)
+		if err == nil || !strings.Contains(err.Error(), "connect to Dropbear") {
+			t.Fatalf("error = %v; want 'connect to Dropbear'", err)
+		}
+	})
+}
+
+func TestCmdUnlock_success(t *testing.T) {
+	rec := happyUnlockSeams(t)
+	cfgPath := writeUnlockReady(t, "")
+	out := captureStdout(t, func() {
+		if err := cmdUnlock(context.Background(), cfgPath, false); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	if !strings.Contains(out, "unlock complete") {
+		t.Errorf("output = %q; want 'unlock complete'", out)
+	}
+	if len(rec.sessions) != 1 || rec.sessions[0] != "cryptroot-unlock" {
+		t.Errorf("sessions = %v; want exactly [cryptroot-unlock]", rec.sessions)
+	}
+	if !rec.downCalled {
+		t.Errorf("wgQuickDown should run on success")
+	}
+}
+
+func TestCmdUnlock_unlockFails(t *testing.T) {
+	happyUnlockSeams(t)
+	interactiveSession = func(c *remote.Client, cmd string) error { return errBoom }
+	cfgPath := writeUnlockReady(t, "")
+	_ = captureStdout(t, func() {
+		err := cmdUnlock(context.Background(), cfgPath, false)
+		if err == nil || !strings.Contains(err.Error(), "cryptroot-unlock") {
+			t.Fatalf("error = %v; want 'cryptroot-unlock'", err)
+		}
+	})
+}
+
+func TestCmdUnlock_changeKey_deviceSet_unlocks(t *testing.T) {
+	rec := happyUnlockSeams(t)
+	unlockStdin = strings.NewReader("y\n")
+	cfgPath := writeUnlockReady(t, "/dev/sda3")
+	_ = captureStdout(t, func() {
+		if err := cmdUnlock(context.Background(), cfgPath, true); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	// First session is the change-key command with the explicit device; second is unlock.
+	if len(rec.sessions) != 2 {
+		t.Fatalf("sessions = %v; want 2 (change then unlock)", rec.sessions)
+	}
+	if !strings.Contains(rec.sessions[0], `luksChangeKey "/dev/sda3"`) {
+		t.Errorf("change cmd = %q; want explicit device", rec.sessions[0])
+	}
+	if rec.sessions[1] != "cryptroot-unlock" {
+		t.Errorf("second session = %q; want cryptroot-unlock", rec.sessions[1])
+	}
+}
+
+func TestCmdUnlock_changeKey_noDevice_emptyAnswerUnlocks(t *testing.T) {
+	rec := happyUnlockSeams(t)
+	unlockStdin = strings.NewReader("\n") // empty -> defaults to yes
+	cfgPath := writeUnlockReady(t, "")    // no device -> awk /etc/crypttab path
+	_ = captureStdout(t, func() {
+		if err := cmdUnlock(context.Background(), cfgPath, true); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	if len(rec.sessions) != 2 {
+		t.Fatalf("sessions = %v; want 2", rec.sessions)
+	}
+	if !strings.Contains(rec.sessions[0], "/etc/crypttab") {
+		t.Errorf("change cmd = %q; want crypttab-derived device", rec.sessions[0])
+	}
+}
+
+func TestCmdUnlock_changeKey_declined(t *testing.T) {
+	rec := happyUnlockSeams(t)
+	unlockStdin = strings.NewReader("n\n")
+	cfgPath := writeUnlockReady(t, "/dev/sda3")
+	out := captureStdout(t, func() {
+		if err := cmdUnlock(context.Background(), cfgPath, true); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	if !strings.Contains(out, "not unlocking") {
+		t.Errorf("output = %q; want 'not unlocking'", out)
+	}
+	// Only the change session ran; no unlock.
+	if len(rec.sessions) != 1 {
+		t.Errorf("sessions = %v; want only the change session", rec.sessions)
+	}
+	if !rec.downCalled {
+		t.Errorf("tunnel should still be torn down after declining")
+	}
+}
+
+// When teardown fails, cmdUnlock still returns the primary result (here
+// success) but emits a warning. We exercise the warning branch of the defer.
+func TestCmdUnlock_downFailureWarns(t *testing.T) {
+	happyUnlockSeams(t)
+	wgQuickDown = func(p string) error { return errBoom }
+	cfgPath := writeUnlockReady(t, "")
+	// Warning goes to stderr; success result to stdout. The call must still
+	// succeed despite teardown failing.
+	_ = captureStdout(t, func() {
+		if err := cmdUnlock(context.Background(), cfgPath, false); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestCmdUnlock_changeKey_changeFails(t *testing.T) {
+	happyUnlockSeams(t)
+	interactiveSession = func(c *remote.Client, cmd string) error { return errBoom }
+	cfgPath := writeUnlockReady(t, "/dev/sda3")
+	_ = captureStdout(t, func() {
+		err := cmdUnlock(context.Background(), cfgPath, true)
+		if err == nil || !strings.Contains(err.Error(), "luksChangeKey") {
+			t.Fatalf("error = %v; want 'luksChangeKey'", err)
+		}
+	})
 }
 
 // --- waitForTunnel ----------------------------------------------------------
