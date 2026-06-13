@@ -10,8 +10,7 @@ import (
 
 	"ubo/internal/config"
 	"ubo/internal/keygen"
-
-	gossh "golang.org/x/crypto/ssh"
+	"ubo/internal/remote"
 )
 
 // ── seam fakes ────────────────────────────────────────────────────────────────
@@ -43,7 +42,7 @@ type readResult struct {
 	err     error
 }
 
-func (f *fakeRemote) run(_ context.Context, _ *gossh.Client, cmd string) (string, error) {
+func (f *fakeRemote) run(_ context.Context, _ *remote.Client, cmd string) (string, error) {
 	f.runCalls = append(f.runCalls, cmd)
 	if r, ok := f.runResponses[cmd]; ok {
 		return r.out, r.err
@@ -51,14 +50,14 @@ func (f *fakeRemote) run(_ context.Context, _ *gossh.Client, cmd string) (string
 	return f.runDefault.out, f.runDefault.err
 }
 
-func (f *fakeRemote) read(_ *gossh.Client, path string) (string, error) {
+func (f *fakeRemote) read(_ *remote.Client, path string) (string, error) {
 	if r, ok := f.readResponses[path]; ok {
 		return r.content, r.err
 	}
 	return "", nil
 }
 
-func (f *fakeRemote) write(_ *gossh.Client, path, _ string, _ os.FileMode) error {
+func (f *fakeRemote) write(_ *remote.Client, path, _ string, _ os.FileMode) error {
 	f.writeCalls = append(f.writeCalls, path)
 	if f.writeErrs != nil {
 		if err, ok := f.writeErrs[path]; ok {
@@ -68,7 +67,7 @@ func (f *fakeRemote) write(_ *gossh.Client, path, _ string, _ os.FileMode) error
 	return nil
 }
 
-func (f *fakeRemote) writeExec(_ *gossh.Client, path, _ string) error {
+func (f *fakeRemote) writeExec(_ *remote.Client, path, _ string) error {
 	return f.write(nil, path, "", 0755)
 }
 

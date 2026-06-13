@@ -2,18 +2,94 @@ package remote
 
 import (
 	"context"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
-
-	"golang.org/x/crypto/ssh"
 )
 
-// writeTemp writes data to a file named name under a fresh temp dir and returns
-// the path.
+// ----- fake ssh harness -----
+//
+// The package invokes the system ssh binary via exec.Command("ssh", ...). To
+// test without a real server, each test installs a FAKE `ssh` executable as the
+// first entry on PATH (via t.Setenv, which auto-restores). The fake is a small
+// shell script whose behavior is driven by environment variables the test sets:
+//
+//	FAKE_SSH_ARGV   - file the fake appends each argv element to (one per line),
+//	                  so tests can assert the ssh options/remote command used.
+//	FAKE_SSH_STDIN  - file the fake copies its stdin to (used by WriteFile to
+//	                  prove content was piped through).
+//	FAKE_SSH_STDOUT - text the fake prints to stdout.
+//	FAKE_SSH_STDERR - text the fake prints to stderr.
+//	FAKE_SSH_EXIT   - exit status the fake returns (default 0).
+//
+// installFakeSSH writes the script into a temp dir, prepends it to PATH, and
+// returns the argv-record path so the test can read back the exact arguments.
+func installFakeSSH(t *testing.T) (argvFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	argvFile = filepath.Join(dir, "argv")
+	script := `#!/bin/sh
+for a in "$@"; do
+  printf '%s\n' "$a" >> "$FAKE_SSH_ARGV"
+done
+if [ -n "$FAKE_SSH_STDIN" ]; then
+  cat > "$FAKE_SSH_STDIN"
+fi
+if [ -n "$FAKE_SSH_STDOUT" ]; then
+  printf '%s' "$FAKE_SSH_STDOUT"
+fi
+if [ -n "$FAKE_SSH_STDERR" ]; then
+  printf '%s' "$FAKE_SSH_STDERR" >&2
+fi
+exit ${FAKE_SSH_EXIT:-0}
+`
+	sshPath := filepath.Join(dir, "ssh")
+	if err := os.WriteFile(sshPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake ssh: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_SSH_ARGV", argvFile)
+	// Clear any leftover controls so each test starts clean.
+	t.Setenv("FAKE_SSH_STDIN", "")
+	t.Setenv("FAKE_SSH_STDOUT", "")
+	t.Setenv("FAKE_SSH_STDERR", "")
+	t.Setenv("FAKE_SSH_EXIT", "")
+	return argvFile
+}
+
+// readArgv returns the recorded argv elements (one per line).
+func readArgv(t *testing.T, argvFile string) []string {
+	t.Helper()
+	data, err := os.ReadFile(argvFile)
+	if err != nil {
+		t.Fatalf("read argv file: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	return lines
+}
+
+// argvContainsPair asserts that the argv slice contains the adjacent pair
+// flag,value (e.g. "-p","2222").
+func argvContainsPair(argv []string, flag, value string) bool {
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == flag && argv[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func argvContains(argv []string, want string) bool {
+	for _, a := range argv {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// writeTemp writes data under a fresh temp dir and returns the path.
 func writeTemp(t *testing.T, name string, data []byte, mode os.FileMode) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -24,645 +100,499 @@ func writeTemp(t *testing.T, name string, data []byte, mode os.FileMode) string 
 	return path
 }
 
-// authorizedKeyFile writes the public key of signer in authorized_keys format
-// and returns the path.
-func authorizedKeyFile(t *testing.T, signer ssh.Signer) string {
+// validPinned writes a syntactically valid authorized_keys-format file.
+func validPinned(t *testing.T) string {
 	t.Helper()
-	line := ssh.MarshalAuthorizedKey(signer.PublicKey())
-	return writeTemp(t, "host_key.pub", line, 0644)
+	return writeTemp(t, "host_key.pub",
+		[]byte("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabcdefg comment here\n"), 0644)
 }
 
-// isolateEnv points HOME at an empty temp dir and clears SSH_AUTH_SOCK so that
-// buildAuthMethods sees no agent and no default keys.
-func isolateEnv(t *testing.T) {
-	t.Helper()
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("SSH_AUTH_SOCK", "")
+// ----- knownHostsHostname -----
+
+func TestKnownHostsHostname_Port22(t *testing.T) {
+	if got := knownHostsHostname("example.com", 22); got != "example.com" {
+		t.Fatalf("port 22 should be bare host, got %q", got)
+	}
 }
 
-// ----- buildAuthMethods -----
+func TestKnownHostsHostname_NonDefaultPort(t *testing.T) {
+	if got := knownHostsHostname("example.com", 2222); got != "[example.com]:2222" {
+		t.Fatalf("non-22 port should be [host]:port, got %q", got)
+	}
+}
 
-func TestBuildAuthMethods_ExplicitValidKey(t *testing.T) {
-	_, keyPath := writeKeyPair(t)
-	auths, err := buildAuthMethods(keyPath)
+// ----- parseAuthorizedKey -----
+
+func TestParseAuthorizedKey_Valid(t *testing.T) {
+	kt, kd, err := parseAuthorizedKey([]byte("# a comment\n\nssh-ed25519 AAAAdata trailing comment\n"))
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
-	if len(auths) != 1 {
-		t.Fatalf("expected 1 auth method, got %d", len(auths))
+	if kt != "ssh-ed25519" || kd != "AAAAdata" {
+		t.Fatalf("got type=%q data=%q", kt, kd)
 	}
 }
 
-func TestBuildAuthMethods_ExplicitMissingKey(t *testing.T) {
-	_, err := buildAuthMethods(filepath.Join(t.TempDir(), "nope"))
-	if err == nil || !strings.Contains(err.Error(), "read SSH key") {
-		t.Fatalf("expected read error, got %v", err)
+func TestParseAuthorizedKey_Empty(t *testing.T) {
+	if _, _, err := parseAuthorizedKey([]byte("\n   \n# only comments\n")); err == nil {
+		t.Fatalf("expected error for no key")
 	}
 }
 
-func TestBuildAuthMethods_ExplicitUnparseableKey(t *testing.T) {
-	bad := writeTemp(t, "bad", []byte("not a private key"), 0600)
-	_, err := buildAuthMethods(bad)
-	if err == nil || !strings.Contains(err.Error(), "parse SSH key") {
-		t.Fatalf("expected parse error, got %v", err)
+func TestParseAuthorizedKey_TooFewFields(t *testing.T) {
+	if _, _, err := parseAuthorizedKey([]byte("ssh-ed25519\n")); err == nil ||
+		!strings.Contains(err.Error(), "malformed") {
+		t.Fatalf("expected malformed error, got %v", err)
 	}
 }
 
-func TestBuildAuthMethods_NoKeysNoAgent(t *testing.T) {
-	isolateEnv(t)
-	auths, err := buildAuthMethods("")
+func TestParseAuthorizedKey_UnknownType(t *testing.T) {
+	if _, _, err := parseAuthorizedKey([]byte("totally-bogus AAAAdata\n")); err == nil ||
+		!strings.Contains(err.Error(), "unrecognized key type") {
+		t.Fatalf("expected unrecognized type error, got %v", err)
+	}
+}
+
+func TestParseAuthorizedKey_AcceptsEcdsaAndSk(t *testing.T) {
+	if _, _, err := parseAuthorizedKey([]byte("ecdsa-sha2-nistp256 AAAAdata\n")); err != nil {
+		t.Fatalf("ecdsa- prefix should be accepted: %v", err)
+	}
+	if _, _, err := parseAuthorizedKey([]byte("sk-ssh-ed25519@openssh.com AAAAdata\n")); err != nil {
+		t.Fatalf("sk- prefix should be accepted: %v", err)
+	}
+}
+
+// ----- Connect: validation -----
+
+func TestConnect_NilOptions(t *testing.T) {
+	if _, err := Connect(context.Background(), nil); err == nil {
+		t.Fatalf("expected error for nil options")
+	}
+}
+
+func TestConnect_MissingHost(t *testing.T) {
+	_, err := Connect(context.Background(), &ConnectOptions{User: "u", Port: 22, KnownHostsPath: "/tmp/kh"})
+	if err == nil || !strings.Contains(err.Error(), "host is required") {
+		t.Fatalf("expected host required, got %v", err)
+	}
+}
+
+func TestConnect_MissingUser(t *testing.T) {
+	_, err := Connect(context.Background(), &ConnectOptions{Host: "h", Port: 22, KnownHostsPath: "/tmp/kh"})
+	if err == nil || !strings.Contains(err.Error(), "user is required") {
+		t.Fatalf("expected user required, got %v", err)
+	}
+}
+
+func TestConnect_InvalidPort(t *testing.T) {
+	_, err := Connect(context.Background(), &ConnectOptions{Host: "h", User: "u", Port: 0, KnownHostsPath: "/tmp/kh"})
+	if err == nil || !strings.Contains(err.Error(), "invalid port") {
+		t.Fatalf("expected invalid port, got %v", err)
+	}
+}
+
+func TestConnect_BothModesSet(t *testing.T) {
+	_, err := Connect(context.Background(), &ConnectOptions{
+		Host: "h", User: "u", Port: 22,
+		KnownHostsPath: "/tmp/kh", PinnedKeyPath: validPinned(t),
+	})
+	if err == nil || !strings.Contains(err.Error(), "only one of") {
+		t.Fatalf("expected only-one error, got %v", err)
+	}
+}
+
+func TestConnect_NoMode(t *testing.T) {
+	_, err := Connect(context.Background(), &ConnectOptions{Host: "h", User: "u", Port: 22})
+	if err == nil || !strings.Contains(err.Error(), "set one of") {
+		t.Fatalf("expected set-one-of error, got %v", err)
+	}
+}
+
+// ----- Connect: TOFU mode -----
+
+func TestConnect_TOFU(t *testing.T) {
+	kh := filepath.Join(t.TempDir(), "known_hosts")
+	c, err := Connect(context.Background(), &ConnectOptions{
+		Host: "h", User: "u", Port: 22, KnownHostsPath: kh,
+	})
 	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
+		t.Fatalf("connect TOFU: %v", err)
 	}
-	if len(auths) != 0 {
-		t.Fatalf("expected 0 auth methods, got %d", len(auths))
+	if c.strictMode != "accept-new" {
+		t.Fatalf("expected accept-new, got %q", c.strictMode)
+	}
+	if c.knownHostsFile != kh {
+		t.Fatalf("expected known hosts %q, got %q", kh, c.knownHostsFile)
+	}
+	if c.tempKnownHosts != "" {
+		t.Fatalf("TOFU must not create a temp known_hosts file")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 }
 
-func TestBuildAuthMethods_DefaultKeyPicked(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("SSH_AUTH_SOCK", "")
-	// Write a valid default key at ~/.ssh/id_ed25519.
-	_, keyPath := writeKeyPair(t)
-	data, err := os.ReadFile(keyPath)
+// ----- Connect: pinned mode -----
+
+func TestConnect_PinnedMaterializesKnownHosts(t *testing.T) {
+	pinned := validPinned(t)
+	c, err := Connect(context.Background(), &ConnectOptions{
+		Host: "h", User: "u", Port: 2222, PinnedKeyPath: pinned,
+	})
+	if err != nil {
+		t.Fatalf("connect pinned: %v", err)
+	}
+	if c.strictMode != "yes" {
+		t.Fatalf("expected strict yes, got %q", c.strictMode)
+	}
+	want := pinned + ".known_hosts"
+	if c.knownHostsFile != want || c.tempKnownHosts != want {
+		t.Fatalf("expected known hosts %q, got file=%q temp=%q", want, c.knownHostsFile, c.tempKnownHosts)
+	}
+	data, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("read materialized known_hosts: %v", err)
+	}
+	// Non-default port -> [host]:port format.
+	if !strings.HasPrefix(string(data), "[h]:2222 ssh-ed25519 AAAAC3") {
+		t.Fatalf("unexpected known_hosts line: %q", string(data))
+	}
+}
+
+func TestConnect_PinnedPort22Format(t *testing.T) {
+	pinned := validPinned(t)
+	c, err := Connect(context.Background(), &ConnectOptions{
+		Host: "h", User: "u", Port: 22, PinnedKeyPath: pinned,
+	})
+	if err != nil {
+		t.Fatalf("connect pinned: %v", err)
+	}
+	defer c.Close()
+	data, err := os.ReadFile(c.knownHostsFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sshDir := filepath.Join(home, ".ssh")
-	if err := os.MkdirAll(sshDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(sshDir, "id_ed25519"), data, 0600); err != nil {
-		t.Fatal(err)
-	}
-	auths, err := buildAuthMethods("")
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if len(auths) != 1 {
-		t.Fatalf("expected 1 default-key auth method, got %d", len(auths))
+	if !strings.HasPrefix(string(data), "h ssh-ed25519 ") {
+		t.Fatalf("port 22 should use bare host, got %q", string(data))
 	}
 }
 
-func TestBuildAuthMethods_DefaultKeyUnparseableSkipped(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("SSH_AUTH_SOCK", "")
-	sshDir := filepath.Join(home, ".ssh")
-	if err := os.MkdirAll(sshDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	// Corrupt default key file is silently skipped (continue branch).
-	if err := os.WriteFile(filepath.Join(sshDir, "id_rsa"), []byte("garbage"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	auths, err := buildAuthMethods("")
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if len(auths) != 0 {
-		t.Fatalf("expected 0 auth methods (corrupt key skipped), got %d", len(auths))
-	}
-}
-
-func TestBuildAuthMethods_AgentDialFailure(t *testing.T) {
-	// SSH_AUTH_SOCK points at a non-existent socket: net.Dial fails, branch
-	// taken but no method added.
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("SSH_AUTH_SOCK", filepath.Join(t.TempDir(), "agent.sock"))
-	auths, err := buildAuthMethods("")
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if len(auths) != 0 {
-		t.Fatalf("expected 0 auth methods, got %d", len(auths))
-	}
-}
-
-func TestBuildAuthMethods_AgentDialSuccess(t *testing.T) {
-	// A live unix socket: net.Dial succeeds, so the agent callback method is
-	// appended (covering the success branch of the agent block).
-	// Use a short socket path: unix socket paths are limited to ~108 bytes,
-	// and nix-shell's TMPDIR is too deep, so place it under os.TempDir() with a
-	// minimal name and clean it up explicitly.
-	sock := filepath.Join(os.TempDir(), "ubo-agent-test.sock")
-	os.Remove(sock)
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Skipf("unix socket unavailable: %v", err)
-	}
-	t.Cleanup(func() { os.Remove(sock) })
-	defer ln.Close()
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			c.Close()
-		}
-	}()
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("SSH_AUTH_SOCK", sock)
-	auths, err := buildAuthMethods("")
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if len(auths) != 1 {
-		t.Fatalf("expected 1 agent auth method, got %d", len(auths))
-	}
-}
-
-// ----- buildHostKeyCallback -----
-
-func TestBuildHostKeyCallback_PinnedValid(t *testing.T) {
-	signer := genSigner(t)
-	pinned := authorizedKeyFile(t, signer)
-	cb, err := buildHostKeyCallback(&ConnectOptions{PinnedKeyPath: pinned})
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if err := cb("host", &net.TCPAddr{}, signer.PublicKey()); err != nil {
-		t.Fatalf("matching pinned key should pass: %v", err)
-	}
-	// A different key must fail.
-	other := genSigner(t)
-	if err := cb("host", &net.TCPAddr{}, other.PublicKey()); err == nil {
-		t.Fatalf("mismatched pinned key should fail")
-	}
-}
-
-func TestBuildHostKeyCallback_PinnedMissing(t *testing.T) {
-	_, err := buildHostKeyCallback(&ConnectOptions{PinnedKeyPath: filepath.Join(t.TempDir(), "nope")})
+func TestConnect_PinnedMissing(t *testing.T) {
+	_, err := Connect(context.Background(), &ConnectOptions{
+		Host: "h", User: "u", Port: 22, PinnedKeyPath: filepath.Join(t.TempDir(), "nope"),
+	})
 	if err == nil || !strings.Contains(err.Error(), "read pinned host key") {
 		t.Fatalf("expected read error, got %v", err)
 	}
 }
 
-func TestBuildHostKeyCallback_PinnedUnparseable(t *testing.T) {
-	bad := writeTemp(t, "bad.pub", []byte("not-a-key"), 0644)
-	_, err := buildHostKeyCallback(&ConnectOptions{PinnedKeyPath: bad})
+func TestConnect_PinnedUnparseable(t *testing.T) {
+	bad := writeTemp(t, "bad.pub", []byte("not-a-key\n"), 0644)
+	_, err := Connect(context.Background(), &ConnectOptions{
+		Host: "h", User: "u", Port: 22, PinnedKeyPath: bad,
+	})
 	if err == nil || !strings.Contains(err.Error(), "parse pinned host key") {
 		t.Fatalf("expected parse error, got %v", err)
 	}
 }
 
-func TestBuildHostKeyCallback_KnownHostsTOFU(t *testing.T) {
-	khPath := filepath.Join(t.TempDir(), "known_hosts")
-	cb, err := buildHostKeyCallback(&ConnectOptions{KnownHostsPath: khPath})
+func TestConnect_PinnedWriteFailure(t *testing.T) {
+	// Place the pinned file inside a directory we then make read-only so the
+	// sibling ".known_hosts" cannot be written.
+	dir := t.TempDir()
+	pinned := filepath.Join(dir, "host_key.pub")
+	if err := os.WriteFile(pinned, []byte("ssh-ed25519 AAAAdata\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0700) })
+	_, err := Connect(context.Background(), &ConnectOptions{
+		Host: "h", User: "u", Port: 22, PinnedKeyPath: pinned,
+	})
+	if err == nil || !strings.Contains(err.Error(), "write known_hosts") {
+		// On some filesystems/uid-0 the chmod won't deny writes; skip then.
+		if os.Geteuid() == 0 {
+			t.Skip("running as root: directory permissions do not deny writes")
+		}
+		t.Fatalf("expected write known_hosts error, got %v", err)
+	}
+}
+
+// ----- sshArgs -----
+
+func TestSSHArgs_TOFUWithKey(t *testing.T) {
+	kh := filepath.Join(t.TempDir(), "kh")
+	key := writeTemp(t, "id", []byte("k"), 0600)
+	c, err := Connect(context.Background(), &ConnectOptions{
+		Host: "host", User: "bob", Port: 2222, KeyPath: key, KnownHostsPath: kh,
+	})
 	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
+		t.Fatal(err)
 	}
-	if cb == nil {
-		t.Fatalf("expected non-nil callback")
+	args := c.sshArgs()
+	if !argvContainsPair(args, "-p", "2222") {
+		t.Fatalf("missing -p 2222 in %v", args)
+	}
+	if !argvContainsPair(args, "-i", key) {
+		t.Fatalf("missing -i key in %v", args)
+	}
+	if !argvContains(args, "BatchMode=yes") || !argvContains(args, "ConnectTimeout=30") {
+		t.Fatalf("missing batch/timeout opts in %v", args)
+	}
+	if !argvContains(args, "UserKnownHostsFile="+kh) {
+		t.Fatalf("missing UserKnownHostsFile in %v", args)
+	}
+	if !argvContains(args, "StrictHostKeyChecking=accept-new") {
+		t.Fatalf("missing accept-new in %v", args)
+	}
+	if args[len(args)-1] != "bob@host" {
+		t.Fatalf("expected user@host last, got %q", args[len(args)-1])
 	}
 }
 
-func TestBuildHostKeyCallback_InsecureFallback(t *testing.T) {
-	cb, err := buildHostKeyCallback(&ConnectOptions{})
+func TestSSHArgs_PinnedStrictYesNoKey(t *testing.T) {
+	pinned := validPinned(t)
+	c, err := Connect(context.Background(), &ConnectOptions{
+		Host: "host", User: "root", Port: 22, PinnedKeyPath: pinned,
+	})
 	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
+		t.Fatal(err)
 	}
-	// Fallback accepts any key.
-	if err := cb("host", &net.TCPAddr{}, genSigner(t).PublicKey()); err != nil {
-		t.Fatalf("insecure fallback should accept any key: %v", err)
+	defer c.Close()
+	args := c.sshArgs()
+	if !argvContains(args, "StrictHostKeyChecking=yes") {
+		t.Fatalf("expected strict yes in %v", args)
 	}
-}
-
-// ----- toFUCallback -----
-
-func TestTOFUCallback_FirstConnectionSaves(t *testing.T) {
-	savePath := filepath.Join(t.TempDir(), "known_hosts")
-	cb := toFUCallback(savePath)
-	signer := genSigner(t)
-	addr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 22}
-	if err := cb("127.0.0.1:22", addr, signer.PublicKey()); err != nil {
-		t.Fatalf("first connection should save and pass: %v", err)
-	}
-	if _, err := os.Stat(savePath); err != nil {
-		t.Fatalf("known_hosts not saved: %v", err)
-	}
-	// Second connection with the SAME key passes.
-	if err := cb("127.0.0.1:22", addr, signer.PublicKey()); err != nil {
-		t.Fatalf("second connection same key should pass: %v", err)
+	if argvContains(args, "-i") {
+		t.Fatalf("no key was set; -i should be absent in %v", args)
 	}
 }
 
-func TestTOFUCallback_MismatchFails(t *testing.T) {
-	savePath := filepath.Join(t.TempDir(), "known_hosts")
-	cb := toFUCallback(savePath)
-	addr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 22}
-	first := genSigner(t)
-	if err := cb("127.0.0.1:22", addr, first.PublicKey()); err != nil {
-		t.Fatalf("first connection should pass: %v", err)
-	}
-	// A different key on the same host must fail.
-	second := genSigner(t)
-	if err := cb("127.0.0.1:22", addr, second.PublicKey()); err == nil {
-		t.Fatalf("mismatched key should fail")
-	}
-}
+// ----- RunCommand -----
 
-func TestTOFUCallback_CorruptKnownHosts(t *testing.T) {
-	// An existing but unparseable known_hosts file makes knownhosts.New error.
-	savePath := writeTemp(t, "known_hosts", []byte("@@@ totally broken line\n"), 0600)
-	cb := toFUCallback(savePath)
-	addr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 22}
-	err := cb("127.0.0.1:22", addr, genSigner(t).PublicKey())
-	if err == nil {
-		t.Fatalf("expected error from corrupt known_hosts")
-	}
-}
-
-func TestTOFUCallback_SaveFailure(t *testing.T) {
-	// savePath whose parent does not exist -> os.WriteFile fails.
-	savePath := filepath.Join(t.TempDir(), "missing-dir", "known_hosts")
-	cb := toFUCallback(savePath)
-	addr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 22}
-	err := cb("127.0.0.1:22", addr, genSigner(t).PublicKey())
-	if err == nil || !strings.Contains(err.Error(), "save host key") {
-		t.Fatalf("expected save host key error, got %v", err)
-	}
-}
-
-// ----- Connect / RunCommand / WriteFile / ReadFile / InteractiveSession -----
-
-// newConnectedClient starts a server authorizing clientSigner and returns a
-// connected *ssh.Client plus the server.
-func newConnectedClient(t *testing.T) (*ssh.Client, *testServer) {
+func newTOFUClient(t *testing.T) *Client {
 	t.Helper()
-	clientSigner, clientKeyPath := writeKeyPair(t)
-	rootDir := t.TempDir()
-	srv := newTestServer(t, clientSigner.PublicKey(), rootDir)
-	pinned := authorizedKeyFile(t, srv.hostSigner)
-
-	ctx := context.Background()
-	client, err := Connect(ctx, &ConnectOptions{
-		Host:          srv.host(),
-		Port:          srv.port(),
-		User:          "tester",
-		KeyPath:       clientKeyPath,
-		PinnedKeyPath: pinned,
+	kh := filepath.Join(t.TempDir(), "kh")
+	c, err := Connect(context.Background(), &ConnectOptions{
+		Host: "host", User: "u", Port: 22, KnownHostsPath: kh,
 	})
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	t.Cleanup(func() { client.Close() })
-	return client, srv
-}
-
-func TestConnect_SuccessPinned(t *testing.T) {
-	client, _ := newConnectedClient(t)
-	if client == nil {
-		t.Fatalf("expected client")
-	}
-}
-
-func TestConnect_SuccessTOFU(t *testing.T) {
-	clientSigner, clientKeyPath := writeKeyPair(t)
-	srv := newTestServer(t, clientSigner.PublicKey(), t.TempDir())
-	khPath := filepath.Join(t.TempDir(), "known_hosts")
-
-	client, err := Connect(context.Background(), &ConnectOptions{
-		Host:           srv.host(),
-		Port:           srv.port(),
-		User:           "tester",
-		KeyPath:        clientKeyPath,
-		KnownHostsPath: khPath,
-	})
-	if err != nil {
-		t.Fatalf("connect TOFU: %v", err)
-	}
-	defer client.Close()
-	if _, err := os.Stat(khPath); err != nil {
-		t.Fatalf("TOFU did not save known_hosts: %v", err)
-	}
-}
-
-func TestConnect_AuthMethodError(t *testing.T) {
-	// An unparseable KeyPath makes buildAuthMethods return an error, covering
-	// the first error branch of Connect.
-	bad := writeTemp(t, "bad", []byte("not a key"), 0600)
-	_, err := Connect(context.Background(), &ConnectOptions{
-		Host: "127.0.0.1", Port: 1, User: "x", KeyPath: bad,
-	})
-	if err == nil || !strings.Contains(err.Error(), "parse SSH key") {
-		t.Fatalf("expected parse SSH key error, got %v", err)
-	}
-}
-
-func TestConnect_NoAuthMethods(t *testing.T) {
-	isolateEnv(t)
-	_, err := Connect(context.Background(), &ConnectOptions{
-		Host: "127.0.0.1", Port: 1, User: "x",
-	})
-	if err == nil || !strings.Contains(err.Error(), "no SSH auth methods") {
-		t.Fatalf("expected no-auth error, got %v", err)
-	}
-}
-
-func TestConnect_BadHostKeyCallback(t *testing.T) {
-	_, clientKeyPath := writeKeyPair(t)
-	_, err := Connect(context.Background(), &ConnectOptions{
-		Host: "127.0.0.1", Port: 1, User: "x",
-		KeyPath:       clientKeyPath,
-		PinnedKeyPath: filepath.Join(t.TempDir(), "nope"),
-	})
-	if err == nil || !strings.Contains(err.Error(), "read pinned host key") {
-		t.Fatalf("expected host key callback error, got %v", err)
-	}
-}
-
-func TestConnect_DialFailure(t *testing.T) {
-	_, clientKeyPath := writeKeyPair(t)
-	// Reserve a port then close it so the dial is refused.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
-
-	_, err = Connect(context.Background(), &ConnectOptions{
-		Host: "127.0.0.1", Port: port, User: "x",
-		KeyPath: clientKeyPath,
-	})
-	if err == nil || !strings.Contains(err.Error(), "connect to") {
-		t.Fatalf("expected dial error, got %v", err)
-	}
-}
-
-func TestConnect_HandshakeFailureWrongKey(t *testing.T) {
-	// Server authorizes a DIFFERENT key than the client presents.
-	authorizedSigner := genSigner(t)
-	srv := newTestServer(t, authorizedSigner.PublicKey(), t.TempDir())
-	_, wrongKeyPath := writeKeyPair(t)
-	pinned := authorizedKeyFile(t, srv.hostSigner)
-
-	_, err := Connect(context.Background(), &ConnectOptions{
-		Host: srv.host(), Port: srv.port(), User: "tester",
-		KeyPath:       wrongKeyPath,
-		PinnedKeyPath: pinned,
-	})
-	if err == nil || !strings.Contains(err.Error(), "SSH handshake") {
-		t.Fatalf("expected handshake error, got %v", err)
-	}
+	return c
 }
 
 func TestRunCommand_Success(t *testing.T) {
-	client, _ := newConnectedClient(t)
-	out, err := RunCommand(context.Background(), client, "echo hello world")
+	argv := installFakeSSH(t)
+	t.Setenv("FAKE_SSH_STDOUT", "hello world\n")
+	c := newTOFUClient(t)
+	out, err := RunCommand(context.Background(), c, "echo hi")
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if out != "hello world" {
-		t.Fatalf("unexpected output %q", out)
+		t.Fatalf("expected trimmed output, got %q", out)
+	}
+	args := readArgv(t, argv)
+	if args[len(args)-1] != "echo hi" {
+		t.Fatalf("remote command should be last arg, got %q", args[len(args)-1])
 	}
 }
 
-func TestRunCommand_FailureReturnsOutput(t *testing.T) {
-	client, _ := newConnectedClient(t)
-	out, err := RunCommand(context.Background(), client, "echo boom >&2; exit 3")
-	if err == nil {
-		t.Fatalf("expected command failure")
-	}
-	if !strings.Contains(err.Error(), "remote command failed") {
-		t.Fatalf("unexpected error %v", err)
+func TestRunCommand_NonZeroExit(t *testing.T) {
+	installFakeSSH(t)
+	t.Setenv("FAKE_SSH_STDERR", "boom\n")
+	t.Setenv("FAKE_SSH_EXIT", "3")
+	c := newTOFUClient(t)
+	out, err := RunCommand(context.Background(), c, "false")
+	if err == nil || !strings.Contains(err.Error(), "remote command failed") {
+		t.Fatalf("expected failure, got %v", err)
 	}
 	if out != "boom" {
-		t.Fatalf("expected captured stderr 'boom', got %q", out)
+		t.Fatalf("expected captured 'boom', got %q", out)
 	}
 }
 
-func TestRunCommand_ContextCancel(t *testing.T) {
-	client, _ := newConnectedClient(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	// Cancel almost immediately while a long command runs; the goroutine should
-	// close the session and the command should error out.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
-	_, err := RunCommand(ctx, client, "sleep 5")
-	if err == nil {
-		t.Fatalf("expected error from cancelled context")
-	}
-}
+// ----- WriteFile / WriteFileExec -----
 
-func TestRunCommand_NewSessionFailure(t *testing.T) {
-	client, _ := newConnectedClient(t)
-	client.Close() // closing underlying conn makes NewSession fail
-	_, err := RunCommand(context.Background(), client, "echo hi")
-	if err == nil || !strings.Contains(err.Error(), "new SSH session") {
-		t.Fatalf("expected new session error, got %v", err)
-	}
-}
+func TestWriteFile_PipesStdinAndChmod(t *testing.T) {
+	argv := installFakeSSH(t)
+	stdinFile := filepath.Join(t.TempDir(), "stdin")
+	t.Setenv("FAKE_SSH_STDIN", stdinFile)
+	c := newTOFUClient(t)
 
-func TestWriteReadFile_RoundTrip(t *testing.T) {
-	client, srv := newConnectedClient(t)
-	remotePath := filepath.Join(srv.rootDir, "sub", "dir", "file.txt")
 	content := "the quick brown fox"
-
-	if err := WriteFile(client, remotePath, content, 0640); err != nil {
+	if err := WriteFile(c, "/etc/dropbear/file", content, 0640); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	// Parent dirs created, content present, mode applied.
-	info, err := os.Stat(remotePath)
+	got, err := os.ReadFile(stdinFile)
 	if err != nil {
-		t.Fatalf("stat written file: %v", err)
+		t.Fatalf("read piped stdin: %v", err)
 	}
-	if info.Mode().Perm() != 0640 {
-		t.Fatalf("expected mode 0640, got %o", info.Mode().Perm())
+	if string(got) != content {
+		t.Fatalf("stdin content mismatch: %q", string(got))
 	}
-	got, err := ReadFile(client, remotePath)
-	if err != nil {
-		t.Fatalf("read: %v", err)
+	args := readArgv(t, argv)
+	remoteCmd := args[len(args)-1]
+	if !strings.Contains(remoteCmd, "mkdir -p '/etc/dropbear'") {
+		t.Fatalf("missing mkdir in remote cmd: %q", remoteCmd)
 	}
-	if got != content {
-		t.Fatalf("round trip mismatch: %q", got)
+	if !strings.Contains(remoteCmd, "cat > '/etc/dropbear/file'") {
+		t.Fatalf("missing cat redirect in remote cmd: %q", remoteCmd)
 	}
-}
-
-func TestWriteFileExec_Mode0755(t *testing.T) {
-	client, srv := newConnectedClient(t)
-	remotePath := filepath.Join(srv.rootDir, "script.sh")
-	if err := WriteFileExec(client, remotePath, "#!/bin/sh\ntrue\n"); err != nil {
-		t.Fatalf("write exec: %v", err)
-	}
-	info, err := os.Stat(remotePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0755 {
-		t.Fatalf("expected 0755, got %o", info.Mode().Perm())
+	if !strings.Contains(remoteCmd, "chmod 640 '/etc/dropbear/file'") {
+		t.Fatalf("expected octal mode 640 in remote cmd: %q", remoteCmd)
 	}
 }
 
-func TestWriteFile_MkdirFailure(t *testing.T) {
-	client, srv := newConnectedClient(t)
-	// Create a regular file, then try to write under it as if it were a dir.
-	blocker := filepath.Join(srv.rootDir, "blocker")
-	if err := os.WriteFile(blocker, []byte("x"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	remotePath := filepath.Join(blocker, "child", "file.txt")
-	err := WriteFile(client, remotePath, "data", 0644)
-	if err == nil {
-		t.Fatalf("expected mkdir failure under a file")
-	}
-	if !strings.Contains(err.Error(), "mkdir") && !strings.Contains(err.Error(), "open") {
-		t.Fatalf("unexpected error %v", err)
-	}
-}
-
-func TestWriteFile_OpenFailure(t *testing.T) {
-	client, srv := newConnectedClient(t)
-	// Make remotePath an existing directory; MkdirAll(parent) succeeds but
-	// OpenFile(O_WRONLY) on a directory fails, covering the open error branch.
-	remotePath := filepath.Join(srv.rootDir, "iam-a-dir")
-	if err := os.Mkdir(remotePath, 0755); err != nil {
-		t.Fatal(err)
-	}
-	err := WriteFile(client, remotePath, "data", 0644)
-	if err == nil || !strings.Contains(err.Error(), "open") {
-		t.Fatalf("expected open error writing to a directory, got %v", err)
-	}
-}
-
-func TestReadFile_OpenFailure(t *testing.T) {
-	client, srv := newConnectedClient(t)
-	_, err := ReadFile(client, filepath.Join(srv.rootDir, "does-not-exist"))
-	if err == nil || !strings.Contains(err.Error(), "open") {
-		t.Fatalf("expected open error, got %v", err)
-	}
-}
-
-func TestWriteFile_SFTPDenied(t *testing.T) {
-	clientSigner, clientKeyPath := writeKeyPair(t)
-	srv := newTestServer(t, clientSigner.PublicKey(), t.TempDir())
-	srv.denySFTP = true
-	pinned := authorizedKeyFile(t, srv.hostSigner)
-	client, err := Connect(context.Background(), &ConnectOptions{
-		Host: srv.host(), Port: srv.port(), User: "tester",
-		KeyPath: clientKeyPath, PinnedKeyPath: pinned,
-	})
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer client.Close()
-	err = WriteFile(client, filepath.Join(srv.rootDir, "f"), "x", 0644)
-	if err == nil || !strings.Contains(err.Error(), "SFTP open") {
-		t.Fatalf("expected SFTP open error, got %v", err)
-	}
-	if _, err := ReadFile(client, filepath.Join(srv.rootDir, "f")); err == nil ||
-		!strings.Contains(err.Error(), "SFTP open") {
-		t.Fatalf("expected SFTP open error on ReadFile, got %v", err)
-	}
-}
-
-// connectFaultySFTP connects a client to a server whose SFTP subsystem injects
-// the named fault.
-func connectFaultySFTP(t *testing.T, fault string) (*ssh.Client, *testServer) {
-	t.Helper()
-	clientSigner, clientKeyPath := writeKeyPair(t)
-	srv := newTestServer(t, clientSigner.PublicKey(), t.TempDir())
-	srv.sftpFault = fault
-	pinned := authorizedKeyFile(t, srv.hostSigner)
-	client, err := Connect(context.Background(), &ConnectOptions{
-		Host: srv.host(), Port: srv.port(), User: "tester",
-		KeyPath: clientKeyPath, PinnedKeyPath: pinned,
-	})
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(func() { client.Close() })
-	return client, srv
-}
-
-func TestWriteFile_WriteFailure(t *testing.T) {
-	client, srv := connectFaultySFTP(t, "write")
-	err := WriteFile(client, filepath.Join(srv.rootDir, "f.txt"), "data", 0644)
-	if err == nil || !strings.Contains(err.Error(), "write") {
+func TestWriteFile_NonZeroExit(t *testing.T) {
+	installFakeSSH(t)
+	t.Setenv("FAKE_SSH_STDIN", filepath.Join(t.TempDir(), "stdin"))
+	t.Setenv("FAKE_SSH_STDERR", "permission denied\n")
+	t.Setenv("FAKE_SSH_EXIT", "1")
+	c := newTOFUClient(t)
+	err := WriteFile(c, "/root/x", "data", 0644)
+	if err == nil || !strings.Contains(err.Error(), "write /root/x") {
 		t.Fatalf("expected write error, got %v", err)
 	}
 }
 
-func TestWriteFile_ChmodFailure(t *testing.T) {
-	client, srv := connectFaultySFTP(t, "setstat")
-	err := WriteFile(client, filepath.Join(srv.rootDir, "f.txt"), "data", 0644)
-	if err == nil || !strings.Contains(err.Error(), "chmod") {
-		t.Fatalf("expected chmod error, got %v", err)
+func TestWriteFileExec_Mode0755(t *testing.T) {
+	argv := installFakeSSH(t)
+	t.Setenv("FAKE_SSH_STDIN", filepath.Join(t.TempDir(), "stdin"))
+	c := newTOFUClient(t)
+	if err := WriteFileExec(c, "/usr/local/bin/x", "#!/bin/sh\n"); err != nil {
+		t.Fatalf("write exec: %v", err)
+	}
+	args := readArgv(t, argv)
+	if !strings.Contains(args[len(args)-1], "chmod 755 ") {
+		t.Fatalf("expected chmod 755, got %q", args[len(args)-1])
 	}
 }
 
-func TestReadFile_ReadFailure(t *testing.T) {
-	client, srv := connectFaultySFTP(t, "read")
-	_, err := ReadFile(client, filepath.Join(srv.rootDir, "f.txt"))
-	if err == nil || !strings.Contains(err.Error(), "read") {
-		t.Fatalf("expected read error, got %v", err)
+// ----- ReadFile -----
+
+func TestReadFile_Success(t *testing.T) {
+	argv := installFakeSSH(t)
+	// Content with trailing newline must be returned faithfully (no trimming).
+	t.Setenv("FAKE_SSH_STDOUT", "line1\nline2\n")
+	c := newTOFUClient(t)
+	got, err := ReadFile(c, "/etc/hostname")
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got != "line1\nline2\n" {
+		t.Fatalf("ReadFile must not trim, got %q", got)
+	}
+	args := readArgv(t, argv)
+	if args[len(args)-1] != "cat '/etc/hostname'" {
+		t.Fatalf("unexpected remote cmd %q", args[len(args)-1])
 	}
 }
+
+func TestReadFile_Error(t *testing.T) {
+	installFakeSSH(t)
+	t.Setenv("FAKE_SSH_STDERR", "No such file\n")
+	t.Setenv("FAKE_SSH_EXIT", "1")
+	c := newTOFUClient(t)
+	_, err := ReadFile(c, "/nope")
+	if err == nil || !strings.Contains(err.Error(), "open /nope") {
+		t.Fatalf("expected open error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "No such file") {
+		t.Fatalf("expected stderr captured, got %v", err)
+	}
+}
+
+// ----- InteractiveSession -----
 
 func TestInteractiveSession_Success(t *testing.T) {
-	client, _ := newConnectedClient(t)
-	if err := InteractiveSession(client, "true"); err != nil {
-		t.Fatalf("interactive 'true' should succeed: %v", err)
+	argv := installFakeSSH(t)
+	c := newTOFUClient(t)
+	if err := InteractiveSession(c, "cryptroot-unlock"); err != nil {
+		t.Fatalf("interactive success: %v", err)
+	}
+	args := readArgv(t, argv)
+	if !argvContains(args, "-t") {
+		t.Fatalf("expected -t (force PTY) in %v", args)
+	}
+	if !argvContains(args, "LogLevel=ERROR") {
+		t.Fatalf("expected LogLevel=ERROR in %v", args)
+	}
+	if args[len(args)-1] != "cryptroot-unlock" {
+		t.Fatalf("expected remote cmd last, got %q", args[len(args)-1])
 	}
 }
 
-func TestInteractiveSession_CommandFails(t *testing.T) {
-	client, _ := newConnectedClient(t)
-	if err := InteractiveSession(client, "exit 1"); err == nil {
-		t.Fatalf("expected non-zero exit to error")
+func TestInteractiveSession_Failure(t *testing.T) {
+	installFakeSSH(t)
+	t.Setenv("FAKE_SSH_EXIT", "1")
+	c := newTOFUClient(t)
+	if err := InteractiveSession(c, "exit 1"); err == nil ||
+		!strings.Contains(err.Error(), "remote session") {
+		t.Fatalf("expected remote session error, got %v", err)
 	}
 }
 
-func TestInteractiveSession_NewSessionFailure(t *testing.T) {
-	client, _ := newConnectedClient(t)
-	client.Close()
-	if err := InteractiveSession(client, "true"); err == nil ||
-		!strings.Contains(err.Error(), "new SSH session") {
-		t.Fatalf("expected new session error, got %v", err)
-	}
-}
+// ----- Close -----
 
-func TestInteractiveSession_RequestPtyFails(t *testing.T) {
-	clientSigner, clientKeyPath := writeKeyPair(t)
-	srv := newTestServer(t, clientSigner.PublicKey(), t.TempDir())
-	srv.denyPTY = true
-	pinned := authorizedKeyFile(t, srv.hostSigner)
-	client, err := Connect(context.Background(), &ConnectOptions{
-		Host: srv.host(), Port: srv.port(), User: "tester",
-		KeyPath: clientKeyPath, PinnedKeyPath: pinned,
+func TestClose_RemovesTempKnownHosts(t *testing.T) {
+	pinned := validPinned(t)
+	c, err := Connect(context.Background(), &ConnectOptions{
+		Host: "h", User: "u", Port: 22, PinnedKeyPath: pinned,
 	})
 	if err != nil {
-		t.Fatalf("connect: %v", err)
+		t.Fatal(err)
 	}
-	defer client.Close()
-	// NewSession succeeds but RequestPty is rejected by the server.
-	if err := InteractiveSession(client, "true"); err == nil ||
-		!strings.Contains(err.Error(), "request PTY") {
-		t.Fatalf("expected request PTY error, got %v", err)
+	kh := c.knownHostsFile
+	if _, err := os.Stat(kh); err != nil {
+		t.Fatalf("known_hosts should exist before close: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := os.Stat(kh); !os.IsNotExist(err) {
+		t.Fatalf("known_hosts should be removed after close, stat err=%v", err)
+	}
+	// Second Close is a no-op.
+	if err := c.Close(); err != nil {
+		t.Fatalf("second close should be no-op: %v", err)
 	}
 }
 
-func TestInteractiveSession_PTYDenied(t *testing.T) {
-	clientSigner, clientKeyPath := writeKeyPair(t)
-	srv := newTestServer(t, clientSigner.PublicKey(), t.TempDir())
-	srv.denySession = true
-	pinned := authorizedKeyFile(t, srv.hostSigner)
-	client, err := Connect(context.Background(), &ConnectOptions{
-		Host: srv.host(), Port: srv.port(), User: "tester",
-		KeyPath: clientKeyPath, PinnedKeyPath: pinned,
+func TestClose_RemoveError(t *testing.T) {
+	// Point tempKnownHosts at a non-empty directory: os.Remove returns a
+	// non-IsNotExist error, exercising the error branch of Close.
+	c := &Client{tempKnownHosts: t.TempDir()}
+	if err := os.WriteFile(filepath.Join(c.tempKnownHosts, "child"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err == nil || !strings.Contains(err.Error(), "remove temp known_hosts") {
+		t.Fatalf("expected remove error, got %v", err)
+	}
+}
+
+func TestClose_TOFUNoOp(t *testing.T) {
+	c := newTOFUClient(t)
+	if err := c.Close(); err != nil {
+		t.Fatalf("TOFU close should be no-op: %v", err)
+	}
+}
+
+func TestClose_RemoveErrorWhenAlreadyGone(t *testing.T) {
+	// If the temp file was already removed externally, Close treats IsNotExist
+	// as success (covered) — remove manually then Close.
+	pinned := validPinned(t)
+	c, err := Connect(context.Background(), &ConnectOptions{
+		Host: "h", User: "u", Port: 22, PinnedKeyPath: pinned,
 	})
 	if err != nil {
-		t.Fatalf("connect: %v", err)
+		t.Fatal(err)
 	}
-	defer client.Close()
-	// Session channels are rejected, so NewSession itself fails.
-	if err := InteractiveSession(client, "true"); err == nil {
-		t.Fatalf("expected error when sessions are denied")
+	os.Remove(c.knownHostsFile)
+	if err := c.Close(); err != nil {
+		t.Fatalf("close should ignore already-removed file: %v", err)
 	}
 }

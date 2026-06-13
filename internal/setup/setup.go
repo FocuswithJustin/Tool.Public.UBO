@@ -13,8 +13,6 @@ import (
 	"ubo/internal/keygen"
 	"ubo/internal/remote"
 	"ubo/internal/templates"
-
-	gossh "golang.org/x/crypto/ssh"
 )
 
 const totalSteps = 11
@@ -50,7 +48,7 @@ type dropbearPaths struct {
 
 // Configure runs all 11 setup steps on the remote host.
 // It saves the Dropbear host public key to outputDir/dropbear_host_key.pub.
-func Configure(ctx context.Context, client *gossh.Client, cfg *config.Config, keys *keygen.Keys, outputDir string) error {
+func Configure(ctx context.Context, client *remote.Client, cfg *config.Config, keys *keygen.Keys, outputDir string) error {
 	// Step 1: Detect network
 	step(1, "detecting remote network configuration")
 	netInfo, err := detectNetwork(ctx, client, cfg)
@@ -159,7 +157,7 @@ func Configure(ctx context.Context, client *gossh.Client, cfg *config.Config, ke
 
 // detectNetwork determines the remote network configuration.
 // Values in cfg.Network override auto-detection.
-func detectNetwork(ctx context.Context, client *gossh.Client, cfg *config.Config) (*NetworkInfo, error) {
+func detectNetwork(ctx context.Context, client *remote.Client, cfg *config.Config) (*NetworkInfo, error) {
 	info := &NetworkInfo{
 		Interface: cfg.Network.Interface,
 	}
@@ -241,7 +239,7 @@ func detectNetwork(ctx context.Context, client *gossh.Client, cfg *config.Config
 }
 
 // detectDropbearPaths returns the dropbear-initramfs config directory and host key path.
-func detectDropbearPaths(ctx context.Context, client *gossh.Client) (*dropbearPaths, error) {
+func detectDropbearPaths(ctx context.Context, client *remote.Client) (*dropbearPaths, error) {
 	out, err := runCommand(ctx, client,
 		`if [ -d /etc/dropbear/initramfs ]; then echo /etc/dropbear/initramfs; `+
 			`elif [ -d /etc/dropbear-initramfs ]; then echo /etc/dropbear-initramfs; `+
@@ -261,7 +259,7 @@ func detectDropbearPaths(ctx context.Context, client *gossh.Client) (*dropbearPa
 
 // generateDropbearHostKey regenerates the Dropbear ed25519 host key and returns
 // its public key in authorized_keys format (e.g. "ssh-ed25519 AAAA...").
-func generateDropbearHostKey(ctx context.Context, client *gossh.Client, keyFile string) (string, error) {
+func generateDropbearHostKey(ctx context.Context, client *remote.Client, keyFile string) (string, error) {
 	runCommand(ctx, client, "rm -f "+keyFile) //nolint:errcheck
 
 	if _, err := runCommand(ctx, client, "dropbearkey -t ed25519 -f "+keyFile); err != nil {
@@ -284,7 +282,7 @@ func generateDropbearHostKey(ctx context.Context, client *gossh.Client, keyFile 
 
 // configureGrub adds the ip= kernel parameter to GRUB_CMDLINE_LINUX for
 // initramfs static networking, then runs update-grub.
-func configureGrub(ctx context.Context, client *gossh.Client, netInfo *NetworkInfo) error {
+func configureGrub(ctx context.Context, client *remote.Client, netInfo *NetworkInfo) error {
 	grubPath := "/etc/default/grub"
 	content, err := readFile(client, grubPath)
 	if err != nil {

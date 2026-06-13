@@ -3,9 +3,8 @@ package config
 import (
 	"fmt"
 	"net"
+	"os"
 	"strings"
-
-	"github.com/BurntSushi/toml"
 )
 
 // Config holds the full ubo.toml configuration.
@@ -69,7 +68,11 @@ func Default() *Config {
 // Load reads and parses the config file at path, filling defaults for unset fields.
 func Load(path string) (*Config, error) {
 	cfg := Default()
-	if _, err := toml.DecodeFile(path, cfg); err != nil {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("load config %s: %w", path, err)
+	}
+	if err := parseTOML(data, cfg); err != nil {
 		return nil, fmt.Errorf("load config %s: %w", path, err)
 	}
 	return cfg, nil
