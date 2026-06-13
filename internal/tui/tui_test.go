@@ -2,6 +2,7 @@ package tui
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -245,6 +246,94 @@ func TestRun_LoadErrorOnMalformedFile(t *testing.T) {
 
 	if err := Run(p); err == nil {
 		t.Fatal("expected load error for malformed config")
+	}
+}
+
+// TestEdit_AllFieldsSet provides a non-empty answer for every field, so each
+// field's setValue closure runs (covering all of them).
+func TestEdit_AllFieldsSet(t *testing.T) {
+	cfg := config.Default()
+	script := strings.Join([]string{
+		"1.2.3.4",     // Host
+		"admin",       // SSH User
+		"2200",        // SSH Port
+		"/k",          // SSH Key Path
+		"51000",       // WireGuard Port
+		"10.9.0.1/24", // WG Server IP
+		"10.9.0.2/32", // WG Client IP
+		"2201",        // Dropbear Port
+		"/out",        // Output Dir
+		"eth9",        // Network Interface
+		"10.9.0.3/24", // Network IP
+		"/dev/sdz1",   // LUKS Device
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	got, err := edit(strings.NewReader(script), &out, cfg)
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if got.Host != "1.2.3.4" || got.SSH.User != "admin" || got.SSH.Port != 2200 ||
+		got.SSH.Key != "/k" || got.WireGuard.Port != 51000 ||
+		got.WireGuard.ServerIP != "10.9.0.1/24" || got.WireGuard.ClientIP != "10.9.0.2/32" ||
+		got.Dropbear.Port != 2201 || got.Output.Dir != "/out" ||
+		got.Network.Interface != "eth9" || got.Network.IP != "10.9.0.3/24" ||
+		got.LUKS.Device != "/dev/sdz1" {
+		t.Errorf("not all fields set as expected: %+v", got)
+	}
+}
+
+// errReader returns a non-EOF error on the first Read, exercising edit's
+// "unexpected read error" branch.
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestEdit_ReadError(t *testing.T) {
+	var out bytes.Buffer
+	_, err := edit(errReader{}, &out, config.Default())
+	if err == nil {
+		t.Fatal("expected read error")
+	}
+}
+
+// TestRun_EditError makes os.Stdin a write-only file so the editor's first read
+// fails with a non-EOF error, covering Run's edit-error return.
+func TestRun_EditError(t *testing.T) {
+	dir := t.TempDir()
+	p := writeFile(t, dir, "ubo.toml", validTOML)
+
+	wo, err := os.OpenFile(filepath.Join(dir, "wo"), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdin
+	os.Stdin = wo
+	t.Cleanup(func() { os.Stdin = old; wo.Close() })
+
+	if err := Run(p); err == nil {
+		t.Fatal("expected edit error from unreadable stdin")
+	}
+}
+
+// TestRun_SaveError starts from a valid config but places it in a read-only
+// directory so the atomic save (temp file + rename in that dir) fails.
+func TestRun_SaveError(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+	dir := t.TempDir()
+	p := writeFile(t, dir, "ubo.toml", validTOML)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+
+	restore := withStdin(t, "") // keep all values; valid config -> Validate passes
+	defer restore()
+
+	if err := Run(p); err == nil {
+		t.Fatal("expected save error in read-only directory")
 	}
 }
 
