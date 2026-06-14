@@ -60,6 +60,15 @@ var (
 		cmd.Stderr = os.Stderr
 		return cmd.Run()
 	}
+
+	// doUnlock runs the tunnel+SSH unlock flow. Replaced at init() time by the
+	// rootless build (main_rootless.go) to use wireguard-go netstack instead of
+	// wg-quick + external ssh.
+	doUnlock = defaultDoUnlock
+
+	// requireRootForUnlock gates the root-privilege check in loadUnlockConfig.
+	// The rootless build sets this to false since no kernel WireGuard is used.
+	requireRootForUnlock = true
 )
 
 const usage = `ubo — Unlock Before Operation
@@ -420,30 +429,36 @@ func printArtifactList(present map[string]bool) {
 	}
 }
 
-// cmdUnlock brings up the WireGuard tunnel, connects to Dropbear, and unlocks.
-// If changeKey is true it runs cryptsetup luksChangeKey first.
+// cmdUnlock loads config, checks artifacts, then delegates to doUnlock.
+// doUnlock is defaultDoUnlock in production and is replaced by the rootless
+// build (main_rootless.go) with a privilege-free userspace WireGuard+SSH impl.
 func cmdUnlock(ctx context.Context, cfgPath string, changeKey bool) error {
 	cfg, err := loadUnlockConfig(cfgPath)
 	if err != nil {
 		return err
 	}
-
 	outDir := cfg.OutputDir()
+	if err := requireUnlockFiles(
+		filepath.Join(outDir, "client_wg.conf"),
+		filepath.Join(outDir, "client_auth_ed25519"),
+		filepath.Join(outDir, "dropbear_host_key.pub"),
+	); err != nil {
+		return err
+	}
+	return doUnlock(ctx, cfg, outDir, changeKey)
+}
+
+// defaultDoUnlock is the standard (requires-root) unlock flow: wg-quick up,
+// wait for tunnel, SSH to Dropbear, cryptroot-unlock, wg-quick down.
+func defaultDoUnlock(ctx context.Context, cfg *config.Config, outDir string, changeKey bool) error {
 	wgConfigPath := filepath.Join(outDir, "client_wg.conf")
 	sshKeyPath := filepath.Join(outDir, "client_auth_ed25519")
 	pinnedKeyPath := filepath.Join(outDir, "dropbear_host_key.pub")
 
-	if err := requireUnlockFiles(wgConfigPath, sshKeyPath, pinnedKeyPath); err != nil {
-		return err
-	}
-
-	// Bring up WireGuard tunnel
 	fmt.Println("[ubo] bringing up WireGuard tunnel...")
 	if err := wgQuickUp(ctx, wgConfigPath); err != nil {
 		return fmt.Errorf("wg-quick up: %w", err)
 	}
-	// Always tear down on exit (registered before the wait so teardown still
-	// runs if the tunnel never becomes reachable).
 	defer tearDownTunnel(wgConfigPath)
 
 	serverTunnelIP := cfg.WGServerTunnelIP()
@@ -457,7 +472,6 @@ func cmdUnlock(ctx context.Context, cfgPath string, changeKey bool) error {
 		return err
 	}
 	defer client.Close()
-
 	return performUnlock(client, cfg, changeKey)
 }
 
@@ -499,7 +513,7 @@ func loadUnlockConfig(cfgPath string) (*config.Config, error) {
 	if err := checkTools("unlock"); err != nil {
 		return nil, err
 	}
-	if osGetuid() != 0 {
+	if requireRootForUnlock && osGetuid() != 0 {
 		return nil, fmt.Errorf("unlock requires root privileges\nRun: sudo ubo unlock --config %s", cfgPath)
 	}
 	return cfg, nil

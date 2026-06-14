@@ -1,12 +1,12 @@
 x 2026-06-14 2026-06-13 Fix unlock-change device auto-detect: crypttab field 2 is "UUID=..." which cryptsetup luksChangeKey rejects; resolve to a device path or use the mapper name +bug @main ref:main.go:479
 x 2026-06-14 2026-06-13 Add optional sudo support so non-root sudo-group SSH users can run 'ubo run'; today all remote setup runs with no privilege escalation +hostcompat @decision @remote @setup ref:internal/setup
-(C) 2026-06-13 Configure target 192.254.68.234: needs root SSH login and network.ip=192.254.68.234/29 (gateway .233 is in-subnet, /29) +hostcompat @config
+(C) 2026-06-13 Configure target 192.254.68.235: needs root SSH login and network.ip=192.254.68.235/29 (gateway .233 is in-subnet, /29) +hostcompat @config
 x 2026-06-14 2026-06-13 Enforce init-premount ordering so Dropbear binds the tunnel IP only after wg0 exists +security @templates @initramfs audit:M1 ref:templates.go
 x 2026-06-14 2026-06-13 Decide fail-closed vs retry for init-premount which currently fails open with no set -e +security @templates @initramfs audit:M2 ref:templates.go
 x 2026-06-14 2026-06-13 Fall back to 'ip -4 addr show dev IFACE' for IP and prefix when the default route lacks a src token +hostcompat @setup ref:setup.go
 x 2026-06-14 2026-06-13 Support multi-LUKS hosts: multiple x-initrd.attach devices cause several unlock prompts and need mdadm RAID in initramfs; verify interactive session handles sequential prompts +hostcompat @main
 x 2026-06-14 2026-06-13 Render init-premount script from a typed validated struct like WireGuardServerConfig.MarshalINI and fold M1/M2 fixes there +architecture @templates ref:templates.go
-(B) 2026-06-13 Decide whether to build the optional rootless unlock variant: wireguard-go netstack plus in-process SSH in contrib/ behind //go:build rootless; adds gvisor and x-crypto deps +architecture @decision ref:docs/remote-execution-plan.md
+x 2026-06-14 2026-06-13 Decide whether to build the optional rootless unlock variant: wireguard-go netstack plus in-process SSH in contrib/ behind //go:build rootless; adds gvisor and x-crypto deps +architecture @decision ref:docs/remote-execution-plan.md
 x 2026-06-14 2026-06-13 Collapse the ~15 ssh round-trips in setup.Configure into one idempotent uploaded setup.sh with a structured JSON result +architecture @setup ref:docs/remote-execution-plan.md
 x 2026-06-14 2026-06-13 Handle onlink and out-of-subnet gateways in the initramfs ip= setup; general robustness, does not affect the current /29 target +hostcompat @templates @initramfs
 x 2026-06-14 2026-06-13 Tidy generateDropbearHostKey error path that may echo dropbearkey public-key output +security @setup audit:L4 ref:setup.go:406
