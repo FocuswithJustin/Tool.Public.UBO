@@ -229,3 +229,37 @@ func TestIsValidHostname(t *testing.T) {
 		}
 	}
 }
+
+// ── firstInetAddr ─────────────────────────────────────────────────────────────
+
+func TestFirstInetAddr_found(t *testing.T) {
+	// Typical `ip -4 addr show dev` output (192.254.68.234/29 is the real target).
+	out := `2: ens3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP
+    link/ether 52:54:00:01:02:03 brd ff:ff:ff:ff:ff:ff
+    inet 192.254.68.234/29 brd 192.254.68.239 scope global ens3
+       valid_lft forever preferred_lft forever`
+	ip, prefix := firstInetAddr(out)
+	if ip != "192.254.68.234" {
+		t.Errorf("ip = %q; want 192.254.68.234", ip)
+	}
+	if prefix != 29 {
+		t.Errorf("prefix = %d; want 29", prefix)
+	}
+}
+
+func TestFirstInetAddr_notFound(t *testing.T) {
+	ip, prefix := firstInetAddr("lo: flags=73  mtu 65536\nlink/loopback")
+	if ip != "" || prefix != 0 {
+		t.Errorf("firstInetAddr empty = (%q, %d); want (\"\", 0)", ip, prefix)
+	}
+}
+
+func TestFirstInetAddr_loopbackSkipped(t *testing.T) {
+	// Only a loopback address — firstInetAddr takes the first match regardless,
+	// so this documents the behaviour rather than filtering loopback.
+	out := "inet 127.0.0.1/8 scope host lo"
+	ip, prefix := firstInetAddr(out)
+	if ip != "127.0.0.1" || prefix != 8 {
+		t.Errorf("firstInetAddr loopback = (%q, %d); want (127.0.0.1, 8)", ip, prefix)
+	}
+}

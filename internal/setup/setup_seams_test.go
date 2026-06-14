@@ -169,9 +169,9 @@ func TestDetectNetwork_invalidInterfaceName(t *testing.T) {
 func TestDetectNetwork_prefixFromIPAddrMatch(t *testing.T) {
 	// IP from route src; prefix detected from `ip addr` matched-IP line.
 	f := &fakeRemote{runResponses: map[string]cmdResult{
-		"ip route show default": {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
-		"ip addr show dev eth0": {out: "    inet 10.0.0.1/8 scope global\n    inet 192.168.1.50/25 scope global eth0"},
-		"hostname":              {out: "host1"},
+		"ip route show default":    {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
+		"ip -4 addr show dev eth0": {out: "    inet 10.0.0.1/8 scope global\n    inet 192.168.1.50/25 scope global eth0"},
+		"hostname":                 {out: "host1"},
 	}}
 	defer f.install()()
 	cfg := &config.Config{}
@@ -187,9 +187,9 @@ func TestDetectNetwork_prefixFromIPAddrMatch(t *testing.T) {
 func TestDetectNetwork_prefixFallback24(t *testing.T) {
 	// ip addr returns no matching inet line -> /24 fallback warning path.
 	f := &fakeRemote{runResponses: map[string]cmdResult{
-		"ip route show default": {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
-		"ip addr show dev eth0": {out: "    inet 10.0.0.1/8 scope global"},
-		"hostname":              {out: "host1"},
+		"ip route show default":    {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
+		"ip -4 addr show dev eth0": {out: "    inet 10.0.0.1/8 scope global"},
+		"hostname":                 {out: "host1"},
 	}}
 	defer f.install()()
 	cfg := &config.Config{}
@@ -205,9 +205,9 @@ func TestDetectNetwork_prefixFallback24(t *testing.T) {
 func TestDetectNetwork_prefixIPAddrError(t *testing.T) {
 	// ip addr command errors -> addrErr != nil path -> /24 fallback.
 	f := &fakeRemote{runResponses: map[string]cmdResult{
-		"ip route show default": {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
-		"ip addr show dev eth0": {err: errBoom},
-		"hostname":              {out: "host1"},
+		"ip route show default":    {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
+		"ip -4 addr show dev eth0": {err: errBoom},
+		"hostname":                 {out: "host1"},
 	}}
 	defer f.install()()
 	cfg := &config.Config{}
@@ -223,9 +223,9 @@ func TestDetectNetwork_prefixIPAddrError(t *testing.T) {
 func TestDetectNetwork_hostnameFailureFallback(t *testing.T) {
 	// hostname command errors AND returns empty -> "server" fallback.
 	f := &fakeRemote{runResponses: map[string]cmdResult{
-		"ip route show default": {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
-		"ip addr show dev eth0": {out: "    inet 192.168.1.50/24 scope global eth0"},
-		"hostname":              {out: "", err: errBoom},
+		"ip route show default":    {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
+		"ip -4 addr show dev eth0": {out: "    inet 192.168.1.50/24 scope global eth0"},
+		"hostname":                 {out: "", err: errBoom},
 	}}
 	defer f.install()()
 	cfg := &config.Config{}
@@ -241,9 +241,9 @@ func TestDetectNetwork_hostnameFailureFallback(t *testing.T) {
 func TestDetectNetwork_hostnameEmptyNoError(t *testing.T) {
 	// hostname returns empty without error -> still "server".
 	f := &fakeRemote{runResponses: map[string]cmdResult{
-		"ip route show default": {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
-		"ip addr show dev eth0": {out: "    inet 192.168.1.50/24 scope global eth0"},
-		"hostname":              {out: "   "},
+		"ip route show default":    {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
+		"ip -4 addr show dev eth0": {out: "    inet 192.168.1.50/24 scope global eth0"},
+		"hostname":                 {out: "   "},
 	}}
 	defer f.install()()
 	cfg := &config.Config{}
@@ -256,11 +256,38 @@ func TestDetectNetwork_hostnameEmptyNoError(t *testing.T) {
 	}
 }
 
-func TestDetectNetwork_ipEmptyError(t *testing.T) {
-	// Interface present, but no IP anywhere -> IP empty error.
+func TestDetectNetwork_ipFromAddr_noSrcInRoute(t *testing.T) {
+	// Default route has no src token (e.g. static/in-subnet gateway).
+	// fillIPFromAddr should fall back to ip -4 addr to provide both IP and prefix.
+	// This matches the 192.254.68.234/29 real-world target.
 	f := &fakeRemote{runResponses: map[string]cmdResult{
-		"ip route show default": {out: "default via 192.168.1.1 dev eth0"},
-		"hostname":              {out: "h"},
+		"ip route show default":    {out: "default via 192.254.68.233 dev ens3"},
+		"ip -4 addr show dev ens3": {out: "    inet 192.254.68.234/29 brd 192.254.68.239 scope global ens3"},
+		"hostname":                 {out: "target"},
+	}}
+	defer f.install()()
+	cfg := &config.Config{}
+	info, err := detectNetwork(context.Background(), nil, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.IP != "192.254.68.234" {
+		t.Errorf("IP = %q; want 192.254.68.234", info.IP)
+	}
+	if info.Prefix != 29 {
+		t.Errorf("Prefix = %d; want 29", info.Prefix)
+	}
+	if info.Gateway != "192.254.68.233" {
+		t.Errorf("Gateway = %q; want 192.254.68.233", info.Gateway)
+	}
+}
+
+func TestDetectNetwork_ipEmptyError(t *testing.T) {
+	// Interface present, but no IP anywhere (ip -4 addr also returns nothing).
+	f := &fakeRemote{runResponses: map[string]cmdResult{
+		"ip route show default":    {out: "default via 192.168.1.1 dev eth0"},
+		"ip -4 addr show dev eth0": {out: "link/ether 52:54:00:01 brd ff:ff:ff:ff:ff:ff"},
+		"hostname":                 {out: "h"},
 	}}
 	defer f.install()()
 	cfg := &config.Config{}
@@ -273,9 +300,9 @@ func TestDetectNetwork_ipEmptyError(t *testing.T) {
 func TestDetectNetwork_gatewayEmptyError(t *testing.T) {
 	// IP present (via config), interface via config, but no gateway -> error.
 	f := &fakeRemote{runResponses: map[string]cmdResult{
-		"ip route show default": {out: "nothing useful here"},
-		"ip addr show dev eth0": {out: "    inet 10.0.0.5/24 scope global eth0"},
-		"hostname":              {out: "h"},
+		"ip route show default":    {out: "nothing useful here"},
+		"ip -4 addr show dev eth0": {out: "    inet 10.0.0.5/24 scope global eth0"},
+		"hostname":                 {out: "h"},
 	}}
 	defer f.install()()
 	cfg := &config.Config{Network: config.NetConfig{Interface: "eth0", IP: "10.0.0.5/24"}}
@@ -506,7 +533,7 @@ func happyRemote() *fakeRemote {
 	return &fakeRemote{
 		runResponses: map[string]cmdResult{
 			"ip route show default":                     {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
-			"ip addr show dev eth0":                     {out: "    inet 192.168.1.50/24 scope global eth0"},
+			"ip -4 addr show dev eth0":                  {out: "    inet 192.168.1.50/24 scope global eth0"},
 			"hostname":                                  {out: "host1"},
 			dbDetectCmd:                                 {out: "/etc/dropbear/initramfs"},
 			"dropbearkey -t ed25519 -f " + key:          {out: "ok"},

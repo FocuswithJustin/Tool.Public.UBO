@@ -263,6 +263,13 @@ func detectNetwork(ctx context.Context, client *remote.Client, cfg *config.Confi
 		return nil, err
 	}
 
+	// Some systems omit the src token from the default route (e.g. hosts where
+	// the gateway is in-subnet). Fall back to ip -4 addr to find both IP and
+	// prefix from the interface address, then let detectPrefix refine if needed.
+	if info.IP == "" {
+		fillIPFromAddr(ctx, client, info)
+	}
+
 	detectPrefix(ctx, client, info)
 	detectHostname(ctx, client, info)
 
@@ -349,12 +356,46 @@ func routeFieldFor(info *NetworkInfo, p string) *string {
 	return nil
 }
 
-// detectPrefix fills info.Prefix from `ip addr` when unset, falling back to /24.
+// fillIPFromAddr fills info.IP (and info.Prefix) from `ip -4 addr show dev`
+// when the default route lacked a `src` token. It takes the first inet address
+// on the interface; if no address is found the fields are left unchanged so the
+// caller's validateNetworkInfo() surfaces a clear error.
+func fillIPFromAddr(ctx context.Context, client *remote.Client, info *NetworkInfo) {
+	if info.Interface == "" {
+		return
+	}
+	out, err := runCommand(ctx, client, "ip -4 addr show dev "+info.Interface)
+	if err != nil {
+		return
+	}
+	ip, prefix := firstInetAddr(out)
+	if ip != "" {
+		info.IP = ip
+		info.Prefix = prefix
+	}
+}
+
+// firstInetAddr returns the IP string and prefix length of the first inet
+// address found in `ip addr` output, or ("", 0) if none is present.
+func firstInetAddr(out string) (string, int) {
+	re := regexp.MustCompile(`inet (\d+\.\d+\.\d+\.\d+/\d+)`)
+	for _, m := range re.FindAllStringSubmatch(out, 1) {
+		addr, ipNet, err := net.ParseCIDR(m[1])
+		if err != nil {
+			continue
+		}
+		ones, _ := ipNet.Mask.Size()
+		return addr.String(), ones
+	}
+	return "", 0
+}
+
+// detectPrefix fills info.Prefix from `ip -4 addr` when unset, falling back to /24.
 func detectPrefix(ctx context.Context, client *remote.Client, info *NetworkInfo) {
 	if info.Prefix != 0 || info.IP == "" {
 		return
 	}
-	if addrOut, addrErr := runCommand(ctx, client, "ip addr show dev "+info.Interface); addrErr == nil {
+	if addrOut, addrErr := runCommand(ctx, client, "ip -4 addr show dev "+info.Interface); addrErr == nil {
 		info.Prefix = prefixForIP(addrOut, info.IP)
 	}
 	if info.Prefix == 0 {
