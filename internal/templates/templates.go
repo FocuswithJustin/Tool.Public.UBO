@@ -3,6 +3,7 @@ package templates
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"strings"
 	"text/template"
 )
@@ -124,17 +125,30 @@ type InitramfsScriptData struct {
 	ServerIP string // e.g. "10.42.0.1/24"
 }
 
-// InitramfsScriptTmpl is the /etc/initramfs-tools/scripts/init-premount/wireguard script.
-// It sets up the WireGuard interface during early boot, after the network is available.
+// InitramfsScriptTmpl is the /etc/initramfs-tools/scripts/init-premount/wireguard
+// script. It runs in init-premount, which is earlier than the init-local stage
+// where dropbear-initramfs starts Dropbear — so wg0 is guaranteed to exist
+// before Dropbear tries to bind its tunnel IP (audit M1).
+//
+// set -e makes the script fail-closed: if any command fails (e.g. wg setconf
+// rejects the config, or ip link add returns an error) the script exits non-zero
+// and the initramfs halts rather than leaving the machine in an undefined state
+// where Dropbear may be unreachable (audit M2).
+//
+// The route-wait loop uses `if` rather than `&& break` so that grep's non-zero
+// exit (route not yet present) does not trigger set -e's automatic exit.
 const InitramfsScriptTmpl = `#!/bin/sh
 PREREQ="udev"
 prereqs() { echo "$PREREQ"; }
 case "$1" in prereqs) prereqs; exit 0;; esac
+set -e
 
 # Wait for default route — max 30 seconds
 TIMEOUT=30
 while [ $TIMEOUT -gt 0 ]; do
-    ip route show default 2>/dev/null | grep -q default && break
+    if ip route show default 2>/dev/null | grep -q default; then
+        break
+    fi
     sleep 1
     TIMEOUT=$((TIMEOUT - 1))
 done
@@ -147,9 +161,10 @@ ip link set dev wg0 up
 `
 
 // RenderInitramfsScript renders InitramfsScriptTmpl with d.
+// It validates that ServerIP is a non-empty CIDR before rendering.
 func RenderInitramfsScript(d InitramfsScriptData) (string, error) {
-	if d.ServerIP == "" {
-		return "", fmt.Errorf("RenderInitramfsScript: ServerIP is required")
+	if err := validateInitramfsScriptData(d); err != nil {
+		return "", err
 	}
 	tmpl, err := template.New("wg-script").Parse(InitramfsScriptTmpl)
 	if err != nil {
@@ -160,6 +175,17 @@ func RenderInitramfsScript(d InitramfsScriptData) (string, error) {
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+// validateInitramfsScriptData returns an error if d contains invalid fields.
+func validateInitramfsScriptData(d InitramfsScriptData) error {
+	if d.ServerIP == "" {
+		return fmt.Errorf("RenderInitramfsScript: ServerIP is required")
+	}
+	if _, _, err := net.ParseCIDR(d.ServerIP); err != nil {
+		return fmt.Errorf("RenderInitramfsScript: ServerIP %q is not a valid CIDR: %w", d.ServerIP, err)
+	}
+	return nil
 }
 
 // DropbearConfigData holds template variables for DropbearConfigTmpl.

@@ -138,6 +138,38 @@ func TestRenderInitramfsScript_emptyServerIP(t *testing.T) {
 	}
 }
 
+func TestRenderInitramfsScript_invalidCIDR(t *testing.T) {
+	_, err := RenderInitramfsScript(InitramfsScriptData{ServerIP: "not-a-cidr"})
+	if err == nil || !strings.Contains(err.Error(), "not a valid CIDR") {
+		t.Errorf("expected CIDR error, got %v", err)
+	}
+}
+
+func TestRenderInitramfsScript_setE(t *testing.T) {
+	got, err := RenderInitramfsScript(InitramfsScriptData{ServerIP: "10.42.0.1/24"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(got, "set -e") {
+		t.Errorf("script missing 'set -e' (M2 fail-closed): %s", got)
+	}
+}
+
+func TestRenderInitramfsScript_noAndBreak(t *testing.T) {
+	// The route-wait loop must use `if ... fi; break` so grep's non-zero exit
+	// (route not yet present) does not trigger set -e (audit M1/M2).
+	got, err := RenderInitramfsScript(InitramfsScriptData{ServerIP: "10.42.0.1/24"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(got, "&& break") {
+		t.Error("script must not use '&& break' in route-wait loop (breaks under set -e)")
+	}
+	if !strings.Contains(got, "if ip route") {
+		t.Error("script should use 'if ip route ...' pattern for route-wait loop")
+	}
+}
+
 // ── RenderDropbearConfig ──────────────────────────────────────────────────────
 
 func TestRenderDropbearConfig(t *testing.T) {
