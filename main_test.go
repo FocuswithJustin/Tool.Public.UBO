@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -678,6 +679,158 @@ func TestCmdRun_marshalINIFails(t *testing.T) {
 		err := cmdRun(context.Background(), cfgPath)
 		if err == nil || !strings.Contains(err.Error(), "render client WireGuard config") {
 			t.Fatalf("error = %v; want 'render client WireGuard config'", err)
+		}
+	})
+}
+
+// --- ensureSudo --------------------------------------------------------------
+
+// setSudoSeams saves and restores the sudoProbe and readSudoPassword seams.
+func setSudoSeams(t *testing.T) {
+	t.Helper()
+	op, or_ := sudoProbe, readSudoPassword
+	t.Cleanup(func() { sudoProbe, readSudoPassword = op, or_ })
+}
+
+func writeSudoConfig(t *testing.T, dir, outDir string) string {
+	t.Helper()
+	cfg := `host = "192.168.1.100"
+
+[ssh]
+user = "justin"
+port = 22
+sudo = true
+
+[wireguard]
+port = 51820
+server_ip = "10.42.0.1/24"
+client_ip = "10.42.0.2/32"
+
+[dropbear]
+port = 22
+
+[output]
+dir = "` + outDir + `"
+`
+	p := filepath.Join(dir, "ubo.toml")
+	if err := os.WriteFile(p, []byte(cfg), 0644); err != nil {
+		t.Fatalf("write sudo config: %v", err)
+	}
+	return p
+}
+
+func TestEnsureSudo_disabled(t *testing.T) {
+	setSudoSeams(t)
+	probed := false
+	sudoProbe = func(ctx context.Context, c *remote.Client) error {
+		probed = true
+		return nil
+	}
+	// Load a config with sudo=false (the default writeValidConfig).
+	dir := t.TempDir()
+	cfg, err := config.Load(writeSudoConfig(t, dir, filepath.Join(dir, "out")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.SSH.Sudo = false
+	if err := ensureSudo(context.Background(), &remote.Client{}, cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if probed {
+		t.Error("probe should not be called when sudo is disabled")
+	}
+}
+
+func TestEnsureSudo_nopassword_succeeds(t *testing.T) {
+	setSudoSeams(t)
+	sudoProbe = func(ctx context.Context, c *remote.Client) error { return nil }
+	prompted := false
+	readSudoPassword = func(prompt string) (string, error) {
+		prompted = true
+		return "", nil
+	}
+	dir := t.TempDir()
+	cfg, err := config.Load(writeSudoConfig(t, dir, filepath.Join(dir, "out")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() {
+		if err := ensureSudo(context.Background(), &remote.Client{}, cfg); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	if prompted {
+		t.Error("password should not be prompted when passwordless sudo works")
+	}
+	if !strings.Contains(out, "passwordless") {
+		t.Errorf("output = %q; want passwordless confirmation", out)
+	}
+}
+
+func TestEnsureSudo_password_succeeds(t *testing.T) {
+	setSudoSeams(t)
+	probeCount := 0
+	sudoProbe = func(ctx context.Context, c *remote.Client) error {
+		probeCount++
+		if probeCount == 1 {
+			return fmt.Errorf("no NOPASSWD")
+		}
+		return nil
+	}
+	readSudoPassword = func(prompt string) (string, error) { return "s3cr3t", nil }
+	dir := t.TempDir()
+	cfg, err := config.Load(writeSudoConfig(t, dir, filepath.Join(dir, "out")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &remote.Client{}
+	out := captureStdout(t, func() {
+		if err := ensureSudo(context.Background(), client, cfg); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	if probeCount != 2 {
+		t.Errorf("probeCount = %d; want 2", probeCount)
+	}
+	if !strings.Contains(out, "accepted") {
+		t.Errorf("output = %q; want password accepted confirmation", out)
+	}
+}
+
+func TestEnsureSudo_wrongPassword(t *testing.T) {
+	setSudoSeams(t)
+	sudoProbe = func(ctx context.Context, c *remote.Client) error {
+		return fmt.Errorf("authentication failure")
+	}
+	readSudoPassword = func(prompt string) (string, error) { return "wrong", nil }
+	dir := t.TempDir()
+	cfg, err := config.Load(writeSudoConfig(t, dir, filepath.Join(dir, "out")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = captureStdout(t, func() {
+		err := ensureSudo(context.Background(), &remote.Client{}, cfg)
+		if err == nil || !strings.Contains(err.Error(), "authentication failed") {
+			t.Fatalf("error = %v; want 'authentication failed'", err)
+		}
+	})
+}
+
+func TestEnsureSudo_readPasswordFails(t *testing.T) {
+	setSudoSeams(t)
+	sudoProbe = func(ctx context.Context, c *remote.Client) error {
+		return fmt.Errorf("no NOPASSWD")
+	}
+	readSudoPassword = func(prompt string) (string, error) { return "", errBoom }
+	dir := t.TempDir()
+	cfg, err := config.Load(writeSudoConfig(t, dir, filepath.Join(dir, "out")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = captureStdout(t, func() {
+		err := ensureSudo(context.Background(), &remote.Client{}, cfg)
+		if err == nil || !strings.Contains(err.Error(), "read sudo password") {
+			t.Fatalf("error = %v; want 'read sudo password'", err)
 		}
 	})
 }

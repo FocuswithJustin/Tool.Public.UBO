@@ -1,5 +1,5 @@
-(A) 2026-06-13 Fix unlock-change device auto-detect: crypttab field 2 is "UUID=..." which cryptsetup luksChangeKey rejects; resolve to a device path or use the mapper name +bug @main ref:main.go:479
-(A) 2026-06-13 Add optional sudo support so non-root sudo-group SSH users can run 'ubo run'; today all remote setup runs with no privilege escalation +hostcompat @decision @remote @setup ref:internal/setup
+x 2026-06-14 2026-06-13 Fix unlock-change device auto-detect: crypttab field 2 is "UUID=..." which cryptsetup luksChangeKey rejects; resolve to a device path or use the mapper name +bug @main ref:main.go:479
+x 2026-06-14 2026-06-13 Add optional sudo support so non-root sudo-group SSH users can run 'ubo run'; today all remote setup runs with no privilege escalation +hostcompat @decision @remote @setup ref:internal/setup
 (A) 2026-06-13 Configure target 192.254.68.234: needs root SSH login and network.ip=192.254.68.234/29 (gateway .233 is in-subnet, /29) +hostcompat @config
 (B) 2026-06-13 Enforce init-premount ordering so Dropbear binds the tunnel IP only after wg0 exists +security @templates @initramfs audit:M1 ref:templates.go
 (B) 2026-06-13 Decide fail-closed vs retry for init-premount which currently fails open with no set -e +security @templates @initramfs audit:M2 ref:templates.go
