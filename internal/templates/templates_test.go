@@ -2,6 +2,7 @@ package templates
 
 import (
 	"bytes"
+	"encoding/base64"
 	"strings"
 	"testing"
 	"text/template"
@@ -460,6 +461,102 @@ func TestRenderReadme_emptyData(t *testing.T) {
 // functions hold; the error branches themselves remain (intentionally)
 // unreachable dead-defensive code and are therefore documented, not forced.
 
+// fullSetupScriptData returns a fully-populated SetupScriptData for tests.
+func fullSetupScriptData() SetupScriptData {
+	return SetupScriptData{
+		WGServerConf:    "[Interface]\nPrivateKey = k\nListenPort = 51820\n",
+		InitramfsHook:   InitramfsHookTmpl,
+		InitramfsScript: "#!/bin/sh\nset -e\n",
+		AuthorizedKeys:  "ssh-ed25519 AAAAclient\n",
+		DropbearConf:    "DROPBEAR_OPTIONS=\"-p 10.42.0.1:22 -s -j -k\"\n",
+		UMASKConf:       InitramfsUMASKConf,
+		NetIP:           "192.168.1.50",
+		NetGateway:      "192.168.1.1",
+		NetMask:         "255.255.255.0",
+		NetHostname:     "host1",
+		NetInterface:    "eth0",
+	}
+}
+
+func TestRenderSetupScript_happyPath(t *testing.T) {
+	d := fullSetupScriptData()
+	got, err := RenderSetupScript(d)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(got, "#!/bin/sh") {
+		t.Errorf("script should start with #!/bin/sh")
+	}
+	assertSetupScriptContents(t, got, d)
+}
+
+// assertSetupScriptContents checks that the rendered script embeds the expected
+// content and contains the required structural elements.
+func assertSetupScriptContents(t *testing.T, script string, d SetupScriptData) {
+	t.Helper()
+	wantB64 := base64.StdEncoding.EncodeToString([]byte(d.WGServerConf))
+	if !strings.Contains(script, wantB64) {
+		t.Errorf("WGServerConf base64 %q not found in script", wantB64)
+	}
+	hookB64 := base64.StdEncoding.EncodeToString([]byte(d.InitramfsHook))
+	if !strings.Contains(script, hookB64) {
+		t.Errorf("InitramfsHook base64 %q not found in script", hookB64)
+	}
+	assertSetupScriptStructure(t, script, d)
+}
+
+// assertSetupScriptStructure checks that structural elements and network info
+// are present in the rendered script.
+func assertSetupScriptStructure(t *testing.T, script string, d SetupScriptData) {
+	t.Helper()
+	for _, want := range []string{
+		"/etc/dropbear/initramfs",
+		"dropbearkey -t ed25519",
+		"dropbear_pub_key",
+		"apt-get install",
+		"update-initramfs",
+		d.NetIP,
+		d.NetGateway,
+		d.NetInterface,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("script missing expected content %q", want)
+		}
+	}
+}
+
+func TestRenderSetupScript_missingFields(t *testing.T) {
+	fields := []struct {
+		name   string
+		mutate func(*SetupScriptData)
+	}{
+		{"WGServerConf", func(d *SetupScriptData) { d.WGServerConf = "" }},
+		{"InitramfsHook", func(d *SetupScriptData) { d.InitramfsHook = "" }},
+		{"InitramfsScript", func(d *SetupScriptData) { d.InitramfsScript = "" }},
+		{"AuthorizedKeys", func(d *SetupScriptData) { d.AuthorizedKeys = "" }},
+		{"DropbearConf", func(d *SetupScriptData) { d.DropbearConf = "" }},
+		{"UMASKConf", func(d *SetupScriptData) { d.UMASKConf = "" }},
+		{"NetIP", func(d *SetupScriptData) { d.NetIP = "" }},
+		{"NetGateway", func(d *SetupScriptData) { d.NetGateway = "" }},
+		{"NetMask", func(d *SetupScriptData) { d.NetMask = "" }},
+		{"NetHostname", func(d *SetupScriptData) { d.NetHostname = "" }},
+		{"NetInterface", func(d *SetupScriptData) { d.NetInterface = "" }},
+	}
+	for _, tc := range fields {
+		t.Run(tc.name, func(t *testing.T) {
+			d := fullSetupScriptData()
+			tc.mutate(&d)
+			_, err := RenderSetupScript(d)
+			if err == nil {
+				t.Errorf("expected error for missing %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.name+" is required") {
+				t.Errorf("error %q does not mention %q is required", err.Error(), tc.name)
+			}
+		})
+	}
+}
+
 func TestConstTemplates_ParseAndExecuteNeverError(t *testing.T) {
 	cases := []struct {
 		name string
@@ -469,6 +566,7 @@ func TestConstTemplates_ParseAndExecuteNeverError(t *testing.T) {
 		{"InitramfsScriptTmpl", InitramfsScriptTmpl, validScriptData()},
 		{"DropbearConfigTmpl", DropbearConfigTmpl, DropbearConfigData{ServerTunnelIP: "10.42.0.1", DropbearPort: 22}},
 		{"ReadmeTmpl", ReadmeTmpl, ReadmeTmplData{ServerTunnelIP: "10.42.0.1", DropbearPort: 22, ConfigPath: "ubo.toml"}},
+		{"SetupScriptTmpl", SetupScriptTmpl, fullSetupScriptData()},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

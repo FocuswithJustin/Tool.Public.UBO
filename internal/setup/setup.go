@@ -2,6 +2,7 @@ package setup
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -27,6 +28,19 @@ var (
 	writeFileExec = remote.WriteFileExec
 )
 
+// runSetupScript uploads script to /tmp/ubo-setup.sh and executes it on the
+// remote host, returning its stdout (the JSON result).
+var runSetupScript = func(ctx context.Context, client *remote.Client, script string) (string, error) {
+	if err := writeFile(client, "/tmp/ubo-setup.sh", script, 0700); err != nil {
+		return "", fmt.Errorf("upload setup script: %w", err)
+	}
+	out, err := runCommand(ctx, client, "sh /tmp/ubo-setup.sh")
+	if err != nil {
+		return "", fmt.Errorf("run setup script: %w", err)
+	}
+	return out, nil
+}
+
 func step(n int, msg string) {
 	fmt.Printf("[ubo] step %d/%d: %s\n", n, totalSteps, msg)
 }
@@ -46,74 +60,140 @@ type dropbearPaths struct {
 	HostKeyFile string
 }
 
+// setupResult is the JSON returned by the setup script on stdout.
+type setupResult struct {
+	DropbearPubKey string `json:"dropbear_pub_key"`
+}
+
 // Configure runs all 11 setup steps on the remote host.
 // It saves the Dropbear host public key to outputDir/dropbear_host_key.pub.
 func Configure(ctx context.Context, client *remote.Client, cfg *config.Config, keys *keygen.Keys, outputDir string) error {
+	// Step 1: Detect remote network configuration (still separate SSH calls
+	// because we need the results to embed in the setup script).
 	netInfo, err := stepDetectNetwork(ctx, client, cfg)
 	if err != nil {
 		return err
 	}
 
-	if err := stepInstallPackages(ctx, client); err != nil {
-		return err
-	}
-
-	dbPaths, err := stepGenerateHostKey(ctx, client, outputDir)
+	// Build all file contents that will be embedded in the setup script.
+	scriptData, err := buildSetupScriptData(cfg, keys, netInfo)
 	if err != nil {
 		return err
 	}
 
-	if err := stepWriteConfigs(client, cfg, keys, dbPaths, netInfo); err != nil {
+	// Render the setup script.
+	script, err := templates.RenderSetupScript(scriptData)
+	if err != nil {
+		return fmt.Errorf("render setup script: %w", err)
+	}
+
+	// Steps 2-11: run the setup script on the remote host.
+	step(2, "installing packages, writing configs, configuring GRUB, rebuilding initramfs")
+	out, err := runSetupScript(ctx, client, script)
+	if err != nil {
 		return err
 	}
 
-	return stepGrubAndInitramfs(ctx, client, netInfo)
+	// Parse the JSON result from the script.
+	pubKey, err := parseSetupResult(out)
+	if err != nil {
+		return err
+	}
+
+	// Save the Dropbear host public key locally.
+	return savePinnedKey(outputDir, pubKey)
 }
 
-// stepWriteConfigs runs steps 4-9: report the dropbear config dir then write the
-// WireGuard config, initramfs hook/script, and Dropbear authorized_keys/config.
-func stepWriteConfigs(client *remote.Client, cfg *config.Config, keys *keygen.Keys, dbPaths *dropbearPaths, netInfo *NetworkInfo) error {
-	// Step 4: Report detected dropbear config path
-	step(4, fmt.Sprintf("using dropbear config dir: %s", dbPaths.ConfigDir))
-
-	if err := stepWriteWireGuardConfig(client, cfg, keys); err != nil {
-		return err
+// buildSetupScriptData renders all file contents and assembles SetupScriptData.
+func buildSetupScriptData(cfg *config.Config, keys *keygen.Keys, netInfo *NetworkInfo) (templates.SetupScriptData, error) {
+	wgServerINI, err := renderWGConfig(cfg, keys)
+	if err != nil {
+		return templates.SetupScriptData{}, err
 	}
 
-	if err := stepWriteInitramfsHook(client); err != nil {
-		return err
+	initScript, err := templates.RenderInitramfsScript(templates.InitramfsScriptData{
+		ServerIP:  cfg.WireGuard.ServerIP,
+		GatewayIP: netInfo.Gateway,
+		Interface: netInfo.Interface,
+	})
+	if err != nil {
+		return templates.SetupScriptData{}, fmt.Errorf("render initramfs script: %w", err)
 	}
 
-	if err := stepWriteInitramfsScript(client, cfg, netInfo); err != nil {
-		return err
+	dbConf, err := templates.RenderDropbearConfig(templates.DropbearConfigData{
+		ServerTunnelIP: cfg.WGServerTunnelIP(),
+		DropbearPort:   cfg.Dropbear.Port,
+	})
+	if err != nil {
+		return templates.SetupScriptData{}, fmt.Errorf("render dropbear config: %w", err)
 	}
 
-	return stepWriteDropbear(client, cfg, keys, dbPaths)
-}
-
-// stepGrubAndInitramfs runs steps 10 and 11: configure GRUB and rebuild initramfs.
-func stepGrubAndInitramfs(ctx context.Context, client *remote.Client, netInfo *NetworkInfo) error {
-	// Step 10: Configure GRUB for initramfs networking
 	if err := validateGrubNetFields(netInfo); err != nil {
-		return fmt.Errorf("step 10 validate network fields: %w", err)
-	}
-	step(10, "configuring GRUB for initramfs networking")
-	if err := configureGrub(ctx, client, netInfo); err != nil {
-		return fmt.Errorf("step 10 configure GRUB: %w", err)
+		return templates.SetupScriptData{}, fmt.Errorf("validate network fields: %w", err)
 	}
 
-	// Restrict generated initramfs images to root-only before rebuilding: they
-	// embed the WireGuard private key, so a world-readable /boot would leak it.
-	if err := writeFile(client, "/etc/initramfs-tools/conf.d/ubo", templates.InitramfsUMASKConf, 0644); err != nil {
-		return fmt.Errorf("step 11 write initramfs umask conf: %w", err)
-	}
+	return templates.SetupScriptData{
+		WGServerConf:    wgServerINI,
+		InitramfsHook:   templates.InitramfsHookTmpl,
+		InitramfsScript: initScript,
+		AuthorizedKeys:  keys.ClientSSHPubKey + "\n",
+		DropbearConf:    dbConf,
+		UMASKConf:       templates.InitramfsUMASKConf,
+		NetIP:           netInfo.IP,
+		NetGateway:      netInfo.Gateway,
+		NetMask:         prefixToNetmask(netInfo.Prefix),
+		NetHostname:     netInfo.Hostname,
+		NetInterface:    netInfo.Interface,
+	}, nil
+}
 
-	// Step 11: Rebuild initramfs
-	step(11, "rebuilding initramfs (this may take a minute)")
-	if _, err := runCommand(ctx, client, "update-initramfs -u -k all"); err != nil {
-		return fmt.Errorf("step 11 update-initramfs: %w", err)
+// renderWGConfig renders the WireGuard server INI config.
+func renderWGConfig(cfg *config.Config, keys *keygen.Keys) (string, error) {
+	wgServerCfg := templates.WireGuardServerConfig{
+		Address:        cfg.WireGuard.ServerIP,
+		PrivateKey:     keys.ServerWGPrivate,
+		ListenPort:     cfg.WireGuard.Port,
+		PeerPublicKey:  keys.ClientWGPublic,
+		PeerAllowedIPs: cfg.WGClientTunnelIP() + "/32",
 	}
+	out, err := wgServerCfg.MarshalINI()
+	if err != nil {
+		return "", fmt.Errorf("step 5 render WireGuard config: %w", err)
+	}
+	return out, nil
+}
 
+// parseSetupResult extracts the dropbear public key from JSON script output.
+func parseSetupResult(out string) (string, error) {
+	// The script may emit progress lines to stderr but still include JSON on
+	// stdout; find the last line that starts with '{'.
+	jsonLine := ""
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "{") {
+			jsonLine = line
+		}
+	}
+	if jsonLine == "" {
+		return "", fmt.Errorf("setup script produced no JSON output; got:\n%s", out)
+	}
+	var result setupResult
+	if err := json.Unmarshal([]byte(jsonLine), &result); err != nil {
+		return "", fmt.Errorf("parse setup script JSON: %w", err)
+	}
+	if result.DropbearPubKey == "" {
+		return "", fmt.Errorf("setup script JSON missing dropbear_pub_key; got: %s", jsonLine)
+	}
+	return result.DropbearPubKey, nil
+}
+
+// savePinnedKey writes the Dropbear host public key to outputDir.
+func savePinnedKey(outputDir, pubKey string) error {
+	pinnedPath := filepath.Join(outputDir, "dropbear_host_key.pub")
+	if err := os.WriteFile(pinnedPath, []byte(pubKey+"\n"), 0644); err != nil {
+		return fmt.Errorf("save dropbear host key: %w", err)
+	}
+	fmt.Printf("[ubo]   dropbear host key saved to %s\n", pinnedPath)
 	return nil
 }
 
@@ -143,110 +223,6 @@ func stepDetectNetwork(ctx context.Context, client *remote.Client, cfg *config.C
 	fmt.Printf("[ubo]   interface=%s ip=%s/%d gateway=%s hostname=%s\n",
 		netInfo.Interface, netInfo.IP, netInfo.Prefix, netInfo.Gateway, netInfo.Hostname)
 	return netInfo, nil
-}
-
-// stepInstallPackages runs step 2: install dropbear-initramfs, wireguard-tools,
-// and mdadm. mdadm is needed in initramfs for hosts with LUKS-on-RAID (e.g. a
-// target whose LUKS device lives on a software RAID array assembled by mdadm
-// before the passphrase prompt).
-func stepInstallPackages(ctx context.Context, client *remote.Client) error {
-	step(2, "installing dropbear-initramfs, wireguard-tools, and mdadm")
-	installCmd := "DEBIAN_FRONTEND=noninteractive apt-get update -qq && " +
-		"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dropbear-initramfs wireguard-tools mdadm"
-	if _, err := runCommand(ctx, client, installCmd); err != nil {
-		return fmt.Errorf("step 2 install packages: %w", err)
-	}
-	return nil
-}
-
-// stepGenerateHostKey runs step 3: detect dropbear paths, regenerate the host
-// key, and pin its public key under outputDir.
-func stepGenerateHostKey(ctx context.Context, client *remote.Client, outputDir string) (*dropbearPaths, error) {
-	step(3, "generating Dropbear host key")
-	dbPaths, err := detectDropbearPaths(ctx, client)
-	if err != nil {
-		return nil, fmt.Errorf("step 3 detect dropbear paths: %w", err)
-	}
-	hostPubKey, err := generateDropbearHostKey(ctx, client, dbPaths.HostKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("step 3 generate dropbear host key: %w", err)
-	}
-	pinnedPath := filepath.Join(outputDir, "dropbear_host_key.pub")
-	if err := os.WriteFile(pinnedPath, []byte(hostPubKey+"\n"), 0644); err != nil {
-		return nil, fmt.Errorf("save dropbear host key: %w", err)
-	}
-	fmt.Printf("[ubo]   dropbear host key saved to %s\n", pinnedPath)
-	return dbPaths, nil
-}
-
-// stepWriteWireGuardConfig runs step 5: render and write the WireGuard server config.
-func stepWriteWireGuardConfig(client *remote.Client, cfg *config.Config, keys *keygen.Keys) error {
-	step(5, "writing WireGuard server config")
-	wgServerCfg := templates.WireGuardServerConfig{
-		Address:        cfg.WireGuard.ServerIP,
-		PrivateKey:     keys.ServerWGPrivate,
-		ListenPort:     cfg.WireGuard.Port,
-		PeerPublicKey:  keys.ClientWGPublic,
-		PeerAllowedIPs: cfg.WGClientTunnelIP() + "/32",
-	}
-	wgServerINI, err := wgServerCfg.MarshalINI()
-	if err != nil {
-		return fmt.Errorf("step 5 render WireGuard config: %w", err)
-	}
-	if err := writeFile(client, "/etc/wireguard/wg-initramfs.conf", wgServerINI, 0600); err != nil {
-		return fmt.Errorf("step 5 write WireGuard config: %w", err)
-	}
-	return nil
-}
-
-// stepWriteInitramfsHook runs step 6: write the initramfs WireGuard hook.
-func stepWriteInitramfsHook(client *remote.Client) error {
-	step(6, "writing initramfs WireGuard hook")
-	if err := writeFileExec(client, "/etc/initramfs-tools/hooks/wireguard", templates.InitramfsHookTmpl); err != nil {
-		return fmt.Errorf("step 6 write initramfs hook: %w", err)
-	}
-	return nil
-}
-
-// stepWriteInitramfsScript runs step 7: render and write the initramfs startup script.
-func stepWriteInitramfsScript(client *remote.Client, cfg *config.Config, netInfo *NetworkInfo) error {
-	step(7, "writing initramfs WireGuard startup script")
-	initScript, err := templates.RenderInitramfsScript(templates.InitramfsScriptData{
-		ServerIP:  cfg.WireGuard.ServerIP,
-		GatewayIP: netInfo.Gateway,
-		Interface: netInfo.Interface,
-	})
-	if err != nil {
-		return fmt.Errorf("step 7 render initramfs script: %w", err)
-	}
-	if err := writeFileExec(client, "/etc/initramfs-tools/scripts/init-premount/wireguard", initScript); err != nil {
-		return fmt.Errorf("step 7 write initramfs script: %w", err)
-	}
-	return nil
-}
-
-// stepWriteDropbear runs steps 8 and 9: write Dropbear authorized_keys and config.
-func stepWriteDropbear(client *remote.Client, cfg *config.Config, keys *keygen.Keys, dbPaths *dropbearPaths) error {
-	// Step 8: Write Dropbear authorized_keys
-	step(8, "configuring Dropbear authorized keys")
-	authKeysPath := dbPaths.ConfigDir + "/authorized_keys"
-	if err := writeFile(client, authKeysPath, keys.ClientSSHPubKey+"\n", 0600); err != nil {
-		return fmt.Errorf("step 8 write authorized_keys: %w", err)
-	}
-
-	// Step 9: Write Dropbear config
-	step(9, "configuring Dropbear options")
-	dbConf, err := templates.RenderDropbearConfig(templates.DropbearConfigData{
-		ServerTunnelIP: cfg.WGServerTunnelIP(),
-		DropbearPort:   cfg.Dropbear.Port,
-	})
-	if err != nil {
-		return fmt.Errorf("step 9 render dropbear config: %w", err)
-	}
-	if err := writeFile(client, dbPaths.ConfigDir+"/dropbear.conf", dbConf, 0644); err != nil {
-		return fmt.Errorf("step 9 write dropbear config: %w", err)
-	}
-	return nil
 }
 
 // detectNetwork determines the remote network configuration.

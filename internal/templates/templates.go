@@ -2,6 +2,7 @@ package templates
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"strings"
@@ -303,4 +304,165 @@ func RenderReadme(d ReadmeTmplData) (string, error) {
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+// SetupScriptData holds all inputs needed to render the idempotent setup.sh.
+type SetupScriptData struct {
+	// File contents to embed (base64-encoded) in the script.
+	WGServerConf    string // /etc/wireguard/wg-initramfs.conf (mode 0600)
+	InitramfsHook   string // /etc/initramfs-tools/hooks/wireguard (chmod +x)
+	InitramfsScript string // /etc/initramfs-tools/scripts/init-premount/wireguard (chmod +x)
+	AuthorizedKeys  string // <dropbear_dir>/authorized_keys (mode 0600)
+	DropbearConf    string // <dropbear_dir>/dropbear.conf
+	UMASKConf       string // /etc/initramfs-tools/conf.d/ubo
+
+	// Network info for GRUB ip= param.
+	NetIP        string // e.g. "192.168.1.100"
+	NetGateway   string // e.g. "192.168.1.1"
+	NetMask      string // e.g. "255.255.255.0"
+	NetHostname  string // e.g. "server"
+	NetInterface string // e.g. "eth0"
+}
+
+// setupScriptRendered is the internal struct passed to the template after
+// pre-encoding all file contents to base64.
+type setupScriptRendered struct {
+	WGServerConf    string
+	InitramfsHook   string
+	InitramfsScript string
+	AuthorizedKeys  string
+	DropbearConf    string
+	UMASKConf       string
+	NetIP           string
+	NetGateway      string
+	NetMask         string
+	NetHostname     string
+	NetInterface    string
+}
+
+// SetupScriptTmpl is the idempotent setup.sh script. It runs all configuration
+// steps on the remote host in one SSH session and prints a JSON result on stdout.
+// File contents are base64-encoded to avoid shell quoting issues.
+const SetupScriptTmpl = `#!/bin/sh
+set -e
+
+# ── Step 2: Install packages ──────────────────────────────────────────────────
+echo "[ubo-setup] step 2/11: installing packages" >&2
+DEBIAN_FRONTEND=noninteractive apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dropbear-initramfs wireguard-tools mdadm
+
+# ── Step 3: Detect dropbear path and regenerate host key ─────────────────────
+echo "[ubo-setup] step 3/11: generating dropbear host key" >&2
+if [ -d /etc/dropbear/initramfs ]; then
+    DROPBEAR_DIR=/etc/dropbear/initramfs
+elif [ -d /etc/dropbear-initramfs ]; then
+    DROPBEAR_DIR=/etc/dropbear-initramfs
+else
+    echo "[ubo-setup] error: dropbear-initramfs config directory not found" >&2
+    exit 1
+fi
+DROPBEAR_KEY="$DROPBEAR_DIR/dropbear_ed25519_host_key"
+rm -f "$DROPBEAR_KEY"
+dropbearkey -t ed25519 -f "$DROPBEAR_KEY" >&2
+DROPBEAR_PUB=$(dropbearkey -y -f "$DROPBEAR_KEY" 2>/dev/null | grep '^ssh-')
+
+# ── Steps 4-9: Write config files ─────────────────────────────────────────────
+echo "[ubo-setup] steps 4-9/11: writing config files" >&2
+
+mkdir -p /etc/wireguard
+printf '%s' '{{.WGServerConf}}' | base64 -d > /etc/wireguard/wg-initramfs.conf
+chmod 600 /etc/wireguard/wg-initramfs.conf
+
+mkdir -p /etc/initramfs-tools/hooks
+printf '%s' '{{.InitramfsHook}}' | base64 -d > /etc/initramfs-tools/hooks/wireguard
+chmod 755 /etc/initramfs-tools/hooks/wireguard
+
+mkdir -p /etc/initramfs-tools/scripts/init-premount
+printf '%s' '{{.InitramfsScript}}' | base64 -d > /etc/initramfs-tools/scripts/init-premount/wireguard
+chmod 755 /etc/initramfs-tools/scripts/init-premount/wireguard
+
+printf '%s' '{{.AuthorizedKeys}}' | base64 -d > "$DROPBEAR_DIR/authorized_keys"
+chmod 600 "$DROPBEAR_DIR/authorized_keys"
+
+printf '%s' '{{.DropbearConf}}' | base64 -d > "$DROPBEAR_DIR/dropbear.conf"
+
+mkdir -p /etc/initramfs-tools/conf.d
+printf '%s' '{{.UMASKConf}}' | base64 -d > /etc/initramfs-tools/conf.d/ubo
+
+# ── Step 10: Configure GRUB ───────────────────────────────────────────────────
+echo "[ubo-setup] step 10/11: configuring GRUB" >&2
+GRUB_FILE=/etc/default/grub
+IP_PARAM="ip={{.NetIP}}::{{.NetGateway}}:{{.NetMask}}:{{.NetHostname}}:{{.NetInterface}}:none"
+if grep -qE '^GRUB_CMDLINE_LINUX="[^"]*ip=' "$GRUB_FILE" 2>/dev/null; then
+    echo "[ubo-setup] GRUB_CMDLINE_LINUX already contains ip=; skipping" >&2
+elif grep -qE '^GRUB_CMDLINE_LINUX="' "$GRUB_FILE" 2>/dev/null; then
+    sed -i "s|^GRUB_CMDLINE_LINUX=\"\(.*\)\"|GRUB_CMDLINE_LINUX=\"\1 $IP_PARAM\"|" "$GRUB_FILE"
+    update-grub 2>&1 >&2
+else
+    printf '\nGRUB_CMDLINE_LINUX="%s"\n' "$IP_PARAM" >> "$GRUB_FILE"
+    update-grub 2>&1 >&2
+fi
+
+# ── Step 11: Rebuild initramfs ────────────────────────────────────────────────
+echo "[ubo-setup] step 11/11: rebuilding initramfs" >&2
+update-initramfs -u -k all >&2
+
+# ── Output JSON result ────────────────────────────────────────────────────────
+printf '{"dropbear_pub_key":"%s"}\n' "$DROPBEAR_PUB"
+`
+
+// RenderSetupScript renders SetupScriptTmpl with d, base64-encoding all file
+// contents so they can be safely embedded in the shell script.
+func RenderSetupScript(d SetupScriptData) (string, error) {
+	if err := validateSetupScriptData(d); err != nil {
+		return "", err
+	}
+	r := setupScriptRendered{
+		WGServerConf:    base64.StdEncoding.EncodeToString([]byte(d.WGServerConf)),
+		InitramfsHook:   base64.StdEncoding.EncodeToString([]byte(d.InitramfsHook)),
+		InitramfsScript: base64.StdEncoding.EncodeToString([]byte(d.InitramfsScript)),
+		AuthorizedKeys:  base64.StdEncoding.EncodeToString([]byte(d.AuthorizedKeys)),
+		DropbearConf:    base64.StdEncoding.EncodeToString([]byte(d.DropbearConf)),
+		UMASKConf:       base64.StdEncoding.EncodeToString([]byte(d.UMASKConf)),
+		NetIP:           d.NetIP,
+		NetGateway:      d.NetGateway,
+		NetMask:         d.NetMask,
+		NetHostname:     d.NetHostname,
+		NetInterface:    d.NetInterface,
+	}
+	tmpl, err := template.New("setup-script").Parse(SetupScriptTmpl)
+	if err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, r); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+// validateSetupScriptData checks that all required fields are present.
+func validateSetupScriptData(d SetupScriptData) error {
+	type req struct {
+		name string
+		val  string
+	}
+	for _, r := range []req{
+		{"WGServerConf", d.WGServerConf},
+		{"InitramfsHook", d.InitramfsHook},
+		{"InitramfsScript", d.InitramfsScript},
+		{"AuthorizedKeys", d.AuthorizedKeys},
+		{"DropbearConf", d.DropbearConf},
+		{"UMASKConf", d.UMASKConf},
+		{"NetIP", d.NetIP},
+		{"NetGateway", d.NetGateway},
+		{"NetMask", d.NetMask},
+		{"NetHostname", d.NetHostname},
+		{"NetInterface", d.NetInterface},
+	} {
+		if r.val == "" {
+			return fmt.Errorf("RenderSetupScript: %s is required", r.name)
+		}
+	}
+	return nil
 }

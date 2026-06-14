@@ -527,28 +527,33 @@ func fullKeys() *keygen.Keys {
 	}
 }
 
-// happyRemote returns a fakeRemote wired for a successful Configure run.
-func happyRemote() *fakeRemote {
-	key := "/etc/dropbear/initramfs/dropbear_ed25519_host_key"
+const happySetupJSON = `{"dropbear_pub_key":"ssh-ed25519 AAAAhostkey"}`
+
+// networkRemote returns a fakeRemote wired for successful network detection.
+func networkRemote() *fakeRemote {
 	return &fakeRemote{
 		runResponses: map[string]cmdResult{
 			"ip route show default":    {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
 			"ip -4 addr show dev eth0": {out: "    inet 192.168.1.50/24 scope global eth0"},
 			"hostname":                 {out: "host1"},
-			dbDetectCmd:                {out: "/etc/dropbear/initramfs"},
-			"dropbearkey -t ed25519 -f " + key + " >/dev/null 2>&1": {out: "ok"},
-			"dropbearkey -y -f " + key + " 2>/dev/null":             {out: "ssh-ed25519 AAAAhostkey"},
-			"update-grub 2>&1": {out: "ok"},
-		},
-		readResponses: map[string]readResult{
-			"/etc/default/grub": {content: `GRUB_CMDLINE_LINUX=""` + "\n"},
 		},
 	}
 }
 
+// installSetupScript swaps in fn for the runSetupScript seam and returns a
+// restore func to be deferred.
+func installSetupScript(fn func(context.Context, *remote.Client, string) (string, error)) func() {
+	orig := runSetupScript
+	runSetupScript = fn
+	return func() { runSetupScript = orig }
+}
+
 func TestConfigure_happyPath(t *testing.T) {
-	f := happyRemote()
+	f := networkRemote()
 	defer f.install()()
+	defer installSetupScript(func(_ context.Context, _ *remote.Client, _ string) (string, error) {
+		return happySetupJSON, nil
+	})()
 
 	outDir := t.TempDir()
 	err := Configure(context.Background(), nil, fullCfg(), fullKeys(), outDir)
@@ -577,41 +582,90 @@ func TestConfigure_step1Error(t *testing.T) {
 	}
 }
 
-func TestConfigure_step2InstallError(t *testing.T) {
-	f := happyRemote()
-	f.runResponses["DEBIAN_FRONTEND=noninteractive apt-get update -qq && "+
-		"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dropbear-initramfs wireguard-tools mdadm"] = cmdResult{err: errBoom}
+func TestConfigure_renderWGError(t *testing.T) {
+	// Empty WireGuard.ServerIP makes MarshalINI fail (Address required).
+	f := networkRemote()
 	defer f.install()()
-	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
-		!strings.Contains(err.Error(), "step 2 install packages") {
-		t.Fatalf("expected step 2 error, got %v", err)
+	defer installSetupScript(func(_ context.Context, _ *remote.Client, _ string) (string, error) {
+		return happySetupJSON, nil
+	})()
+	cfg := fullCfg()
+	cfg.WireGuard.ServerIP = ""
+	if err := Configure(context.Background(), nil, cfg, fullKeys(), t.TempDir()); err == nil ||
+		!strings.Contains(err.Error(), "step 5 render WireGuard config") {
+		t.Fatalf("expected WG render error, got %v", err)
 	}
 }
 
-func TestConfigure_step3DetectError(t *testing.T) {
-	f := happyRemote()
-	f.runResponses[dbDetectCmd] = cmdResult{out: "NOTFOUND"}
+func TestConfigure_renderDropbearError(t *testing.T) {
+	// DropbearPort == 0 makes RenderDropbearConfig fail.
+	f := networkRemote()
 	defer f.install()()
-	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
-		!strings.Contains(err.Error(), "step 3 detect dropbear paths") {
-		t.Fatalf("expected step 3 detect error, got %v", err)
+	defer installSetupScript(func(_ context.Context, _ *remote.Client, _ string) (string, error) {
+		return happySetupJSON, nil
+	})()
+	cfg := fullCfg()
+	cfg.Dropbear.Port = 0
+	if err := Configure(context.Background(), nil, cfg, fullKeys(), t.TempDir()); err == nil ||
+		!strings.Contains(err.Error(), "render dropbear config") {
+		t.Fatalf("expected dropbear render error, got %v", err)
 	}
 }
 
-func TestConfigure_step3GenKeyError(t *testing.T) {
-	f := happyRemote()
-	key := "/etc/dropbear/initramfs/dropbear_ed25519_host_key"
-	f.runResponses["dropbearkey -t ed25519 -f "+key+" >/dev/null 2>&1"] = cmdResult{err: errBoom}
+func TestConfigure_setupScriptError(t *testing.T) {
+	f := networkRemote()
 	defer f.install()()
+	defer installSetupScript(func(_ context.Context, _ *remote.Client, _ string) (string, error) {
+		return "", errBoom
+	})()
 	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
-		!strings.Contains(err.Error(), "step 3 generate dropbear host key") {
-		t.Fatalf("expected step 3 gen key error, got %v", err)
+		!errors.Is(err, errBoom) {
+		t.Fatalf("expected setup script error, got %v", err)
+	}
+}
+
+func TestConfigure_setupScriptBadJSON(t *testing.T) {
+	f := networkRemote()
+	defer f.install()()
+	defer installSetupScript(func(_ context.Context, _ *remote.Client, _ string) (string, error) {
+		return "not json at all", nil
+	})()
+	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
+		!strings.Contains(err.Error(), "no JSON output") {
+		t.Fatalf("expected no JSON output error, got %v", err)
+	}
+}
+
+func TestConfigure_setupScriptMalformedJSON(t *testing.T) {
+	f := networkRemote()
+	defer f.install()()
+	defer installSetupScript(func(_ context.Context, _ *remote.Client, _ string) (string, error) {
+		return "{invalid json}", nil
+	})()
+	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
+		!strings.Contains(err.Error(), "parse setup script JSON") {
+		t.Fatalf("expected JSON parse error, got %v", err)
+	}
+}
+
+func TestConfigure_setupScriptMissingKey(t *testing.T) {
+	f := networkRemote()
+	defer f.install()()
+	defer installSetupScript(func(_ context.Context, _ *remote.Client, _ string) (string, error) {
+		return `{"other_field":"value"}`, nil
+	})()
+	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
+		!strings.Contains(err.Error(), "missing dropbear_pub_key") {
+		t.Fatalf("expected missing key error, got %v", err)
 	}
 }
 
 func TestConfigure_pinnedKeyWriteError(t *testing.T) {
-	f := happyRemote()
+	f := networkRemote()
 	defer f.install()()
+	defer installSetupScript(func(_ context.Context, _ *remote.Client, _ string) (string, error) {
+		return happySetupJSON, nil
+	})()
 	// Point outputDir at a path whose parent forbids creating the file.
 	roDir := filepath.Join(t.TempDir(), "ro")
 	if err := os.Mkdir(roDir, 0500); err != nil {
@@ -620,99 +674,5 @@ func TestConfigure_pinnedKeyWriteError(t *testing.T) {
 	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), roDir); err == nil ||
 		!strings.Contains(err.Error(), "save dropbear host key") {
 		t.Fatalf("expected save key error, got %v", err)
-	}
-}
-
-func TestConfigure_step5RenderWGError(t *testing.T) {
-	// Empty WireGuard.ServerIP makes MarshalINI fail (Address required).
-	f := happyRemote()
-	defer f.install()()
-	cfg := fullCfg()
-	cfg.WireGuard.ServerIP = ""
-	if err := Configure(context.Background(), nil, cfg, fullKeys(), t.TempDir()); err == nil ||
-		!strings.Contains(err.Error(), "step 5 render WireGuard config") {
-		t.Fatalf("expected step 5 render error, got %v", err)
-	}
-}
-
-func TestConfigure_step9RenderDropbearError(t *testing.T) {
-	// DropbearPort == 0 makes RenderDropbearConfig fail (DropbearPort required).
-	f := happyRemote()
-	defer f.install()()
-	cfg := fullCfg()
-	cfg.Dropbear.Port = 0
-	if err := Configure(context.Background(), nil, cfg, fullKeys(), t.TempDir()); err == nil ||
-		!strings.Contains(err.Error(), "step 9 render dropbear config") {
-		t.Fatalf("expected step 9 render error, got %v", err)
-	}
-}
-
-func TestConfigure_step5WriteWGError(t *testing.T) {
-	f := happyRemote()
-	f.writeErrs = map[string]error{"/etc/wireguard/wg-initramfs.conf": errBoom}
-	defer f.install()()
-	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
-		!strings.Contains(err.Error(), "step 5 write WireGuard config") {
-		t.Fatalf("expected step 5 error, got %v", err)
-	}
-}
-
-func TestConfigure_step6HookError(t *testing.T) {
-	f := happyRemote()
-	f.writeErrs = map[string]error{"/etc/initramfs-tools/hooks/wireguard": errBoom}
-	defer f.install()()
-	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
-		!strings.Contains(err.Error(), "step 6 write initramfs hook") {
-		t.Fatalf("expected step 6 error, got %v", err)
-	}
-}
-
-func TestConfigure_step7ScriptError(t *testing.T) {
-	f := happyRemote()
-	f.writeErrs = map[string]error{"/etc/initramfs-tools/scripts/init-premount/wireguard": errBoom}
-	defer f.install()()
-	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
-		!strings.Contains(err.Error(), "step 7 write initramfs script") {
-		t.Fatalf("expected step 7 error, got %v", err)
-	}
-}
-
-func TestConfigure_step8AuthKeysError(t *testing.T) {
-	f := happyRemote()
-	f.writeErrs = map[string]error{"/etc/dropbear/initramfs/authorized_keys": errBoom}
-	defer f.install()()
-	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
-		!strings.Contains(err.Error(), "step 8 write authorized_keys") {
-		t.Fatalf("expected step 8 error, got %v", err)
-	}
-}
-
-func TestConfigure_step9DropbearConfError(t *testing.T) {
-	f := happyRemote()
-	f.writeErrs = map[string]error{"/etc/dropbear/initramfs/dropbear.conf": errBoom}
-	defer f.install()()
-	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
-		!strings.Contains(err.Error(), "step 9 write dropbear config") {
-		t.Fatalf("expected step 9 error, got %v", err)
-	}
-}
-
-func TestConfigure_step10GrubError(t *testing.T) {
-	f := happyRemote()
-	f.readResponses["/etc/default/grub"] = readResult{err: errBoom}
-	defer f.install()()
-	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
-		!strings.Contains(err.Error(), "step 10 configure GRUB") {
-		t.Fatalf("expected step 10 error, got %v", err)
-	}
-}
-
-func TestConfigure_step11UpdateInitramfsError(t *testing.T) {
-	f := happyRemote()
-	f.runResponses["update-initramfs -u -k all"] = cmdResult{err: errBoom}
-	defer f.install()()
-	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
-		!strings.Contains(err.Error(), "step 11 update-initramfs") {
-		t.Fatalf("expected step 11 error, got %v", err)
 	}
 }
