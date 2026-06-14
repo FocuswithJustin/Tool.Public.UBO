@@ -451,10 +451,13 @@ func detectDropbearPaths(ctx context.Context, client *remote.Client) (*dropbearP
 
 // generateDropbearHostKey regenerates the Dropbear ed25519 host key and returns
 // its public key in authorized_keys format (e.g. "ssh-ed25519 AAAA...").
+// Both stdout and stderr of the key-generation command are suppressed (they
+// contain only status/progress text, not the key itself). The `-y` read-back
+// redirects stderr to /dev/null so only the public key line reaches stdout.
 func generateDropbearHostKey(ctx context.Context, client *remote.Client, keyFile string) (string, error) {
 	runCommand(ctx, client, "rm -f "+keyFile) //nolint:errcheck
 
-	if _, err := runCommand(ctx, client, "dropbearkey -t ed25519 -f "+keyFile); err != nil {
+	if _, err := runCommand(ctx, client, "dropbearkey -t ed25519 -f "+keyFile+" >/dev/null 2>&1"); err != nil {
 		return "", fmt.Errorf("dropbearkey: %w", err)
 	}
 
@@ -469,7 +472,7 @@ func generateDropbearHostKey(ctx context.Context, client *remote.Client, keyFile
 			return line, nil
 		}
 	}
-	return "", fmt.Errorf("could not extract public key from dropbearkey output:\n%s", out)
+	return "", fmt.Errorf("could not extract public key from dropbearkey -y output")
 }
 
 // configureGrub adds the ip= kernel parameter to GRUB_CMDLINE_LINUX for

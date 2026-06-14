@@ -375,8 +375,8 @@ func TestDetectDropbearPaths_runError(t *testing.T) {
 func TestGenerateDropbearHostKey_success(t *testing.T) {
 	key := "/etc/dropbear/initramfs/dropbear_ed25519_host_key"
 	f := &fakeRemote{runResponses: map[string]cmdResult{
-		"dropbearkey -t ed25519 -f " + key:          {out: "Generating key"},
-		"dropbearkey -y -f " + key + " 2>/dev/null": {out: "Public key portion is:\nssh-ed25519 AAAAC3Nz comment\nFingerprint: ..."},
+		"dropbearkey -t ed25519 -f " + key + " >/dev/null 2>&1": {out: "Generating key"},
+		"dropbearkey -y -f " + key + " 2>/dev/null":             {out: "Public key portion is:\nssh-ed25519 AAAAC3Nz comment\nFingerprint: ..."},
 	}}
 	defer f.install()()
 	pub, err := generateDropbearHostKey(context.Background(), nil, key)
@@ -391,7 +391,7 @@ func TestGenerateDropbearHostKey_success(t *testing.T) {
 func TestGenerateDropbearHostKey_genError(t *testing.T) {
 	key := "/k"
 	f := &fakeRemote{runResponses: map[string]cmdResult{
-		"dropbearkey -t ed25519 -f " + key: {err: errBoom},
+		"dropbearkey -t ed25519 -f " + key + " >/dev/null 2>&1": {err: errBoom},
 	}}
 	defer f.install()()
 	if _, err := generateDropbearHostKey(context.Background(), nil, key); err == nil ||
@@ -403,8 +403,8 @@ func TestGenerateDropbearHostKey_genError(t *testing.T) {
 func TestGenerateDropbearHostKey_yError(t *testing.T) {
 	key := "/k"
 	f := &fakeRemote{runResponses: map[string]cmdResult{
-		"dropbearkey -t ed25519 -f " + key:          {out: "ok"},
-		"dropbearkey -y -f " + key + " 2>/dev/null": {err: errBoom},
+		"dropbearkey -t ed25519 -f " + key + " >/dev/null 2>&1": {out: "ok"},
+		"dropbearkey -y -f " + key + " 2>/dev/null":             {err: errBoom},
 	}}
 	defer f.install()()
 	if _, err := generateDropbearHostKey(context.Background(), nil, key); err == nil ||
@@ -416,8 +416,8 @@ func TestGenerateDropbearHostKey_yError(t *testing.T) {
 func TestGenerateDropbearHostKey_noPubKey(t *testing.T) {
 	key := "/k"
 	f := &fakeRemote{runResponses: map[string]cmdResult{
-		"dropbearkey -t ed25519 -f " + key:          {out: "ok"},
-		"dropbearkey -y -f " + key + " 2>/dev/null": {out: "no key here\njust noise"},
+		"dropbearkey -t ed25519 -f " + key + " >/dev/null 2>&1": {out: "ok"},
+		"dropbearkey -y -f " + key + " 2>/dev/null":             {out: "no key here\njust noise"},
 	}}
 	defer f.install()()
 	if _, err := generateDropbearHostKey(context.Background(), nil, key); err == nil ||
@@ -532,13 +532,13 @@ func happyRemote() *fakeRemote {
 	key := "/etc/dropbear/initramfs/dropbear_ed25519_host_key"
 	return &fakeRemote{
 		runResponses: map[string]cmdResult{
-			"ip route show default":                     {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
-			"ip -4 addr show dev eth0":                  {out: "    inet 192.168.1.50/24 scope global eth0"},
-			"hostname":                                  {out: "host1"},
-			dbDetectCmd:                                 {out: "/etc/dropbear/initramfs"},
-			"dropbearkey -t ed25519 -f " + key:          {out: "ok"},
-			"dropbearkey -y -f " + key + " 2>/dev/null": {out: "ssh-ed25519 AAAAhostkey"},
-			"update-grub 2>&1":                          {out: "ok"},
+			"ip route show default":    {out: "default via 192.168.1.1 dev eth0 src 192.168.1.50"},
+			"ip -4 addr show dev eth0": {out: "    inet 192.168.1.50/24 scope global eth0"},
+			"hostname":                 {out: "host1"},
+			dbDetectCmd:                {out: "/etc/dropbear/initramfs"},
+			"dropbearkey -t ed25519 -f " + key + " >/dev/null 2>&1": {out: "ok"},
+			"dropbearkey -y -f " + key + " 2>/dev/null":             {out: "ssh-ed25519 AAAAhostkey"},
+			"update-grub 2>&1": {out: "ok"},
 		},
 		readResponses: map[string]readResult{
 			"/etc/default/grub": {content: `GRUB_CMDLINE_LINUX=""` + "\n"},
@@ -601,7 +601,7 @@ func TestConfigure_step3DetectError(t *testing.T) {
 func TestConfigure_step3GenKeyError(t *testing.T) {
 	f := happyRemote()
 	key := "/etc/dropbear/initramfs/dropbear_ed25519_host_key"
-	f.runResponses["dropbearkey -t ed25519 -f "+key] = cmdResult{err: errBoom}
+	f.runResponses["dropbearkey -t ed25519 -f "+key+" >/dev/null 2>&1"] = cmdResult{err: errBoom}
 	defer f.install()()
 	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
 		!strings.Contains(err.Error(), "step 3 generate dropbear host key") {
