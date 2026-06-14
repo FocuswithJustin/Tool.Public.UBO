@@ -2,6 +2,7 @@ package remote
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -403,6 +404,101 @@ func newTOFUClient(t *testing.T) *Client {
 		t.Fatalf("connect: %v", err)
 	}
 	return c
+}
+
+// ----- sudoCmd / sudoStdin / SetSudoPassword -----
+
+func newSudoClient(t *testing.T) *Client {
+	t.Helper()
+	c := newTOFUClient(t)
+	c.sudo = true
+	return c
+}
+
+func TestSudoCmd_noSudo_passthrough(t *testing.T) {
+	c := newTOFUClient(t)
+	if got := c.sudoCmd("apt-get install"); got != "apt-get install" {
+		t.Errorf("sudoCmd without sudo = %q; want passthrough", got)
+	}
+}
+
+func TestSudoCmd_noPassword_usesN(t *testing.T) {
+	c := newSudoClient(t)
+	got := c.sudoCmd("apt-get install")
+	if !strings.HasPrefix(got, "sudo -n") {
+		t.Errorf("sudoCmd without password = %q; want sudo -n prefix", got)
+	}
+	if !strings.Contains(got, "apt-get install") {
+		t.Errorf("sudoCmd = %q; should contain original command", got)
+	}
+}
+
+func TestSudoCmd_withPassword_usesSFlag(t *testing.T) {
+	c := newSudoClient(t)
+	c.SetSudoPassword("s3cr3t")
+	got := c.sudoCmd("apt-get install")
+	if !strings.Contains(got, "sudo -S") {
+		t.Errorf("sudoCmd with password = %q; want sudo -S", got)
+	}
+}
+
+func TestSudoCmd_singleQuoteEscaping(t *testing.T) {
+	c := newSudoClient(t)
+	got := c.sudoCmd("echo 'hello'")
+	if strings.Contains(got, "echo 'hello'") {
+		t.Errorf("sudoCmd = %q; inner single quotes not escaped", got)
+	}
+	// The escaped form of ' inside a sh -c '...' is '\''
+	if !strings.Contains(got, `'\''`) {
+		t.Errorf("sudoCmd = %q; want escaped single quotes", got)
+	}
+}
+
+func TestSudoStdin_noSudo(t *testing.T) {
+	c := newTOFUClient(t)
+	if got := c.sudoStdin(nil); got != nil {
+		t.Error("sudoStdin without sudo should return nil unchanged")
+	}
+}
+
+func TestSudoStdin_noPasswordReturnsBase(t *testing.T) {
+	c := newSudoClient(t) // sudo=true, sudoPassword=""
+	base := strings.NewReader("content")
+	got := c.sudoStdin(base)
+	if got != base {
+		t.Error("sudoStdin with no password should return base reader unchanged")
+	}
+}
+
+func TestSudoStdin_withPasswordPrependsLine(t *testing.T) {
+	c := newSudoClient(t)
+	c.SetSudoPassword("pass")
+	got := c.sudoStdin(strings.NewReader("body"))
+	if got == nil {
+		t.Fatal("sudoStdin should return non-nil with password set")
+	}
+	var buf strings.Builder
+	io.Copy(&buf, got) //nolint:errcheck
+	combined := buf.String()
+	if !strings.HasPrefix(combined, "pass\n") {
+		t.Errorf("stdin = %q; want password line first", combined)
+	}
+	if !strings.Contains(combined, "body") {
+		t.Errorf("stdin = %q; want original body after password", combined)
+	}
+}
+
+// TestRunCommand_sudo verifies that RunCommand wraps the command in sudo -n
+// when the client has sudo=true and no password set.
+func TestRunCommand_sudo(t *testing.T) {
+	argv := installFakeSSH(t)
+	c := newSudoClient(t)
+	_, _ = RunCommand(context.Background(), c, "apt-get install -y foo")
+	args := readArgv(t, argv)
+	last := args[len(args)-1]
+	if !strings.HasPrefix(last, "sudo -n") {
+		t.Errorf("remote command arg = %q; want sudo -n prefix", last)
+	}
 }
 
 func TestRunCommand_Success(t *testing.T) {

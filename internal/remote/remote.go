@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,15 +27,22 @@ type ConnectOptions struct {
 	// Exactly one of the following should be set:
 	KnownHostsPath string // TOFU: accept-new and save host key here on first connection
 	PinnedKeyPath  string // Strict: pin the host key from this authorized_keys-format file
+
+	// Sudo runs remote commands under passwordless sudo. Used when User is a
+	// non-root account that is in the sudo group (the unlock-time Dropbear
+	// session always runs as root and never needs this).
+	Sudo bool
 }
 
 // Client holds the connection parameters used to invoke the ssh binary. There
 // is no persistent connection: each operation spawns a fresh `ssh` process.
 type Client struct {
-	host    string
-	port    int
-	user    string
-	keyPath string
+	host         string
+	port         int
+	user         string
+	keyPath      string
+	sudo         bool
+	sudoPassword string // non-empty means feed via sudo -S instead of -n
 
 	// knownHostsFile is the file passed to ssh via UserKnownHostsFile.
 	knownHostsFile string
@@ -60,6 +68,7 @@ func Connect(ctx context.Context, opts *ConnectOptions) (*Client, error) {
 		port:    opts.Port,
 		user:    opts.User,
 		keyPath: opts.KeyPath,
+		sudo:    opts.Sudo,
 	}
 
 	if err := applyHostKeyMode(c, opts); err != nil {
@@ -209,6 +218,41 @@ func (c *Client) sshArgs() []string {
 	return args
 }
 
+// SetSudoPassword stores pw so that subsequent commands use `sudo -S` (read
+// password from stdin) instead of `sudo -n` (fail if NOPASSWD not configured).
+// Call this only after a passwordless probe fails; otherwise leave it unset.
+func (c *Client) SetSudoPassword(pw string) { c.sudoPassword = pw }
+
+// sudoCmd wraps cmd for privileged execution. With no password set it uses
+// `sudo -n` (non-interactive, fails fast if NOPASSWD is not configured). With a
+// password set it uses `sudo -S -p ”` (reads password from stdin silently).
+// Single quotes inside cmd are escaped so the outer sh -c argument is valid.
+func (c *Client) sudoCmd(cmd string) string {
+	if !c.sudo {
+		return cmd
+	}
+	escaped := strings.ReplaceAll(cmd, "'", `'\''`)
+	flag := "-n"
+	if c.sudoPassword != "" {
+		flag = "-S -p ''"
+	}
+	return "sudo " + flag + " sh -c '" + escaped + "'"
+}
+
+// sudoStdin prepends the sudo password line to base when password-mode sudo is
+// in use. base may be nil (no process stdin). Returns nil when sudo is inactive
+// or NOPASSWD mode is used, leaving the caller's existing stdin handling intact.
+func (c *Client) sudoStdin(base io.Reader) io.Reader {
+	if !c.sudo || c.sudoPassword == "" {
+		return base
+	}
+	pw := strings.NewReader(c.sudoPassword + "\n")
+	if base == nil {
+		return pw
+	}
+	return io.MultiReader(pw, base)
+}
+
 // Close removes any temporary known_hosts file materialized for pinned mode.
 // It is safe to call multiple times.
 func (c *Client) Close() error {
@@ -229,8 +273,9 @@ func (c *Client) Close() error {
 // client warnings (e.g. unsupported ssh_config options) never corrupt the
 // returned value.
 func RunCommand(ctx context.Context, c *Client, cmd string) (string, error) {
-	args := append(c.sshArgs(), cmd)
+	args := append(c.sshArgs(), c.sudoCmd(cmd))
 	command := exec.CommandContext(ctx, "ssh", args...)
+	command.Stdin = c.sudoStdin(nil)
 	var stdout, stderr bytes.Buffer
 	command.Stdout = &stdout
 	command.Stderr = &stderr
@@ -252,9 +297,9 @@ func WriteFile(c *Client, remotePath, content string, mode os.FileMode) error {
 	remoteCmd := fmt.Sprintf("mkdir -p '%s' && cat > '%s' && chmod %s '%s'",
 		dir, remotePath, octal, remotePath)
 
-	args := append(c.sshArgs(), remoteCmd)
+	args := append(c.sshArgs(), c.sudoCmd(remoteCmd))
 	cmd := exec.Command("ssh", args...)
-	cmd.Stdin = strings.NewReader(content)
+	cmd.Stdin = c.sudoStdin(strings.NewReader(content))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("write %s: %w\noutput: %s", remotePath, err, strings.TrimSpace(string(out)))
@@ -271,8 +316,9 @@ func WriteFileExec(c *Client, remotePath, content string) error {
 // previous SFTP-based behavior which returned bytes faithfully).
 func ReadFile(c *Client, remotePath string) (string, error) {
 	remoteCmd := fmt.Sprintf("cat '%s'", remotePath)
-	args := append(c.sshArgs(), remoteCmd)
+	args := append(c.sshArgs(), c.sudoCmd(remoteCmd))
 	cmd := exec.Command("ssh", args...)
+	cmd.Stdin = c.sudoStdin(nil)
 	out, err := cmd.Output()
 	if err != nil {
 		stderr := ""

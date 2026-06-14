@@ -92,11 +92,13 @@ func parseKeyValue(line string) (key string, val tomlValue, err error) {
 	return key, val, nil
 }
 
-// tomlValue is a decoded scalar: either a string or an int.
+// tomlValue is a decoded scalar: a string, an int, or a bool.
 type tomlValue struct {
-	isInt bool
-	str   string
-	i     int
+	isInt  bool
+	isBool bool
+	str    string
+	i      int
+	b      bool
 }
 
 // parseValue decodes a single value plus an optional trailing comment.
@@ -107,7 +109,26 @@ func parseValue(s string) (tomlValue, error) {
 	if s[0] == '"' {
 		return parseStringValue(s)
 	}
+	if s[0] == 't' || s[0] == 'f' {
+		return parseBoolValue(s)
+	}
 	return parseIntValue(s)
+}
+
+// parseBoolValue decodes a bare boolean value (true/false), stripping any
+// trailing inline comment that starts at an unquoted '#'.
+func parseBoolValue(s string) (tomlValue, error) {
+	tok := s
+	if h := strings.IndexByte(s, '#'); h >= 0 {
+		tok = s[:h]
+	}
+	switch strings.TrimSpace(tok) {
+	case "true":
+		return tomlValue{isBool: true, b: true}, nil
+	case "false":
+		return tomlValue{isBool: true, b: false}, nil
+	}
+	return tomlValue{}, fmt.Errorf("invalid value %q (expected quoted string, integer, or boolean)", strings.TrimSpace(tok))
 }
 
 // parseStringValue decodes a quoted string value and any trailing comment.
@@ -200,7 +221,7 @@ type fieldSetter func(cfg *Config, section, key string, v tomlValue) error
 // strField builds a setter that stores a string into the field selected by get.
 func strField(get func(*Config) *string) fieldSetter {
 	return func(cfg *Config, section, key string, v tomlValue) error {
-		if v.isInt {
+		if v.isInt || v.isBool {
 			return fmt.Errorf("%s.%s expects a string", section, key)
 		}
 		*get(cfg) = v.str
@@ -219,6 +240,17 @@ func intField(get func(*Config) *int) fieldSetter {
 	}
 }
 
+// boolField builds a setter that stores a bool into the field selected by get.
+func boolField(get func(*Config) *bool) fieldSetter {
+	return func(cfg *Config, section, key string, v tomlValue) error {
+		if !v.isBool {
+			return fmt.Errorf("%s.%s expects a boolean", section, key)
+		}
+		*get(cfg) = v.b
+		return nil
+	}
+}
+
 // schema maps each section to its known keys and their field setters.
 var schema = map[string]map[string]fieldSetter{
 	"": {
@@ -228,6 +260,7 @@ var schema = map[string]map[string]fieldSetter{
 		"user": strField(func(c *Config) *string { return &c.SSH.User }),
 		"port": intField(func(c *Config) *int { return &c.SSH.Port }),
 		"key":  strField(func(c *Config) *string { return &c.SSH.Key }),
+		"sudo": boolField(func(c *Config) *bool { return &c.SSH.Sudo }),
 	},
 	"wireguard": {
 		"port":      intField(func(c *Config) *int { return &c.WireGuard.Port }),
@@ -279,6 +312,7 @@ func Marshal(c *Config) ([]byte, error) {
 	fmt.Fprintf(&b, "user = %s\n", quote(c.SSH.User))
 	fmt.Fprintf(&b, "port = %d\n", c.SSH.Port)
 	fmt.Fprintf(&b, "key = %s\n", quote(c.SSH.Key))
+	fmt.Fprintf(&b, "sudo = %t\n", c.SSH.Sudo)
 
 	b.WriteString("\n[wireguard]\n")
 	fmt.Fprintf(&b, "port = %d\n", c.WireGuard.Port)

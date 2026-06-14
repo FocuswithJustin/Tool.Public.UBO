@@ -37,6 +37,17 @@ var (
 	tuiRun                       = tui.Run
 	unlockStdin        io.Reader = os.Stdin
 
+	// sudoProbe runs a trivial remote command to test whether passwordless sudo
+	// (-n) works. Seamed so tests can stub it without a real SSH connection.
+	sudoProbe = func(ctx context.Context, c *remote.Client) error {
+		_, err := remote.RunCommand(ctx, c, "true")
+		return err
+	}
+
+	// readSudoPassword prompts the operator for a sudo password with echo
+	// suppressed. Seamed so tests can inject a fixed password.
+	readSudoPassword = readSudoPasswordTTY
+
 	wgQuickUp = func(ctx context.Context, cfgPath string) error {
 		cmd := exec.CommandContext(ctx, "wg-quick", "up", cfgPath)
 		cmd.Stdout = os.Stdout
@@ -223,16 +234,70 @@ func prepareRun(cfgPath string) (*config.Config, string, error) {
 	return cfg, outDir, nil
 }
 
-// connectForRun opens the TOFU SSH connection to the remote host for cmdRun.
+// connectForRun opens the TOFU SSH connection to the remote host for cmdRun
+// and, when ssh.sudo is enabled, verifies sudo access (probing for passwordless
+// NOPASSWD first, then prompting interactively if needed).
 func connectForRun(ctx context.Context, cfg *config.Config, outDir string) (*remote.Client, error) {
 	fmt.Printf("[ubo] connecting to %s:%d as %s...\n", cfg.Host, cfg.SSH.Port, cfg.SSH.User)
-	return remoteConnect(ctx, &remote.ConnectOptions{
+	client, err := remoteConnect(ctx, &remote.ConnectOptions{
 		Host:           cfg.Host,
 		Port:           cfg.SSH.Port,
 		User:           cfg.SSH.User,
 		KeyPath:        cfg.SSH.Key,
 		KnownHostsPath: filepath.Join(outDir, "ssh_known_hosts"),
+		Sudo:           cfg.SSH.Sudo,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureSudo(ctx, client, cfg); err != nil {
+		client.Close()
+		return nil, err
+	}
+	return client, nil
+}
+
+// ensureSudo verifies sudo access when ssh.sudo is true. It first probes
+// passwordless sudo (`-n`); if that fails it prompts once for the password,
+// stores it in the client for the session, and verifies it before continuing.
+// When ssh.sudo is false the function is a no-op so existing root-login configs
+// are completely unaffected.
+func ensureSudo(ctx context.Context, client *remote.Client, cfg *config.Config) error {
+	if !cfg.SSH.Sudo {
+		return nil
+	}
+	if err := sudoProbe(ctx, client); err == nil {
+		fmt.Println("[ubo] sudo: passwordless access confirmed")
+		return nil
+	}
+	pw, err := readSudoPassword(fmt.Sprintf("[ubo] sudo password for %s@%s: ", cfg.SSH.User, cfg.Host))
+	if err != nil {
+		return fmt.Errorf("read sudo password: %w", err)
+	}
+	client.SetSudoPassword(pw)
+	if err := sudoProbe(ctx, client); err != nil {
+		return fmt.Errorf("sudo authentication failed: %w", err)
+	}
+	fmt.Println("[ubo] sudo: password accepted")
+	return nil
+}
+
+// readSudoPasswordTTY is the real implementation of readSudoPassword: it
+// disables terminal echo via stty, reads one line from stdin, and restores echo.
+func readSudoPasswordTTY(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	off := exec.Command("stty", "-echo")
+	off.Stdin = os.Stdin
+	_ = off.Run()
+	defer func() {
+		on := exec.Command("stty", "echo")
+		on.Stdin = os.Stdin
+		_ = on.Run()
+		fmt.Fprintln(os.Stderr)
+	}()
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	return strings.TrimRight(line, "\r\n"), err
 }
 
 // writeRunArtifacts writes the local client WireGuard config and README produced
@@ -473,10 +538,25 @@ func tearDownTunnel(wgConfigPath string) {
 	}
 }
 
+// crypttabChangeKeyCmd resolves the first LUKS backing device from /etc/crypttab
+// to a usable device path before running cryptsetup luksChangeKey. crypttab
+// field 2 is commonly a tag form (UUID=, PARTUUID=, LABEL=, PARTLABEL=) that
+// cryptsetup rejects directly, so each tag is mapped to its /dev/disk/by-* path.
+const crypttabChangeKeyCmd = `SRC=$(awk 'NF && !/^#/{print $2; exit}' /etc/crypttab)
+case "$SRC" in
+  UUID=*) DEV="/dev/disk/by-uuid/${SRC#UUID=}" ;;
+  PARTUUID=*) DEV="/dev/disk/by-partuuid/${SRC#PARTUUID=}" ;;
+  LABEL=*) DEV="/dev/disk/by-label/${SRC#LABEL=}" ;;
+  PARTLABEL=*) DEV="/dev/disk/by-partlabel/${SRC#PARTLABEL=}" ;;
+  *) DEV="$SRC" ;;
+esac
+test -n "$DEV" || { echo "could not determine LUKS device from /etc/crypttab" >&2; exit 1; }
+cryptsetup luksChangeKey "$DEV"`
+
 // runChangeKey performs the interactive LUKS passphrase change and asks whether
 // to continue to unlock. It returns whether the caller should proceed to unlock.
 func runChangeKey(client *remote.Client, cfg *config.Config) (bool, error) {
-	changeCmd := `DEVICE=$(awk 'NF && !/^#/{print $2; exit}' /etc/crypttab) && cryptsetup luksChangeKey "$DEVICE"`
+	changeCmd := crypttabChangeKeyCmd
 	if cfg.LUKS.Device != "" {
 		changeCmd = fmt.Sprintf("cryptsetup luksChangeKey %q", cfg.LUKS.Device)
 	}

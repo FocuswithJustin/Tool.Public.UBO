@@ -23,6 +23,7 @@ type SSHConfig struct {
 	User string `toml:"user"`
 	Port int    `toml:"port"`
 	Key  string `toml:"key"`
+	Sudo bool   `toml:"sudo"`
 }
 
 type WGConfig struct {
@@ -213,6 +214,7 @@ host = "192.168.1.100"
 user = "root"
 port = 22
 key  = ""   # path to SSH private key; empty = use agent / default keys
+sudo = false   # true = run remote setup via passwordless sudo (for non-root sudo-group users)
 
 [wireguard]
 port      = 51820
