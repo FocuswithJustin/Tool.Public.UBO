@@ -17,6 +17,13 @@ type WireGuardServerConfig struct {
 }
 
 // MarshalINI validates fields and returns the wg-conf INI string.
+//
+// The output is consumed by `wg setconf` inside the initramfs, which only
+// understands kernel-level WireGuard keys. It must NOT contain the Address
+// field (a wg-quick extension that `wg setconf` rejects with "Line
+// unrecognized"); the interface address is applied separately by the
+// init-premount script via `ip addr add`. The Address field is still required
+// here because the caller must supply the server tunnel IP for that script.
 func (c WireGuardServerConfig) MarshalINI() (string, error) {
 	if c.Address == "" {
 		return "", fmt.Errorf("WireGuardServerConfig: Address is required")
@@ -36,7 +43,6 @@ func (c WireGuardServerConfig) MarshalINI() (string, error) {
 
 	var sb strings.Builder
 	sb.WriteString("[Interface]\n")
-	fmt.Fprintf(&sb, "Address = %s\n", c.Address)
 	fmt.Fprintf(&sb, "PrivateKey = %s\n", c.PrivateKey)
 	fmt.Fprintf(&sb, "ListenPort = %d\n", c.ListenPort)
 	sb.WriteString("\n[Peer]\n")

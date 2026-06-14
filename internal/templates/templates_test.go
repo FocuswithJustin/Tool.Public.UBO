@@ -23,7 +23,6 @@ func TestWireGuardServerConfig_MarshalINI_valid(t *testing.T) {
 	}
 	for _, want := range []string{
 		"[Interface]",
-		"Address = 10.42.0.1/24",
 		"PrivateKey = serverPrivKey==",
 		"ListenPort = 51820",
 		"[Peer]",
@@ -34,6 +33,11 @@ func TestWireGuardServerConfig_MarshalINI_valid(t *testing.T) {
 		if !strings.Contains(ini, want) {
 			t.Errorf("MarshalINI missing %q\ngot:\n%s", want, ini)
 		}
+	}
+	// `wg setconf` rejects the wg-quick-only Address key, so the server config
+	// (consumed by setconf in initramfs) must not contain it.
+	if strings.Contains(ini, "Address") {
+		t.Errorf("server MarshalINI must not contain Address (wg setconf rejects it)\ngot:\n%s", ini)
 	}
 }
 
@@ -212,7 +216,6 @@ func TestWireGuardServerConfig_MarshalINI_exactOutput(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	want := "[Interface]\n" +
-		"Address = 10.42.0.1/24\n" +
 		"PrivateKey = serverPrivKey==\n" +
 		"ListenPort = 51820\n" +
 		"\n[Peer]\n" +
