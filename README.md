@@ -77,7 +77,9 @@ dependencies** (standard library only); it drives `wg`, `ssh-keygen`, `ssh`,
 - **To run `ubo run`/`unlock` (your machine):** `wireguard-tools`, `openssh`.
 - **`ubo unlock` needs root** (to bring the WireGuard interface up).
 - **The remote host:** Debian 13 (Trixie) with a LUKS-encrypted root and an
-  unencrypted `/boot`, reachable over SSH as root for the initial `ubo run`.
+  unencrypted `/boot`, reachable over SSH. The SSH user must have root privileges
+  either directly (`user = "root"`) or via passwordless or interactive sudo
+  (`sudo = true` in `[ssh]`).
 
 A `shell.nix` is provided that pins Go and every tool used for building and
 testing.
@@ -143,6 +145,7 @@ host = "192.168.1.100"
 user = "root"
 port = 22
 key  = ""   # path to SSH private key; empty = use agent / default keys
+sudo = false   # true = run setup via sudo (for non-root sudo-group users)
 
 [wireguard]
 port      = 51820
@@ -165,8 +168,10 @@ device = ""   # LUKS block device (e.g. "/dev/sda3"); auto-detected from /etc/cr
 ```
 
 > The initramfs gets a *static* network configuration (DHCP isn't reliable that
-> early), so set `network.ip` if the server's IP isn't discoverable from its
-> default route (some DHCP clients omit the route's `src` field).
+> early). `ubo run` auto-detects the server's IP from the default route's `src`
+> token; if that token is absent (common when the gateway is in-subnet), it falls
+> back to `ip -4 addr show dev IFACE`. Set `network.ip` explicitly if both
+> methods fail (e.g. `network.ip = "192.168.1.100/24"`).
 
 > **Validation:** `wireguard.client_ip` must be distinct from
 > `wireguard.server_ip` and fall within the server's tunnel subnet, and
