@@ -93,7 +93,10 @@ func (c WireGuardClientConfig) MarshalINI() (string, error) {
 }
 
 // InitramfsHookTmpl is the /etc/initramfs-tools/hooks/wireguard hook script.
-// It copies wg and the wireguard module into the initramfs image.
+// It copies wg and the wireguard module into the initramfs image, and also
+// copies mdadm and the RAID modules needed for LUKS-on-RAID hosts where the
+// LUKS device lives on a software RAID array that must be assembled before the
+// passphrase prompt.
 const InitramfsHookTmpl = `#!/bin/sh
 PREREQ=""
 prereqs() { echo "$PREREQ"; }
@@ -101,6 +104,8 @@ case "$1" in prereqs) prereqs; exit 0;; esac
 . /usr/share/initramfs-tools/hook-functions
 copy_exec /usr/bin/wg
 manual_add_modules wireguard
+copy_exec /usr/sbin/mdadm
+manual_add_modules md_mod raid1
 mkdir -p "${DESTDIR}/etc/wireguard"
 cp /etc/wireguard/wg-initramfs.conf "${DESTDIR}/etc/wireguard/"
 `
@@ -122,7 +127,9 @@ UMASK=0077
 
 // InitramfsScriptData holds template variables for InitramfsScriptTmpl.
 type InitramfsScriptData struct {
-	ServerIP string // e.g. "10.42.0.1/24"
+	ServerIP  string // e.g. "10.42.0.1/24" — WireGuard server tunnel CIDR
+	GatewayIP string // physical network gateway, e.g. "192.168.1.1"
+	Interface string // physical network interface, e.g. "eth0"
 }
 
 // InitramfsScriptTmpl is the /etc/initramfs-tools/scripts/init-premount/wireguard
@@ -152,6 +159,14 @@ while [ $TIMEOUT -gt 0 ]; do
     sleep 1
     TIMEOUT=$((TIMEOUT - 1))
 done
+
+
+# Onlink gateway fallback: if the kernel's ip= setup did not establish a default
+# route (gateway outside the host subnet), add host and default routes manually.
+if ! ip route show default | grep -q default; then
+    ip route add {{.GatewayIP}}/32 dev {{.Interface}} onlink 2>/dev/null || true
+    ip route add default via {{.GatewayIP}} 2>/dev/null || true
+fi
 
 modprobe wireguard 2>/dev/null || true
 ip link add dev wg0 type wireguard
@@ -184,6 +199,15 @@ func validateInitramfsScriptData(d InitramfsScriptData) error {
 	}
 	if _, _, err := net.ParseCIDR(d.ServerIP); err != nil {
 		return fmt.Errorf("RenderInitramfsScript: ServerIP %q is not a valid CIDR: %w", d.ServerIP, err)
+	}
+	if d.GatewayIP == "" {
+		return fmt.Errorf("RenderInitramfsScript: GatewayIP is required")
+	}
+	if net.ParseIP(d.GatewayIP) == nil {
+		return fmt.Errorf("RenderInitramfsScript: GatewayIP %q is not a valid IP address", d.GatewayIP)
+	}
+	if d.Interface == "" {
+		return fmt.Errorf("RenderInitramfsScript: Interface is required")
 	}
 	return nil
 }

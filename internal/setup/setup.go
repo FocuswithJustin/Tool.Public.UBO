@@ -63,7 +63,7 @@ func Configure(ctx context.Context, client *remote.Client, cfg *config.Config, k
 		return err
 	}
 
-	if err := stepWriteConfigs(client, cfg, keys, dbPaths); err != nil {
+	if err := stepWriteConfigs(client, cfg, keys, dbPaths, netInfo); err != nil {
 		return err
 	}
 
@@ -72,7 +72,7 @@ func Configure(ctx context.Context, client *remote.Client, cfg *config.Config, k
 
 // stepWriteConfigs runs steps 4-9: report the dropbear config dir then write the
 // WireGuard config, initramfs hook/script, and Dropbear authorized_keys/config.
-func stepWriteConfigs(client *remote.Client, cfg *config.Config, keys *keygen.Keys, dbPaths *dropbearPaths) error {
+func stepWriteConfigs(client *remote.Client, cfg *config.Config, keys *keygen.Keys, dbPaths *dropbearPaths, netInfo *NetworkInfo) error {
 	// Step 4: Report detected dropbear config path
 	step(4, fmt.Sprintf("using dropbear config dir: %s", dbPaths.ConfigDir))
 
@@ -84,7 +84,7 @@ func stepWriteConfigs(client *remote.Client, cfg *config.Config, keys *keygen.Ke
 		return err
 	}
 
-	if err := stepWriteInitramfsScript(client, cfg); err != nil {
+	if err := stepWriteInitramfsScript(client, cfg, netInfo); err != nil {
 		return err
 	}
 
@@ -145,11 +145,14 @@ func stepDetectNetwork(ctx context.Context, client *remote.Client, cfg *config.C
 	return netInfo, nil
 }
 
-// stepInstallPackages runs step 2: install dropbear-initramfs and wireguard-tools.
+// stepInstallPackages runs step 2: install dropbear-initramfs, wireguard-tools,
+// and mdadm. mdadm is needed in initramfs for hosts with LUKS-on-RAID (e.g. a
+// target whose LUKS device lives on a software RAID array assembled by mdadm
+// before the passphrase prompt).
 func stepInstallPackages(ctx context.Context, client *remote.Client) error {
-	step(2, "installing dropbear-initramfs and wireguard-tools")
+	step(2, "installing dropbear-initramfs, wireguard-tools, and mdadm")
 	installCmd := "DEBIAN_FRONTEND=noninteractive apt-get update -qq && " +
-		"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dropbear-initramfs wireguard-tools"
+		"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dropbear-initramfs wireguard-tools mdadm"
 	if _, err := runCommand(ctx, client, installCmd); err != nil {
 		return fmt.Errorf("step 2 install packages: %w", err)
 	}
@@ -206,10 +209,12 @@ func stepWriteInitramfsHook(client *remote.Client) error {
 }
 
 // stepWriteInitramfsScript runs step 7: render and write the initramfs startup script.
-func stepWriteInitramfsScript(client *remote.Client, cfg *config.Config) error {
+func stepWriteInitramfsScript(client *remote.Client, cfg *config.Config, netInfo *NetworkInfo) error {
 	step(7, "writing initramfs WireGuard startup script")
 	initScript, err := templates.RenderInitramfsScript(templates.InitramfsScriptData{
-		ServerIP: cfg.WireGuard.ServerIP,
+		ServerIP:  cfg.WireGuard.ServerIP,
+		GatewayIP: netInfo.Gateway,
+		Interface: netInfo.Interface,
 	})
 	if err != nil {
 		return fmt.Errorf("step 7 render initramfs script: %w", err)

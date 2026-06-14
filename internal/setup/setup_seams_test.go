@@ -580,7 +580,7 @@ func TestConfigure_step1Error(t *testing.T) {
 func TestConfigure_step2InstallError(t *testing.T) {
 	f := happyRemote()
 	f.runResponses["DEBIAN_FRONTEND=noninteractive apt-get update -qq && "+
-		"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dropbear-initramfs wireguard-tools"] = cmdResult{err: errBoom}
+		"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dropbear-initramfs wireguard-tools mdadm"] = cmdResult{err: errBoom}
 	defer f.install()()
 	if err := Configure(context.Background(), nil, fullCfg(), fullKeys(), t.TempDir()); err == nil ||
 		!strings.Contains(err.Error(), "step 2 install packages") {

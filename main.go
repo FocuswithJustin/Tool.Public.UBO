@@ -475,6 +475,9 @@ func performUnlock(client *remote.Client, cfg *config.Config, changeKey bool) er
 	}
 
 	fmt.Println("[ubo] unlocking disk (enter LUKS passphrase when prompted)...")
+	// cryptroot-unlock already loops through all crypttab entries with
+	// x-initrd.attach, so multi-LUKS hosts with sequential prompts are handled
+	// automatically by this single interactive session.
 	if err := interactiveSession(client, "cryptroot-unlock"); err != nil {
 		return fmt.Errorf("cryptroot-unlock: %w", err)
 	}

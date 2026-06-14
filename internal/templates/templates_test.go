@@ -119,8 +119,17 @@ func TestWireGuardClientConfig_MarshalINI_missingFields(t *testing.T) {
 
 // ── RenderInitramfsScript ─────────────────────────────────────────────────────
 
+// validScriptData returns a fully-populated InitramfsScriptData for tests.
+func validScriptData() InitramfsScriptData {
+	return InitramfsScriptData{
+		ServerIP:  "10.42.0.1/24",
+		GatewayIP: "192.168.1.1",
+		Interface: "eth0",
+	}
+}
+
 func TestRenderInitramfsScript(t *testing.T) {
-	got, err := RenderInitramfsScript(InitramfsScriptData{ServerIP: "10.42.0.1/24"})
+	got, err := RenderInitramfsScript(validScriptData())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -139,14 +148,53 @@ func TestRenderInitramfsScript_emptyServerIP(t *testing.T) {
 }
 
 func TestRenderInitramfsScript_invalidCIDR(t *testing.T) {
-	_, err := RenderInitramfsScript(InitramfsScriptData{ServerIP: "not-a-cidr"})
+	d := validScriptData()
+	d.ServerIP = "not-a-cidr"
+	_, err := RenderInitramfsScript(d)
 	if err == nil || !strings.Contains(err.Error(), "not a valid CIDR") {
 		t.Errorf("expected CIDR error, got %v", err)
 	}
 }
 
+func TestRenderInitramfsScript_missingGateway(t *testing.T) {
+	d := validScriptData()
+	d.GatewayIP = ""
+	if _, err := RenderInitramfsScript(d); err == nil || !strings.Contains(err.Error(), "GatewayIP is required") {
+		t.Errorf("expected GatewayIP error, got %v", err)
+	}
+}
+
+func TestRenderInitramfsScript_invalidGateway(t *testing.T) {
+	d := validScriptData()
+	d.GatewayIP = "not-an-ip"
+	if _, err := RenderInitramfsScript(d); err == nil || !strings.Contains(err.Error(), "not a valid IP") {
+		t.Errorf("expected invalid gateway error, got %v", err)
+	}
+}
+
+func TestRenderInitramfsScript_missingInterface(t *testing.T) {
+	d := validScriptData()
+	d.Interface = ""
+	if _, err := RenderInitramfsScript(d); err == nil || !strings.Contains(err.Error(), "Interface is required") {
+		t.Errorf("expected Interface error, got %v", err)
+	}
+}
+
+func TestRenderInitramfsScript_onlinkFallback(t *testing.T) {
+	got, err := RenderInitramfsScript(validScriptData())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(got, "ip route add 192.168.1.1/32 dev eth0 onlink") {
+		t.Errorf("missing onlink host route, got:\n%s", got)
+	}
+	if !strings.Contains(got, "ip route add default via 192.168.1.1") {
+		t.Errorf("missing default route via gateway, got:\n%s", got)
+	}
+}
+
 func TestRenderInitramfsScript_setE(t *testing.T) {
-	got, err := RenderInitramfsScript(InitramfsScriptData{ServerIP: "10.42.0.1/24"})
+	got, err := RenderInitramfsScript(validScriptData())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -158,7 +206,7 @@ func TestRenderInitramfsScript_setE(t *testing.T) {
 func TestRenderInitramfsScript_noAndBreak(t *testing.T) {
 	// The route-wait loop must use `if ... fi; break` so grep's non-zero exit
 	// (route not yet present) does not trigger set -e (audit M1/M2).
-	got, err := RenderInitramfsScript(InitramfsScriptData{ServerIP: "10.42.0.1/24"})
+	got, err := RenderInitramfsScript(validScriptData())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -227,6 +275,12 @@ func TestInitramfsHookTmpl(t *testing.T) {
 	}
 	if !strings.Contains(InitramfsHookTmpl, "manual_add_modules wireguard") {
 		t.Error("hook missing manual_add_modules wireguard")
+	}
+	if !strings.Contains(InitramfsHookTmpl, "copy_exec /usr/sbin/mdadm") {
+		t.Error("hook missing copy_exec for mdadm (needed for LUKS-on-RAID)")
+	}
+	if !strings.Contains(InitramfsHookTmpl, "manual_add_modules md_mod raid1") {
+		t.Error("hook missing manual_add_modules for RAID modules")
 	}
 	if !strings.HasPrefix(InitramfsHookTmpl, "#!/bin/sh") {
 		t.Error("hook should start with #!/bin/sh")
@@ -412,7 +466,7 @@ func TestConstTemplates_ParseAndExecuteNeverError(t *testing.T) {
 		tmpl string
 		data interface{}
 	}{
-		{"InitramfsScriptTmpl", InitramfsScriptTmpl, InitramfsScriptData{ServerIP: "10.42.0.1/24"}},
+		{"InitramfsScriptTmpl", InitramfsScriptTmpl, validScriptData()},
 		{"DropbearConfigTmpl", DropbearConfigTmpl, DropbearConfigData{ServerTunnelIP: "10.42.0.1", DropbearPort: 22}},
 		{"ReadmeTmpl", ReadmeTmpl, ReadmeTmplData{ServerTunnelIP: "10.42.0.1", DropbearPort: 22, ConfigPath: "ubo.toml"}},
 	}
