@@ -29,6 +29,10 @@ UBO's security model:
 - **Key-only, hardened Dropbear**: no password auth, no port forwarding.
 - **Host-key pinning (TOFU):** `ubo run` records the server's Dropbear host key;
   `ubo unlock` refuses to connect if it ever changes (MITM protection).
+- **Initramfs secrets are root-only.** The boot image carries the WireGuard key
+  (it must, to bring the tunnel up before decryption), so UBO generates it mode
+  `0600` (`UMASK=0077`) — unreadable by unprivileged local users. See
+  [Security notes](#security-notes) for the residual exposure.
 
 ---
 
@@ -164,6 +168,11 @@ device = ""   # LUKS block device (e.g. "/dev/sda3"); auto-detected from /etc/cr
 > early), so set `network.ip` if the server's IP isn't discoverable from its
 > default route (some DHCP clients omit the route's `src` field).
 
+> **Validation:** `wireguard.client_ip` must be distinct from
+> `wireguard.server_ip` and fall within the server's tunnel subnet, and
+> `luks.device` (when set) must be an absolute `/dev` path. `ubo run` and
+> `ubo unlock` reject configs that violate these rules before touching the host.
+
 ---
 
 ## Output files
@@ -242,3 +251,16 @@ tests/                      VM-based integration tests + image builders
   (including the pinned Dropbear host key) consistently in the output directory.
 - The LUKS passphrase is only ever typed interactively into the remote
   `cryptroot-unlock` prompt — UBO neither stores nor transmits it in any file.
+- **The initramfs embeds the WireGuard server private key.** Because the tunnel
+  must come up *before* the root disk is decrypted, that key necessarily lives
+  in the unencrypted `/boot`. UBO writes `UMASK=0077` to
+  `/etc/initramfs-tools/conf.d/ubo` so the generated image is mode `0600`
+  (root-only): a local *unprivileged* user cannot extract the key with
+  `lsinitramfs`/`unmkinitramfs`. It cannot be encrypted at rest (it is needed
+  pre-decryption), so anyone with root on the server — or physical/offline
+  access to the disk — can still read it. Compromise of this key lets an
+  attacker impersonate the *initramfs WireGuard endpoint*; it does **not** by
+  itself decrypt the disk (the LUKS passphrase is never stored).
+- Inputs that flow into remote shell commands are validated: `luks.device` must
+  be an absolute `/dev` path, and the detected interface, IP, gateway, and
+  hostname baked into the GRUB `ip=` parameter are checked before use.
