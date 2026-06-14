@@ -3,29 +3,29 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
 
 func TestDefault(t *testing.T) {
 	c := Default()
-	if c.SSH.User != "root" {
-		t.Errorf("SSH.User = %q; want root", c.SSH.User)
+	cases := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"SSH.User", c.SSH.User, "root"},
+		{"SSH.Port", strconv.Itoa(c.SSH.Port), "22"},
+		{"WireGuard.Port", strconv.Itoa(c.WireGuard.Port), "51820"},
+		{"WireGuard.ServerIP", c.WireGuard.ServerIP, "10.42.0.1/24"},
+		{"WireGuard.ClientIP", c.WireGuard.ClientIP, "10.42.0.2/32"},
+		{"Dropbear.Port", strconv.Itoa(c.Dropbear.Port), "22"},
 	}
-	if c.SSH.Port != 22 {
-		t.Errorf("SSH.Port = %d; want 22", c.SSH.Port)
-	}
-	if c.WireGuard.Port != 51820 {
-		t.Errorf("WireGuard.Port = %d; want 51820", c.WireGuard.Port)
-	}
-	if c.WireGuard.ServerIP != "10.42.0.1/24" {
-		t.Errorf("WireGuard.ServerIP = %q; want 10.42.0.1/24", c.WireGuard.ServerIP)
-	}
-	if c.WireGuard.ClientIP != "10.42.0.2/32" {
-		t.Errorf("WireGuard.ClientIP = %q; want 10.42.0.2/32", c.WireGuard.ClientIP)
-	}
-	if c.Dropbear.Port != 22 {
-		t.Errorf("Dropbear.Port = %d; want 22", c.Dropbear.Port)
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("%s = %q; want %q", tc.name, tc.got, tc.want)
+		}
 	}
 }
 

@@ -32,30 +32,33 @@ func parseTOML(src []byte, cfg *Config) error {
 	section := ""
 	lines := strings.Split(string(src), "\n")
 	for i, raw := range lines {
-		lineNo := i + 1
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		if strings.HasPrefix(line, "[") {
-			name, err := parseSectionHeader(line)
-			if err != nil {
-				return fmt.Errorf("line %d: %w", lineNo, err)
-			}
-			section = name
-			continue
-		}
-
-		key, val, err := parseKeyValue(line)
-		if err != nil {
-			return fmt.Errorf("line %d: %w", lineNo, err)
-		}
-		if err := assign(cfg, section, key, val); err != nil {
-			return fmt.Errorf("line %d: %w", lineNo, err)
+		if err := parseLine(strings.TrimSpace(raw), cfg, &section); err != nil {
+			return fmt.Errorf("line %d: %w", i+1, err)
 		}
 	}
 	return nil
+}
+
+// parseLine processes one already-trimmed line, updating *section for headers
+// and assigning into cfg for key/value pairs. Blank and comment lines are
+// no-ops.
+func parseLine(line string, cfg *Config, section *string) error {
+	if line == "" || strings.HasPrefix(line, "#") {
+		return nil
+	}
+	if strings.HasPrefix(line, "[") {
+		name, err := parseSectionHeader(line)
+		if err != nil {
+			return err
+		}
+		*section = name
+		return nil
+	}
+	key, val, err := parseKeyValue(line)
+	if err != nil {
+		return err
+	}
+	return assign(cfg, *section, key, val)
 }
 
 // parseSectionHeader parses a "[name]" header and returns the section name.
@@ -102,17 +105,26 @@ func parseValue(s string) (tomlValue, error) {
 		return tomlValue{}, fmt.Errorf("missing value")
 	}
 	if s[0] == '"' {
-		str, rest, err := parseQuoted(s)
-		if err != nil {
-			return tomlValue{}, err
-		}
-		if err := ensureCommentOnly(rest); err != nil {
-			return tomlValue{}, err
-		}
-		return tomlValue{str: str}, nil
+		return parseStringValue(s)
 	}
+	return parseIntValue(s)
+}
 
-	// Bare value (integer): a trailing inline comment starts at an unquoted '#'.
+// parseStringValue decodes a quoted string value and any trailing comment.
+func parseStringValue(s string) (tomlValue, error) {
+	str, rest, err := parseQuoted(s)
+	if err != nil {
+		return tomlValue{}, err
+	}
+	if err := ensureCommentOnly(rest); err != nil {
+		return tomlValue{}, err
+	}
+	return tomlValue{str: str}, nil
+}
+
+// parseIntValue decodes a bare integer value, stripping any trailing inline
+// comment that starts at an unquoted '#'.
+func parseIntValue(s string) (tomlValue, error) {
 	tok := s
 	if h := strings.IndexByte(s, '#'); h >= 0 {
 		tok = s[:h]
@@ -134,29 +146,38 @@ func parseQuoted(s string) (string, string, error) {
 	var b strings.Builder
 	i := 1
 	for i < len(s) {
-		c := s[i]
-		switch c {
+		switch s[i] {
 		case '\\':
-			if i+1 >= len(s) {
-				return "", "", fmt.Errorf("unterminated string")
+			decoded, err := unescape(s, i)
+			if err != nil {
+				return "", "", err
 			}
-			switch s[i+1] {
-			case '"':
-				b.WriteByte('"')
-			case '\\':
-				b.WriteByte('\\')
-			default:
-				return "", "", fmt.Errorf("invalid escape \\%c", s[i+1])
-			}
+			b.WriteByte(decoded)
 			i += 2
 		case '"':
 			return b.String(), s[i+1:], nil
 		default:
-			b.WriteByte(c)
+			b.WriteByte(s[i])
 			i++
 		}
 	}
 	return "", "", fmt.Errorf("unterminated string")
+}
+
+// unescape decodes the escape sequence in s that begins with the backslash at
+// index i, returning the literal byte it represents.
+func unescape(s string, i int) (byte, error) {
+	if i+1 >= len(s) {
+		return 0, fmt.Errorf("unterminated string")
+	}
+	switch s[i+1] {
+	case '"':
+		return '"', nil
+	case '\\':
+		return '\\', nil
+	default:
+		return 0, fmt.Errorf("invalid escape \\%c", s[i+1])
+	}
 }
 
 // ensureCommentOnly verifies that the text after a value is empty or a
@@ -172,133 +193,81 @@ func ensureCommentOnly(rest string) error {
 	return fmt.Errorf("unexpected trailing text %q after value", trimmed)
 }
 
+// fieldSetter applies a decoded value to one struct field, returning an error
+// if the value has the wrong type for that field.
+type fieldSetter func(cfg *Config, section, key string, v tomlValue) error
+
+// strField builds a setter that stores a string into the field selected by get.
+func strField(get func(*Config) *string) fieldSetter {
+	return func(cfg *Config, section, key string, v tomlValue) error {
+		if v.isInt {
+			return fmt.Errorf("%s.%s expects a string", section, key)
+		}
+		*get(cfg) = v.str
+		return nil
+	}
+}
+
+// intField builds a setter that stores an int into the field selected by get.
+func intField(get func(*Config) *int) fieldSetter {
+	return func(cfg *Config, section, key string, v tomlValue) error {
+		if !v.isInt {
+			return fmt.Errorf("%s.%s expects an integer", section, key)
+		}
+		*get(cfg) = v.i
+		return nil
+	}
+}
+
+// schema maps each section to its known keys and their field setters.
+var schema = map[string]map[string]fieldSetter{
+	"": {
+		"host": strField(func(c *Config) *string { return &c.Host }),
+	},
+	"ssh": {
+		"user": strField(func(c *Config) *string { return &c.SSH.User }),
+		"port": intField(func(c *Config) *int { return &c.SSH.Port }),
+		"key":  strField(func(c *Config) *string { return &c.SSH.Key }),
+	},
+	"wireguard": {
+		"port":      intField(func(c *Config) *int { return &c.WireGuard.Port }),
+		"server_ip": strField(func(c *Config) *string { return &c.WireGuard.ServerIP }),
+		"client_ip": strField(func(c *Config) *string { return &c.WireGuard.ClientIP }),
+	},
+	"dropbear": {
+		"port": intField(func(c *Config) *int { return &c.Dropbear.Port }),
+	},
+	"output": {
+		"dir": strField(func(c *Config) *string { return &c.Output.Dir }),
+	},
+	"network": {
+		"interface": strField(func(c *Config) *string { return &c.Network.Interface }),
+		"ip":        strField(func(c *Config) *string { return &c.Network.IP }),
+	},
+	"luks": {
+		"device": strField(func(c *Config) *string { return &c.LUKS.Device }),
+	},
+}
+
 // assign maps a (section, key) pair to the corresponding struct field.
 func assign(cfg *Config, section, key string, v tomlValue) error {
-	wantStr := func() (string, error) {
-		if v.isInt {
-			return "", fmt.Errorf("%s.%s expects a string", section, key)
-		}
-		return v.str, nil
-	}
-	wantInt := func() (int, error) {
-		if !v.isInt {
-			return 0, fmt.Errorf("%s.%s expects an integer", section, key)
-		}
-		return v.i, nil
-	}
-
-	switch section {
-	case "":
-		switch key {
-		case "host":
-			s, err := wantStr()
-			if err != nil {
-				return err
-			}
-			cfg.Host = s
-		default:
-			return fmt.Errorf("unknown key %q", key)
-		}
-	case "ssh":
-		switch key {
-		case "user":
-			s, err := wantStr()
-			if err != nil {
-				return err
-			}
-			cfg.SSH.User = s
-		case "port":
-			n, err := wantInt()
-			if err != nil {
-				return err
-			}
-			cfg.SSH.Port = n
-		case "key":
-			s, err := wantStr()
-			if err != nil {
-				return err
-			}
-			cfg.SSH.Key = s
-		default:
-			return fmt.Errorf("unknown key %q in [ssh]", key)
-		}
-	case "wireguard":
-		switch key {
-		case "port":
-			n, err := wantInt()
-			if err != nil {
-				return err
-			}
-			cfg.WireGuard.Port = n
-		case "server_ip":
-			s, err := wantStr()
-			if err != nil {
-				return err
-			}
-			cfg.WireGuard.ServerIP = s
-		case "client_ip":
-			s, err := wantStr()
-			if err != nil {
-				return err
-			}
-			cfg.WireGuard.ClientIP = s
-		default:
-			return fmt.Errorf("unknown key %q in [wireguard]", key)
-		}
-	case "dropbear":
-		switch key {
-		case "port":
-			n, err := wantInt()
-			if err != nil {
-				return err
-			}
-			cfg.Dropbear.Port = n
-		default:
-			return fmt.Errorf("unknown key %q in [dropbear]", key)
-		}
-	case "output":
-		switch key {
-		case "dir":
-			s, err := wantStr()
-			if err != nil {
-				return err
-			}
-			cfg.Output.Dir = s
-		default:
-			return fmt.Errorf("unknown key %q in [output]", key)
-		}
-	case "network":
-		switch key {
-		case "interface":
-			s, err := wantStr()
-			if err != nil {
-				return err
-			}
-			cfg.Network.Interface = s
-		case "ip":
-			s, err := wantStr()
-			if err != nil {
-				return err
-			}
-			cfg.Network.IP = s
-		default:
-			return fmt.Errorf("unknown key %q in [network]", key)
-		}
-	case "luks":
-		switch key {
-		case "device":
-			s, err := wantStr()
-			if err != nil {
-				return err
-			}
-			cfg.LUKS.Device = s
-		default:
-			return fmt.Errorf("unknown key %q in [luks]", key)
-		}
-	default:
+	keys, ok := schema[section]
+	if !ok {
 		return fmt.Errorf("unknown section [%s]", section)
 	}
-	return nil
+	set, ok := keys[key]
+	if !ok {
+		return unknownKeyError(section, key)
+	}
+	return set(cfg, section, key, v)
+}
+
+// unknownKeyError formats the "unknown key" error, naming the section when set.
+func unknownKeyError(section, key string) error {
+	if section == "" {
+		return fmt.Errorf("unknown key %q", key)
+	}
+	return fmt.Errorf("unknown key %q in [%s]", key, section)
 }
 
 // Marshal renders c as TOML text (no comments) that Load can round-trip.

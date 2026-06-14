@@ -277,6 +277,51 @@ func tailFile(path string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
+// unlockTimeouts returns the (boot, setup) timeouts, longer without KVM.
+func unlockTimeouts(t *testing.T) (time.Duration, time.Duration) {
+	t.Helper()
+	if _, err := os.Stat("/dev/kvm"); err != nil {
+		t.Log("KVM not available — using software emulation (slower)")
+		return 12 * time.Minute, 15 * time.Minute
+	}
+	return 4 * time.Minute, 6 * time.Minute
+}
+
+// runUboUnlock drives `ubo unlock` from the client via expect, retrying a few
+// times. It fails the test if the unlock never reports completion.
+func runUboUnlock(t *testing.T) {
+	t.Helper()
+	pushUnlockExpect(t)
+	for attempt := 1; attempt <= 4; attempt++ {
+		out := runOnClient(t, true,
+			"cd /root && expect /root/do-unlock.exp "+luksPassphrase+" 2>&1")
+		t.Logf("ubo unlock attempt %d:\n%s", attempt, out)
+		if strings.Contains(out, "unlock complete") {
+			return
+		}
+		time.Sleep(15 * time.Second)
+	}
+	t.Fatalf("ubo unlock did not complete; server serial tail:\n%s",
+		tailFile(tmpPath("server-serial.log"), 50))
+}
+
+// verifyServerDecrypted confirms the server booted to the decrypted system after
+// a remote unlock.
+func verifyServerDecrypted(t *testing.T, bootTimeout time.Duration) {
+	t.Helper()
+	t.Log("Verifying server finished booting after remote unlock...")
+	waitServerSSHFromClient(t, bootTimeout)
+	host := strings.TrimSpace(runOnClient(t, false, sshToServer("hostname")))
+	if !strings.Contains(host, "ubo-luks-server") {
+		t.Errorf("server hostname after unlock = %q; want ubo-luks-server", host)
+	}
+	rootSrc := strings.TrimSpace(runOnClient(t, false, sshToServer("findmnt -no SOURCE /")))
+	if !strings.Contains(rootSrc, "vg0") {
+		t.Errorf("server root source after unlock = %q; want decrypted LVM (vg0)", rootSrc)
+	}
+	t.Log("Full remote LUKS unlock over WireGuard succeeded.")
+}
+
 // TestUBOUnlock_Integration exercises the COMPLETE remote-unlock path end to end,
 // entirely inside VMs:
 //
@@ -293,13 +338,7 @@ func tailFile(path string, n int) string {
 func TestUBOUnlock_Integration(t *testing.T) {
 	checkLUKSPrereqs(t)
 
-	bootTimeout := 4 * time.Minute
-	setupTimeout := 6 * time.Minute
-	if _, err := os.Stat("/dev/kvm"); err != nil {
-		bootTimeout = 12 * time.Minute
-		setupTimeout = 15 * time.Minute
-		t.Log("KVM not available — using software emulation (slower)")
-	}
+	bootTimeout, setupTimeout := unlockTimeouts(t)
 
 	// ── 1. Client VM (router) ────────────────────────────────────────────────
 	t.Log("Building client seed + booting client VM...")
@@ -370,35 +409,10 @@ ip = "%s/24"
 
 	// ── 5. ubo unlock (remote, over the WireGuard tunnel) ────────────────────
 	t.Log("Running ubo unlock from the client (expect drives the passphrase)...")
-	pushUnlockExpect(t)
-	unlockOK := false
-	for attempt := 1; attempt <= 4; attempt++ {
-		out := runOnClient(t, true,
-			"cd /root && expect /root/do-unlock.exp "+luksPassphrase+" 2>&1")
-		t.Logf("ubo unlock attempt %d:\n%s", attempt, out)
-		if strings.Contains(out, "unlock complete") {
-			unlockOK = true
-			break
-		}
-		time.Sleep(15 * time.Second)
-	}
-	if !unlockOK {
-		t.Fatalf("ubo unlock did not complete; server serial tail:\n%s",
-			tailFile(tmpPath("server-serial.log"), 50))
-	}
+	runUboUnlock(t)
 
 	// ── 6. Verify the server booted to the decrypted system ──────────────────
-	t.Log("Verifying server finished booting after remote unlock...")
-	waitServerSSHFromClient(t, bootTimeout)
-	host := strings.TrimSpace(runOnClient(t, false, sshToServer("hostname")))
-	if !strings.Contains(host, "ubo-luks-server") {
-		t.Errorf("server hostname after unlock = %q; want ubo-luks-server", host)
-	}
-	rootSrc := strings.TrimSpace(runOnClient(t, false, sshToServer("findmnt -no SOURCE /")))
-	if !strings.Contains(rootSrc, "vg0") {
-		t.Errorf("server root source after unlock = %q; want decrypted LVM (vg0)", rootSrc)
-	}
-	t.Log("Full remote LUKS unlock over WireGuard succeeded.")
+	verifyServerDecrypted(t, bootTimeout)
 }
 
 // sshToServer builds a command (run on the client) that SSHes to the server over

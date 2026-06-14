@@ -49,43 +49,110 @@ type dropbearPaths struct {
 // Configure runs all 11 setup steps on the remote host.
 // It saves the Dropbear host public key to outputDir/dropbear_host_key.pub.
 func Configure(ctx context.Context, client *remote.Client, cfg *config.Config, keys *keygen.Keys, outputDir string) error {
-	// Step 1: Detect network
+	netInfo, err := stepDetectNetwork(ctx, client, cfg)
+	if err != nil {
+		return err
+	}
+
+	if err := stepInstallPackages(ctx, client); err != nil {
+		return err
+	}
+
+	dbPaths, err := stepGenerateHostKey(ctx, client, outputDir)
+	if err != nil {
+		return err
+	}
+
+	if err := stepWriteConfigs(client, cfg, keys, dbPaths); err != nil {
+		return err
+	}
+
+	return stepGrubAndInitramfs(ctx, client, netInfo)
+}
+
+// stepWriteConfigs runs steps 4-9: report the dropbear config dir then write the
+// WireGuard config, initramfs hook/script, and Dropbear authorized_keys/config.
+func stepWriteConfigs(client *remote.Client, cfg *config.Config, keys *keygen.Keys, dbPaths *dropbearPaths) error {
+	// Step 4: Report detected dropbear config path
+	step(4, fmt.Sprintf("using dropbear config dir: %s", dbPaths.ConfigDir))
+
+	if err := stepWriteWireGuardConfig(client, cfg, keys); err != nil {
+		return err
+	}
+
+	if err := stepWriteInitramfsHook(client); err != nil {
+		return err
+	}
+
+	if err := stepWriteInitramfsScript(client, cfg); err != nil {
+		return err
+	}
+
+	return stepWriteDropbear(client, cfg, keys, dbPaths)
+}
+
+// stepGrubAndInitramfs runs steps 10 and 11: configure GRUB and rebuild initramfs.
+func stepGrubAndInitramfs(ctx context.Context, client *remote.Client, netInfo *NetworkInfo) error {
+	// Step 10: Configure GRUB for initramfs networking
+	step(10, "configuring GRUB for initramfs networking")
+	if err := configureGrub(ctx, client, netInfo); err != nil {
+		return fmt.Errorf("step 10 configure GRUB: %w", err)
+	}
+
+	// Step 11: Rebuild initramfs
+	step(11, "rebuilding initramfs (this may take a minute)")
+	if _, err := runCommand(ctx, client, "update-initramfs -u -k all"); err != nil {
+		return fmt.Errorf("step 11 update-initramfs: %w", err)
+	}
+
+	return nil
+}
+
+// stepDetectNetwork runs step 1: detect and report the remote network config.
+func stepDetectNetwork(ctx context.Context, client *remote.Client, cfg *config.Config) (*NetworkInfo, error) {
 	step(1, "detecting remote network configuration")
 	netInfo, err := detectNetwork(ctx, client, cfg)
 	if err != nil {
-		return fmt.Errorf("step 1 detect network: %w", err)
+		return nil, fmt.Errorf("step 1 detect network: %w", err)
 	}
 	fmt.Printf("[ubo]   interface=%s ip=%s/%d gateway=%s hostname=%s\n",
 		netInfo.Interface, netInfo.IP, netInfo.Prefix, netInfo.Gateway, netInfo.Hostname)
+	return netInfo, nil
+}
 
-	// Step 2: Install packages
+// stepInstallPackages runs step 2: install dropbear-initramfs and wireguard-tools.
+func stepInstallPackages(ctx context.Context, client *remote.Client) error {
 	step(2, "installing dropbear-initramfs and wireguard-tools")
 	installCmd := "DEBIAN_FRONTEND=noninteractive apt-get update -qq && " +
 		"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dropbear-initramfs wireguard-tools"
 	if _, err := runCommand(ctx, client, installCmd); err != nil {
 		return fmt.Errorf("step 2 install packages: %w", err)
 	}
+	return nil
+}
 
-	// Step 3: Detect dropbear paths and generate host key
+// stepGenerateHostKey runs step 3: detect dropbear paths, regenerate the host
+// key, and pin its public key under outputDir.
+func stepGenerateHostKey(ctx context.Context, client *remote.Client, outputDir string) (*dropbearPaths, error) {
 	step(3, "generating Dropbear host key")
 	dbPaths, err := detectDropbearPaths(ctx, client)
 	if err != nil {
-		return fmt.Errorf("step 3 detect dropbear paths: %w", err)
+		return nil, fmt.Errorf("step 3 detect dropbear paths: %w", err)
 	}
 	hostPubKey, err := generateDropbearHostKey(ctx, client, dbPaths.HostKeyFile)
 	if err != nil {
-		return fmt.Errorf("step 3 generate dropbear host key: %w", err)
+		return nil, fmt.Errorf("step 3 generate dropbear host key: %w", err)
 	}
 	pinnedPath := filepath.Join(outputDir, "dropbear_host_key.pub")
 	if err := os.WriteFile(pinnedPath, []byte(hostPubKey+"\n"), 0644); err != nil {
-		return fmt.Errorf("save dropbear host key: %w", err)
+		return nil, fmt.Errorf("save dropbear host key: %w", err)
 	}
 	fmt.Printf("[ubo]   dropbear host key saved to %s\n", pinnedPath)
+	return dbPaths, nil
+}
 
-	// Step 4: Report detected dropbear config path
-	step(4, fmt.Sprintf("using dropbear config dir: %s", dbPaths.ConfigDir))
-
-	// Step 5: Write WireGuard server config
+// stepWriteWireGuardConfig runs step 5: render and write the WireGuard server config.
+func stepWriteWireGuardConfig(client *remote.Client, cfg *config.Config, keys *keygen.Keys) error {
 	step(5, "writing WireGuard server config")
 	wgServerCfg := templates.WireGuardServerConfig{
 		Address:        cfg.WireGuard.ServerIP,
@@ -101,14 +168,20 @@ func Configure(ctx context.Context, client *remote.Client, cfg *config.Config, k
 	if err := writeFile(client, "/etc/wireguard/wg-initramfs.conf", wgServerINI, 0600); err != nil {
 		return fmt.Errorf("step 5 write WireGuard config: %w", err)
 	}
+	return nil
+}
 
-	// Step 6: Write initramfs hook
+// stepWriteInitramfsHook runs step 6: write the initramfs WireGuard hook.
+func stepWriteInitramfsHook(client *remote.Client) error {
 	step(6, "writing initramfs WireGuard hook")
 	if err := writeFileExec(client, "/etc/initramfs-tools/hooks/wireguard", templates.InitramfsHookTmpl); err != nil {
 		return fmt.Errorf("step 6 write initramfs hook: %w", err)
 	}
+	return nil
+}
 
-	// Step 7: Write initramfs script
+// stepWriteInitramfsScript runs step 7: render and write the initramfs startup script.
+func stepWriteInitramfsScript(client *remote.Client, cfg *config.Config) error {
 	step(7, "writing initramfs WireGuard startup script")
 	initScript, err := templates.RenderInitramfsScript(templates.InitramfsScriptData{
 		ServerIP: cfg.WireGuard.ServerIP,
@@ -119,7 +192,11 @@ func Configure(ctx context.Context, client *remote.Client, cfg *config.Config, k
 	if err := writeFileExec(client, "/etc/initramfs-tools/scripts/init-premount/wireguard", initScript); err != nil {
 		return fmt.Errorf("step 7 write initramfs script: %w", err)
 	}
+	return nil
+}
 
+// stepWriteDropbear runs steps 8 and 9: write Dropbear authorized_keys and config.
+func stepWriteDropbear(client *remote.Client, cfg *config.Config, keys *keygen.Keys, dbPaths *dropbearPaths) error {
 	// Step 8: Write Dropbear authorized_keys
 	step(8, "configuring Dropbear authorized keys")
 	authKeysPath := dbPaths.ConfigDir + "/authorized_keys"
@@ -139,19 +216,6 @@ func Configure(ctx context.Context, client *remote.Client, cfg *config.Config, k
 	if err := writeFile(client, dbPaths.ConfigDir+"/dropbear.conf", dbConf, 0644); err != nil {
 		return fmt.Errorf("step 9 write dropbear config: %w", err)
 	}
-
-	// Step 10: Configure GRUB for initramfs networking
-	step(10, "configuring GRUB for initramfs networking")
-	if err := configureGrub(ctx, client, netInfo); err != nil {
-		return fmt.Errorf("step 10 configure GRUB: %w", err)
-	}
-
-	// Step 11: Rebuild initramfs
-	step(11, "rebuilding initramfs (this may take a minute)")
-	if _, err := runCommand(ctx, client, "update-initramfs -u -k all"); err != nil {
-		return fmt.Errorf("step 11 update-initramfs: %w", err)
-	}
-
 	return nil
 }
 
@@ -162,63 +226,134 @@ func detectNetwork(ctx context.Context, client *remote.Client, cfg *config.Confi
 		Interface: cfg.Network.Interface,
 	}
 
-	if cfg.Network.IP != "" {
-		ip, ipNet, err := net.ParseCIDR(cfg.Network.IP)
-		if err != nil {
-			return nil, fmt.Errorf("invalid network.ip %q: %w", cfg.Network.IP, err)
-		}
-		info.IP = ip.String()
-		ones, _ := ipNet.Mask.Size()
-		info.Prefix = ones
+	if err := applyConfigIP(info, cfg.Network.IP); err != nil {
+		return nil, err
 	}
 
-	// Parse default route: "default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.100 ..."
+	if err := parseDefaultRoute(ctx, client, info); err != nil {
+		return nil, err
+	}
+
+	if err := validateInterface(info); err != nil {
+		return nil, err
+	}
+
+	detectPrefix(ctx, client, info)
+	detectHostname(ctx, client, info)
+
+	return info, validateNetworkInfo(info)
+}
+
+// applyConfigIP fills info.IP and info.Prefix from a config CIDR (if non-empty).
+func applyConfigIP(info *NetworkInfo, cfgIP string) error {
+	if cfgIP == "" {
+		return nil
+	}
+	ip, ipNet, err := net.ParseCIDR(cfgIP)
+	if err != nil {
+		return fmt.Errorf("invalid network.ip %q: %w", cfgIP, err)
+	}
+	info.IP = ip.String()
+	ones, _ := ipNet.Mask.Size()
+	info.Prefix = ones
+	return nil
+}
+
+// validateInterface ensures the interface was detected and has a safe name.
+func validateInterface(info *NetworkInfo) error {
+	if info.Interface == "" {
+		return fmt.Errorf("could not determine network interface; set network.interface in config")
+	}
+	if !isValidInterfaceName(info.Interface) {
+		return fmt.Errorf("detected interface name %q contains unexpected characters; set network.interface in config", info.Interface)
+	}
+	return nil
+}
+
+// validateNetworkInfo ensures IP and Gateway were determined.
+func validateNetworkInfo(info *NetworkInfo) error {
+	if info.IP == "" {
+		return fmt.Errorf("could not determine IP address; set network.ip in config")
+	}
+	if info.Gateway == "" {
+		return fmt.Errorf("could not determine default gateway from the remote routing table")
+	}
+	return nil
+}
+
+// parseDefaultRoute runs `ip route show default` and fills any unset
+// Gateway/Interface/IP fields on info from its output.
+// Example line: "default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.100 ..."
+func parseDefaultRoute(ctx context.Context, client *remote.Client, info *NetworkInfo) error {
 	routeOut, err := runCommand(ctx, client, "ip route show default")
 	if err != nil {
-		return nil, fmt.Errorf("ip route: %w", err)
+		return fmt.Errorf("ip route: %w", err)
 	}
 	for _, line := range strings.Split(routeOut, "\n") {
 		parts := strings.Fields(line)
 		for i, p := range parts {
-			if p == "via" && i+1 < len(parts) && info.Gateway == "" {
-				info.Gateway = parts[i+1]
-			}
-			if p == "dev" && i+1 < len(parts) && info.Interface == "" {
-				info.Interface = parts[i+1]
-			}
-			if p == "src" && i+1 < len(parts) && info.IP == "" {
-				info.IP = parts[i+1]
-			}
+			applyRouteToken(info, parts, i, p)
 		}
 	}
+	return nil
+}
 
-	if info.Interface == "" {
-		return nil, fmt.Errorf("could not determine network interface; set network.interface in config")
+// applyRouteToken sets the matching info field for token p at index i if that
+// field is still unset and a value follows.
+func applyRouteToken(info *NetworkInfo, parts []string, i int, p string) {
+	if i+1 >= len(parts) {
+		return
 	}
-	if !isValidInterfaceName(info.Interface) {
-		return nil, fmt.Errorf("detected interface name %q contains unexpected characters; set network.interface in config", info.Interface)
+	field := routeFieldFor(info, p)
+	if field != nil && *field == "" {
+		*field = parts[i+1]
 	}
+}
 
-	// Get prefix length from ip addr if not already set
-	if info.Prefix == 0 && info.IP != "" {
-		addrOut, addrErr := runCommand(ctx, client, "ip addr show dev "+info.Interface)
-		if addrErr == nil {
-			re := regexp.MustCompile(`inet (\d+\.\d+\.\d+\.\d+/\d+)`)
-			for _, m := range re.FindAllStringSubmatch(addrOut, -1) {
-				addrIP, ipNet, parseErr := net.ParseCIDR(m[1])
-				if parseErr == nil && addrIP.String() == info.IP {
-					ones, _ := ipNet.Mask.Size()
-					info.Prefix = ones
-					break
-				}
-			}
+// routeFieldFor returns a pointer to the info field associated with route
+// keyword p, or nil if p is not a recognized keyword.
+func routeFieldFor(info *NetworkInfo, p string) *string {
+	switch p {
+	case "via":
+		return &info.Gateway
+	case "dev":
+		return &info.Interface
+	case "src":
+		return &info.IP
+	}
+	return nil
+}
+
+// detectPrefix fills info.Prefix from `ip addr` when unset, falling back to /24.
+func detectPrefix(ctx context.Context, client *remote.Client, info *NetworkInfo) {
+	if info.Prefix != 0 || info.IP == "" {
+		return
+	}
+	if addrOut, addrErr := runCommand(ctx, client, "ip addr show dev "+info.Interface); addrErr == nil {
+		info.Prefix = prefixForIP(addrOut, info.IP)
+	}
+	if info.Prefix == 0 {
+		fmt.Printf("[ubo]   warning: could not detect network prefix length, assuming /24\n")
+		info.Prefix = 24
+	}
+}
+
+// prefixForIP scans `ip addr` output for the inet line matching ip and returns
+// its prefix length, or 0 if none matches.
+func prefixForIP(addrOut, ip string) int {
+	re := regexp.MustCompile(`inet (\d+\.\d+\.\d+\.\d+/\d+)`)
+	for _, m := range re.FindAllStringSubmatch(addrOut, -1) {
+		addrIP, ipNet, parseErr := net.ParseCIDR(m[1])
+		if parseErr == nil && addrIP.String() == ip {
+			ones, _ := ipNet.Mask.Size()
+			return ones
 		}
-		if info.Prefix == 0 {
-			fmt.Printf("[ubo]   warning: could not detect network prefix length, assuming /24\n")
-			info.Prefix = 24
-		}
 	}
+	return 0
+}
 
+// detectHostname fills info.Hostname, defaulting to "server" on failure/empty.
+func detectHostname(ctx context.Context, client *remote.Client, info *NetworkInfo) {
 	hostnameOut, hostnameErr := runCommand(ctx, client, "hostname")
 	if hostnameErr != nil {
 		fmt.Printf("[ubo]   warning: hostname detection failed, using fallback \"server\"\n")
@@ -227,15 +362,6 @@ func detectNetwork(ctx context.Context, client *remote.Client, cfg *config.Confi
 	if info.Hostname == "" {
 		info.Hostname = "server"
 	}
-
-	if info.IP == "" {
-		return nil, fmt.Errorf("could not determine IP address; set network.ip in config")
-	}
-	if info.Gateway == "" {
-		return nil, fmt.Errorf("could not determine gateway; set network.ip in config")
-	}
-
-	return info, nil
 }
 
 // detectDropbearPaths returns the dropbear-initramfs config directory and host key path.
@@ -324,7 +450,7 @@ func updateGrubContent(content, ipParam string) (string, bool) {
 	updated := re.ReplaceAllStringFunc(content, func(match string) string {
 		m := re.FindStringSubmatch(match)
 		existing := m[2]
-		if strings.Contains(existing, "ip=") {
+		if cmdlineHasIPParam(existing) {
 			alreadySet = true
 			return match
 		}
@@ -336,6 +462,18 @@ func updateGrubContent(content, ipParam string) (string, bool) {
 		return content, false
 	}
 	return updated, true
+}
+
+// cmdlineHasIPParam reports whether a kernel cmdline already contains an `ip=`
+// parameter as a whole token. A plain substring check would false-match params
+// like `gossip=` or `skip=`, causing a needed ip= to be skipped.
+func cmdlineHasIPParam(cmdline string) bool {
+	for _, f := range strings.Fields(cmdline) {
+		if strings.HasPrefix(f, "ip=") {
+			return true
+		}
+	}
+	return false
 }
 
 // prefixToNetmask converts a CIDR prefix length to a dotted-decimal netmask string.
@@ -351,10 +489,32 @@ func isValidInterfaceName(name string) bool {
 		return false
 	}
 	for _, c := range name {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+		if !isValidInterfaceChar(c) {
 			return false
 		}
 	}
 	return true
+}
+
+// charRange is an inclusive rune range.
+type charRange struct{ lo, hi rune }
+
+// validInterfaceRanges enumerates the rune ranges allowed in an interface name.
+var validInterfaceRanges = []charRange{
+	{'a', 'z'},
+	{'A', 'Z'},
+	{'0', '9'},
+	{'-', '-'},
+	{'_', '_'},
+	{'.', '.'},
+}
+
+// isValidInterfaceChar reports whether c is allowed in an interface name.
+func isValidInterfaceChar(c rune) bool {
+	for _, r := range validInterfaceRanges {
+		if c >= r.lo && c <= r.hi {
+			return true
+		}
+	}
+	return false
 }

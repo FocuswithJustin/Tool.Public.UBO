@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -33,13 +34,28 @@ device = "/dev/sda3"
 	if err := parseTOML([]byte(src), cfg); err != nil {
 		t.Fatalf("parseTOML: %v", err)
 	}
-	if cfg.Host != "1.2.3.4" || cfg.SSH.User != "bob" || cfg.SSH.Port != 2200 ||
-		cfg.SSH.Key != "/home/bob/.ssh/id_ed25519" || cfg.WireGuard.Port != 51000 ||
-		cfg.WireGuard.ServerIP != "10.1.0.1/24" || cfg.WireGuard.ClientIP != "10.1.0.2/32" ||
-		cfg.Dropbear.Port != 23 || cfg.Output.Dir != "/var/ubo" ||
-		cfg.Network.Interface != "eth0" || cfg.Network.IP != "192.168.0.5/24" ||
-		cfg.LUKS.Device != "/dev/sda3" {
-		t.Errorf("unexpected parse result: %+v", cfg)
+	checks := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"Host", cfg.Host, "1.2.3.4"},
+		{"SSH.User", cfg.SSH.User, "bob"},
+		{"SSH.Port", strconv.Itoa(cfg.SSH.Port), "2200"},
+		{"SSH.Key", cfg.SSH.Key, "/home/bob/.ssh/id_ed25519"},
+		{"WireGuard.Port", strconv.Itoa(cfg.WireGuard.Port), "51000"},
+		{"WireGuard.ServerIP", cfg.WireGuard.ServerIP, "10.1.0.1/24"},
+		{"WireGuard.ClientIP", cfg.WireGuard.ClientIP, "10.1.0.2/32"},
+		{"Dropbear.Port", strconv.Itoa(cfg.Dropbear.Port), "23"},
+		{"Output.Dir", cfg.Output.Dir, "/var/ubo"},
+		{"Network.Interface", cfg.Network.Interface, "eth0"},
+		{"Network.IP", cfg.Network.IP, "192.168.0.5/24"},
+		{"LUKS.Device", cfg.LUKS.Device, "/dev/sda3"},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %q; want %q", c.name, c.got, c.want)
+		}
 	}
 }
 
@@ -241,68 +257,41 @@ func TestSave_badDir(t *testing.T) {
 	}
 }
 
+var saveBoom = errors.New("boom")
+
+// restoreSeams resets every Save I/O seam to its production implementation.
+func restoreSeams() {
+	marshalFunc = Marshal
+	createTemp = os.CreateTemp
+	writeFile = (*os.File).Write
+	chmodFile = (*os.File).Chmod
+	closeFile = (*os.File).Close
+	renameFile = os.Rename
+	removeFile = os.Remove
+}
+
 func TestSave_seamErrors(t *testing.T) {
-	boom := errors.New("boom")
-	dir := t.TempDir()
-	path := filepath.Join(dir, "ubo.toml")
-
-	restore := func() {
-		marshalFunc = Marshal
-		createTemp = os.CreateTemp
-		writeFile = (*os.File).Write
-		chmodFile = (*os.File).Chmod
-		closeFile = (*os.File).Close
-		renameFile = os.Rename
-		removeFile = os.Remove
+	path := filepath.Join(t.TempDir(), "ubo.toml")
+	cases := []struct {
+		name   string
+		inject func()
+	}{
+		{"marshal error", func() { marshalFunc = func(*Config) ([]byte, error) { return nil, saveBoom } }},
+		{"createTemp error", func() { createTemp = func(string, string) (*os.File, error) { return nil, saveBoom } }},
+		{"write error", func() { writeFile = func(*os.File, []byte) (int, error) { return 0, saveBoom } }},
+		{"chmod error", func() { chmodFile = func(*os.File, os.FileMode) error { return saveBoom } }},
+		{"close error", func() { closeFile = func(*os.File) error { return saveBoom } }},
+		{"rename error", func() { renameFile = func(string, string) error { return saveBoom } }},
 	}
-
-	t.Run("marshal error", func(t *testing.T) {
-		defer restore()
-		marshalFunc = func(*Config) ([]byte, error) { return nil, boom }
-		if err := Save(Default(), path); !errors.Is(err, boom) {
-			t.Errorf("err = %v; want boom", err)
-		}
-	})
-
-	t.Run("createTemp error", func(t *testing.T) {
-		defer restore()
-		createTemp = func(string, string) (*os.File, error) { return nil, boom }
-		if err := Save(Default(), path); !errors.Is(err, boom) {
-			t.Errorf("err = %v; want boom", err)
-		}
-	})
-
-	t.Run("write error", func(t *testing.T) {
-		defer restore()
-		writeFile = func(*os.File, []byte) (int, error) { return 0, boom }
-		if err := Save(Default(), path); !errors.Is(err, boom) {
-			t.Errorf("err = %v; want boom", err)
-		}
-	})
-
-	t.Run("chmod error", func(t *testing.T) {
-		defer restore()
-		chmodFile = func(*os.File, os.FileMode) error { return boom }
-		if err := Save(Default(), path); !errors.Is(err, boom) {
-			t.Errorf("err = %v; want boom", err)
-		}
-	})
-
-	t.Run("close error", func(t *testing.T) {
-		defer restore()
-		closeFile = func(*os.File) error { return boom }
-		if err := Save(Default(), path); !errors.Is(err, boom) {
-			t.Errorf("err = %v; want boom", err)
-		}
-	})
-
-	t.Run("rename error", func(t *testing.T) {
-		defer restore()
-		renameFile = func(string, string) error { return boom }
-		if err := Save(Default(), path); !errors.Is(err, boom) {
-			t.Errorf("err = %v; want boom", err)
-		}
-	})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer restoreSeams()
+			tc.inject()
+			if err := Save(Default(), path); !errors.Is(err, saveBoom) {
+				t.Errorf("err = %v; want boom", err)
+			}
+		})
+	}
 }
 
 func TestMarshal_quotesContainHash(t *testing.T) {

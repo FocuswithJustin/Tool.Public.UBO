@@ -59,47 +59,45 @@ func GenerateAll(outputDir string) (*Keys, error) {
 // loadExisting reads all key files from outputDir and returns the Keys, or an
 // error if any file is missing or unreadable.
 func loadExisting(outputDir string) (*Keys, error) {
-	read := func(name string) (string, error) {
-		b, err := os.ReadFile(filepath.Join(outputDir, name))
-		if err != nil {
-			return "", err
-		}
-		return strings.TrimSpace(string(b)), nil
+	names := []string{
+		"server_wg_private.key",
+		"server_wg_public.key",
+		"client_wg_private.key",
+		"client_wg_public.key",
+		"client_auth_ed25519.pub",
+	}
+	vals, err := readTrimmedFiles(outputDir, names)
+	if err != nil {
+		return nil, err
 	}
 
-	serverPriv, err := read("server_wg_private.key")
-	if err != nil {
-		return nil, err
-	}
-	serverPub, err := read("server_wg_public.key")
-	if err != nil {
-		return nil, err
-	}
-	clientPriv, err := read("client_wg_private.key")
-	if err != nil {
-		return nil, err
-	}
-	clientPub, err := read("client_wg_public.key")
-	if err != nil {
-		return nil, err
-	}
 	sshKeyPath := filepath.Join(outputDir, "client_auth_ed25519")
 	if _, err := os.Stat(sshKeyPath); err != nil {
 		return nil, err
 	}
-	sshPub, err := read("client_auth_ed25519.pub")
-	if err != nil {
-		return nil, err
-	}
 
 	return &Keys{
-		ServerWGPrivate:  serverPriv,
-		ServerWGPublic:   serverPub,
-		ClientWGPrivate:  clientPriv,
-		ClientWGPublic:   clientPub,
+		ServerWGPrivate:  vals[0],
+		ServerWGPublic:   vals[1],
+		ClientWGPrivate:  vals[2],
+		ClientWGPublic:   vals[3],
 		ClientSSHKeyPath: sshKeyPath,
-		ClientSSHPubKey:  sshPub,
+		ClientSSHPubKey:  vals[4],
 	}, nil
+}
+
+// readTrimmedFiles reads each named file in outputDir and returns the
+// whitespace-trimmed contents in the same order, or the first read error.
+func readTrimmedFiles(outputDir string, names []string) ([]string, error) {
+	vals := make([]string, len(names))
+	for i, name := range names {
+		b, err := os.ReadFile(filepath.Join(outputDir, name))
+		if err != nil {
+			return nil, err
+		}
+		vals[i] = strings.TrimSpace(string(b))
+	}
+	return vals, nil
 }
 
 // GenerateWireGuardKeypair uses wg to generate a keypair.

@@ -51,20 +51,8 @@ type Client struct {
 // pinned mode, materializes) the host-key verification settings. Connection
 // errors surface on the first real RunCommand/WriteFile/etc.
 func Connect(ctx context.Context, opts *ConnectOptions) (*Client, error) {
-	if opts == nil {
-		return nil, fmt.Errorf("nil connect options")
-	}
-	if opts.Host == "" {
-		return nil, fmt.Errorf("host is required")
-	}
-	if opts.User == "" {
-		return nil, fmt.Errorf("user is required")
-	}
-	if opts.Port <= 0 {
-		return nil, fmt.Errorf("invalid port %d", opts.Port)
-	}
-	if opts.KnownHostsPath != "" && opts.PinnedKeyPath != "" {
-		return nil, fmt.Errorf("set only one of KnownHostsPath or PinnedKeyPath")
+	if err := validateConnectOptions(opts); err != nil {
+		return nil, err
 	}
 
 	c := &Client{
@@ -74,13 +62,50 @@ func Connect(ctx context.Context, opts *ConnectOptions) (*Client, error) {
 		keyPath: opts.KeyPath,
 	}
 
+	if err := applyHostKeyMode(c, opts); err != nil {
+		return nil, err
+	}
+
+	return c, nil
+}
+
+// validateConnectOptions checks the required fields and mutually exclusive
+// host-key mode selectors on opts.
+func validateConnectOptions(opts *ConnectOptions) error {
+	if opts == nil {
+		return fmt.Errorf("nil connect options")
+	}
+	if opts.Host == "" {
+		return fmt.Errorf("host is required")
+	}
+	if opts.User == "" {
+		return fmt.Errorf("user is required")
+	}
+	if opts.Port <= 0 {
+		return fmt.Errorf("invalid port %d", opts.Port)
+	}
+	return validateHostKeyModeExclusive(opts)
+}
+
+// validateHostKeyModeExclusive rejects setting both host-key mode selectors.
+func validateHostKeyModeExclusive(opts *ConnectOptions) error {
+	if opts.KnownHostsPath != "" && opts.PinnedKeyPath != "" {
+		return fmt.Errorf("set only one of KnownHostsPath or PinnedKeyPath")
+	}
+	return nil
+}
+
+// applyHostKeyMode configures c's host-key verification settings from opts,
+// materializing a pinned known_hosts file when in strict mode. Behavior is
+// identical to the original inline switch in Connect.
+func applyHostKeyMode(c *Client, opts *ConnectOptions) error {
 	switch {
 	case opts.PinnedKeyPath != "":
 		// Strict mode: materialize a known_hosts file from the pinned key now,
 		// so a bad pinned file is reported at Connect time.
 		khFile, err := materializePinnedKnownHosts(opts.Host, opts.Port, opts.PinnedKeyPath)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		c.knownHostsFile = khFile
 		c.tempKnownHosts = khFile
@@ -90,10 +115,9 @@ func Connect(ctx context.Context, opts *ConnectOptions) (*Client, error) {
 		c.knownHostsFile = opts.KnownHostsPath
 		c.strictMode = "accept-new"
 	default:
-		return nil, fmt.Errorf("set one of KnownHostsPath (TOFU) or PinnedKeyPath (strict)")
+		return fmt.Errorf("set one of KnownHostsPath (TOFU) or PinnedKeyPath (strict)")
 	}
-
-	return c, nil
+	return nil
 }
 
 // knownHostsHostname formats the host as it appears in a known_hosts line:
@@ -139,20 +163,33 @@ func parseAuthorizedKey(data []byte) (keyType, keyData string, err error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			return "", "", fmt.Errorf("malformed authorized_keys line: %q", line)
-		}
-		if !strings.HasPrefix(fields[0], "ssh-") && !strings.HasPrefix(fields[0], "ecdsa-") &&
-			!strings.HasPrefix(fields[0], "sk-") {
-			return "", "", fmt.Errorf("unrecognized key type %q", fields[0])
-		}
-		// strings.Fields never yields an empty field, so fields[1] is non-empty.
-		return fields[0], fields[1], nil
+		return parseAuthorizedKeyLine(line)
 	}
 	// scanner.Err on an in-memory strings.Reader cannot fail, so the only way
 	// out of the loop is an input with no usable key line.
 	return "", "", fmt.Errorf("no key found in pinned file")
+}
+
+// parseAuthorizedKeyLine validates a single non-empty, non-comment
+// authorized_keys line and returns its key type and base64 key data.
+func parseAuthorizedKeyLine(line string) (keyType, keyData string, err error) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return "", "", fmt.Errorf("malformed authorized_keys line: %q", line)
+	}
+	if !hasKnownKeyTypePrefix(fields[0]) {
+		return "", "", fmt.Errorf("unrecognized key type %q", fields[0])
+	}
+	// strings.Fields never yields an empty field, so fields[1] is non-empty.
+	return fields[0], fields[1], nil
+}
+
+// hasKnownKeyTypePrefix reports whether field looks like a recognized SSH key
+// type token (ssh-*, ecdsa-*, or sk-*).
+func hasKnownKeyTypePrefix(field string) bool {
+	return strings.HasPrefix(field, "ssh-") ||
+		strings.HasPrefix(field, "ecdsa-") ||
+		strings.HasPrefix(field, "sk-")
 }
 
 // sshArgs builds the common ssh argument list (everything before the remote

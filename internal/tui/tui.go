@@ -107,39 +107,10 @@ func edit(in io.Reader, out io.Writer, cfg *config.Config) (*config.Config, erro
 	fmt.Fprintln(out)
 
 	for _, fd := range fields {
-		eof := false
-		for {
-			cur := fd.getValue(cfg)
-			fmt.Fprintf(out, "%s [%s]: ", fd.label, cur)
-
-			line, err := r.ReadString('\n')
-			if err == io.EOF {
-				eof = true
-			} else if err != nil {
-				return nil, err
-			}
-
-			answer := strings.TrimSpace(line)
-			if answer == "" {
-				// Empty line (or EOF with no input) keeps the current value.
-				break
-			}
-
-			if fd.isInt {
-				if _, perr := strconv.Atoi(answer); perr != nil {
-					fmt.Fprintf(out, "invalid number %q, please enter an integer\n", answer)
-					if eof {
-						// No more input to retry with; keep current value.
-						break
-					}
-					continue // re-prompt the same field
-				}
-			}
-
-			fd.setValue(cfg, answer)
-			break
+		eof, err := editField(r, out, cfg, fd)
+		if err != nil {
+			return nil, err
 		}
-
 		// Stop prompting once input is exhausted; remaining fields keep current.
 		if eof {
 			break
@@ -147,6 +118,48 @@ func edit(in io.Reader, out io.Writer, cfg *config.Config) (*config.Config, erro
 	}
 
 	return cfg, nil
+}
+
+// editField runs the prompt loop for a single field, updating cfg in place.
+// It returns whether EOF was reached on the underlying reader, and any
+// non-EOF read error. Integer fields re-prompt on a parse failure until a
+// valid value is entered or input is exhausted.
+func editField(r *bufio.Reader, out io.Writer, cfg *config.Config, fd fieldDef) (bool, error) {
+	for {
+		fmt.Fprintf(out, "%s [%s]: ", fd.label, fd.getValue(cfg))
+
+		line, err := r.ReadString('\n')
+		eof := err == io.EOF
+		if err != nil && !eof {
+			return false, err
+		}
+
+		answer := strings.TrimSpace(line)
+		if answer == "" {
+			// Empty line (or EOF with no input) keeps the current value.
+			return eof, nil
+		}
+
+		if retry := applyAnswer(out, cfg, fd, answer, eof); retry {
+			continue // re-prompt the same field
+		}
+		return eof, nil
+	}
+}
+
+// applyAnswer validates and applies a non-empty answer to fd. It returns true
+// when the field should be re-prompted (an invalid integer with input still
+// available); otherwise it sets the value (when valid) and returns false.
+func applyAnswer(out io.Writer, cfg *config.Config, fd fieldDef, answer string, eof bool) bool {
+	if fd.isInt {
+		if _, perr := strconv.Atoi(answer); perr != nil {
+			fmt.Fprintf(out, "invalid number %q, please enter an integer\n", answer)
+			// Re-prompt only when there is more input to retry with.
+			return !eof
+		}
+	}
+	fd.setValue(cfg, answer)
+	return false
 }
 
 // Run loads configPath (or config.Default() if the file is absent), runs the

@@ -242,13 +242,8 @@ func TestConnect_PinnedMaterializesKnownHosts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect pinned: %v", err)
 	}
-	if c.strictMode != "yes" {
-		t.Fatalf("expected strict yes, got %q", c.strictMode)
-	}
 	want := pinned + ".known_hosts"
-	if c.knownHostsFile != want || c.tempKnownHosts != want {
-		t.Fatalf("expected known hosts %q, got file=%q temp=%q", want, c.knownHostsFile, c.tempKnownHosts)
-	}
+	requirePinnedClient(t, c, want)
 	data, err := os.ReadFile(want)
 	if err != nil {
 		t.Fatalf("read materialized known_hosts: %v", err)
@@ -256,6 +251,21 @@ func TestConnect_PinnedMaterializesKnownHosts(t *testing.T) {
 	// Non-default port -> [host]:port format.
 	if !strings.HasPrefix(string(data), "[h]:2222 ssh-ed25519 AAAAC3") {
 		t.Fatalf("unexpected known_hosts line: %q", string(data))
+	}
+}
+
+// requirePinnedClient asserts a pinned-mode client has strict checking and the
+// expected known_hosts file/temp paths.
+func requirePinnedClient(t *testing.T, c *Client, wantKH string) {
+	t.Helper()
+	if c.strictMode != "yes" {
+		t.Fatalf("expected strict yes, got %q", c.strictMode)
+	}
+	if c.knownHostsFile != wantKH {
+		t.Fatalf("expected known hosts file %q, got %q", wantKH, c.knownHostsFile)
+	}
+	if c.tempKnownHosts != wantKH {
+		t.Fatalf("expected temp known hosts %q, got %q", wantKH, c.tempKnownHosts)
 	}
 }
 
@@ -322,6 +332,24 @@ func TestConnect_PinnedWriteFailure(t *testing.T) {
 
 // ----- sshArgs -----
 
+// requireArgvContains fails the test unless every want value is present in argv.
+func requireArgvContains(t *testing.T, args []string, wants ...string) {
+	t.Helper()
+	for _, w := range wants {
+		if !argvContains(args, w) {
+			t.Fatalf("missing %q in %v", w, args)
+		}
+	}
+}
+
+// requireArgvPair fails the test unless the adjacent flag,value pair is present.
+func requireArgvPair(t *testing.T, args []string, flag, value string) {
+	t.Helper()
+	if !argvContainsPair(args, flag, value) {
+		t.Fatalf("missing %s %s in %v", flag, value, args)
+	}
+}
+
 func TestSSHArgs_TOFUWithKey(t *testing.T) {
 	kh := filepath.Join(t.TempDir(), "kh")
 	key := writeTemp(t, "id", []byte("k"), 0600)
@@ -332,21 +360,14 @@ func TestSSHArgs_TOFUWithKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	args := c.sshArgs()
-	if !argvContainsPair(args, "-p", "2222") {
-		t.Fatalf("missing -p 2222 in %v", args)
-	}
-	if !argvContainsPair(args, "-i", key) {
-		t.Fatalf("missing -i key in %v", args)
-	}
-	if !argvContains(args, "BatchMode=yes") || !argvContains(args, "ConnectTimeout=30") {
-		t.Fatalf("missing batch/timeout opts in %v", args)
-	}
-	if !argvContains(args, "UserKnownHostsFile="+kh) {
-		t.Fatalf("missing UserKnownHostsFile in %v", args)
-	}
-	if !argvContains(args, "StrictHostKeyChecking=accept-new") {
-		t.Fatalf("missing accept-new in %v", args)
-	}
+	requireArgvPair(t, args, "-p", "2222")
+	requireArgvPair(t, args, "-i", key)
+	requireArgvContains(t, args,
+		"BatchMode=yes",
+		"ConnectTimeout=30",
+		"UserKnownHostsFile="+kh,
+		"StrictHostKeyChecking=accept-new",
+	)
 	if args[len(args)-1] != "bob@host" {
 		t.Fatalf("expected user@host last, got %q", args[len(args)-1])
 	}
@@ -459,14 +480,20 @@ func TestWriteFile_PipesStdinAndChmod(t *testing.T) {
 	}
 	args := readArgv(t, argv)
 	remoteCmd := args[len(args)-1]
-	if !strings.Contains(remoteCmd, "mkdir -p '/etc/dropbear'") {
-		t.Fatalf("missing mkdir in remote cmd: %q", remoteCmd)
-	}
-	if !strings.Contains(remoteCmd, "cat > '/etc/dropbear/file'") {
-		t.Fatalf("missing cat redirect in remote cmd: %q", remoteCmd)
-	}
-	if !strings.Contains(remoteCmd, "chmod 640 '/etc/dropbear/file'") {
-		t.Fatalf("expected octal mode 640 in remote cmd: %q", remoteCmd)
+	requireContainsAll(t, remoteCmd,
+		"mkdir -p '/etc/dropbear'",
+		"cat > '/etc/dropbear/file'",
+		"chmod 640 '/etc/dropbear/file'",
+	)
+}
+
+// requireContainsAll fails the test unless s contains every want substring.
+func requireContainsAll(t *testing.T, s string, wants ...string) {
+	t.Helper()
+	for _, w := range wants {
+		if !strings.Contains(s, w) {
+			t.Fatalf("missing %q in %q", w, s)
+		}
 	}
 }
 

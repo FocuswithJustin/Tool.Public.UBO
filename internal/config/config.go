@@ -80,17 +80,36 @@ func Load(path string) (*Config, error) {
 
 // Validate returns an error if required fields are missing or invalid.
 func (c *Config) Validate() error {
+	for _, check := range []func(*Config) error{
+		validateHost,
+		validateSSH,
+		validateWireGuard,
+		validateDropbear,
+	} {
+		if err := check(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateHost(c *Config) error {
 	if c.Host == "" {
 		return fmt.Errorf("host is required")
 	}
+	return nil
+}
+
+func validateSSH(c *Config) error {
 	if c.SSH.User == "" {
 		return fmt.Errorf("ssh.user is required")
 	}
-	if c.SSH.Port <= 0 || c.SSH.Port > 65535 {
-		return fmt.Errorf("ssh.port must be 1–65535")
-	}
-	if c.WireGuard.Port <= 0 || c.WireGuard.Port > 65535 {
-		return fmt.Errorf("wireguard.port must be 1–65535")
+	return validatePort("ssh.port", c.SSH.Port)
+}
+
+func validateWireGuard(c *Config) error {
+	if err := validatePort("wireguard.port", c.WireGuard.Port); err != nil {
+		return err
 	}
 	if _, _, err := net.ParseCIDR(c.WireGuard.ServerIP); err != nil {
 		return fmt.Errorf("wireguard.server_ip invalid CIDR: %w", err)
@@ -98,8 +117,17 @@ func (c *Config) Validate() error {
 	if _, _, err := net.ParseCIDR(c.WireGuard.ClientIP); err != nil {
 		return fmt.Errorf("wireguard.client_ip invalid CIDR: %w", err)
 	}
-	if c.Dropbear.Port <= 0 || c.Dropbear.Port > 65535 {
-		return fmt.Errorf("dropbear.port must be 1–65535")
+	return nil
+}
+
+func validateDropbear(c *Config) error {
+	return validatePort("dropbear.port", c.Dropbear.Port)
+}
+
+// validatePort checks that port is within the valid 1–65535 range.
+func validatePort(name string, port int) error {
+	if port <= 0 || port > 65535 {
+		return fmt.Errorf("%s must be 1–65535", name)
 	}
 	return nil
 }

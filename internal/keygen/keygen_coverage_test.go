@@ -51,17 +51,19 @@ func TestLoadExisting_success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadExisting: %v", err)
 	}
-	if keys.ServerWGPrivate != "spriv" || keys.ServerWGPublic != "spub" {
-		t.Errorf("server keys wrong: %+v", keys)
+
+	want := []struct{ field, got, expect string }{
+		{"ServerWGPrivate", keys.ServerWGPrivate, "spriv"},
+		{"ServerWGPublic", keys.ServerWGPublic, "spub"},
+		{"ClientWGPrivate", keys.ClientWGPrivate, "cpriv"},
+		{"ClientWGPublic", keys.ClientWGPublic, "cpub"},
+		{"ClientSSHKeyPath", keys.ClientSSHKeyPath, filepath.Join(dir, "client_auth_ed25519")},
+		{"ClientSSHPubKey", keys.ClientSSHPubKey, "ssh-ed25519 AAAA ubo-client"},
 	}
-	if keys.ClientWGPrivate != "cpriv" || keys.ClientWGPublic != "cpub" {
-		t.Errorf("client keys wrong: %+v", keys)
-	}
-	if keys.ClientSSHKeyPath != filepath.Join(dir, "client_auth_ed25519") {
-		t.Errorf("ssh key path wrong: %q", keys.ClientSSHKeyPath)
-	}
-	if keys.ClientSSHPubKey != "ssh-ed25519 AAAA ubo-client" {
-		t.Errorf("ssh pub wrong: %q", keys.ClientSSHPubKey)
+	for _, w := range want {
+		if w.got != w.expect {
+			t.Errorf("%s = %q; want %q", w.field, w.got, w.expect)
+		}
 	}
 }
 

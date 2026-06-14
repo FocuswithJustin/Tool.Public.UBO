@@ -77,45 +77,67 @@ func TestEdit_FullScript(t *testing.T) {
 		t.Fatalf("edit: %v", err)
 	}
 
-	if got.Host != "192.168.1.100" {
-		t.Errorf("Host = %q, want kept 192.168.1.100", got.Host)
-	}
-	if got.SSH.User != "admin" {
-		t.Errorf("SSH.User = %q, want admin", got.SSH.User)
-	}
-	if got.SSH.Port != 2222 {
-		t.Errorf("SSH.Port = %d, want 2222", got.SSH.Port)
-	}
-	if got.SSH.Key != "" {
-		t.Errorf("SSH.Key = %q, want kept empty", got.SSH.Key)
-	}
-	if got.WireGuard.Port != 51999 {
-		t.Errorf("WireGuard.Port = %d, want 51999", got.WireGuard.Port)
-	}
-	if got.WireGuard.ServerIP != "10.42.0.1/24" {
-		t.Errorf("WireGuard.ServerIP = %q, want kept default", got.WireGuard.ServerIP)
-	}
-	if got.Output.Dir != "/tmp/out" {
-		t.Errorf("Output.Dir = %q, want /tmp/out", got.Output.Dir)
-	}
-	// EOF-kept fields remain at defaults (empty).
-	if got.Network.Interface != "" || got.Network.IP != "" || got.LUKS.Device != "" {
-		t.Errorf("expected EOF-kept fields empty, got iface=%q ip=%q luks=%q",
-			got.Network.Interface, got.Network.IP, got.LUKS.Device)
-	}
+	// Each case names a field and its expected stringified value after editing.
+	// Covers kept (empty line), changed string/int, re-prompted int, and
+	// EOF-kept (Network/LUKS) fields.
+	checkStringFields(t, []stringCheck{
+		{"Host", got.Host, "192.168.1.100"},
+		{"SSH.User", got.SSH.User, "admin"},
+		{"SSH.Key", got.SSH.Key, ""},
+		{"WireGuard.ServerIP", got.WireGuard.ServerIP, "10.42.0.1/24"},
+		{"Output.Dir", got.Output.Dir, "/tmp/out"},
+		{"Network.Interface", got.Network.Interface, ""},
+		{"Network.IP", got.Network.IP, ""},
+		{"LUKS.Device", got.LUKS.Device, ""},
+	})
+	checkIntFields(t, []intCheck{
+		{"SSH.Port", got.SSH.Port, 2222},
+		{"WireGuard.Port", got.WireGuard.Port, 51999},
+	})
 
-	// Prompts should have been written to out.
-	o := out.String()
-	for _, want := range []string{
+	checkOutputContains(t, out.String(), []string{
 		"UBO Configuration Editor",
 		"Host [192.168.1.100]: ",
 		"SSH User [root]: ",
 		"SSH Port [22]: ",
 		"invalid number \"abc\"",
 		"Output Dir []: ",
-	} {
-		if !strings.Contains(o, want) {
-			t.Errorf("output missing %q\n--- output ---\n%s", want, o)
+	})
+}
+
+// stringCheck and intCheck describe a single expected field value.
+type stringCheck struct {
+	name, got, want string
+}
+
+type intCheck struct {
+	name      string
+	got, want int
+}
+
+func checkStringFields(t *testing.T, checks []stringCheck) {
+	t.Helper()
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %q, want %q", c.name, c.got, c.want)
+		}
+	}
+}
+
+func checkIntFields(t *testing.T, checks []intCheck) {
+	t.Helper()
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
+		}
+	}
+}
+
+func checkOutputContains(t *testing.T, out string, wants []string) {
+	t.Helper()
+	for _, want := range wants {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q\n--- output ---\n%s", want, out)
 		}
 	}
 }
@@ -273,14 +295,22 @@ func TestEdit_AllFieldsSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("edit: %v", err)
 	}
-	if got.Host != "1.2.3.4" || got.SSH.User != "admin" || got.SSH.Port != 2200 ||
-		got.SSH.Key != "/k" || got.WireGuard.Port != 51000 ||
-		got.WireGuard.ServerIP != "10.9.0.1/24" || got.WireGuard.ClientIP != "10.9.0.2/32" ||
-		got.Dropbear.Port != 2201 || got.Output.Dir != "/out" ||
-		got.Network.Interface != "eth9" || got.Network.IP != "10.9.0.3/24" ||
-		got.LUKS.Device != "/dev/sdz1" {
-		t.Errorf("not all fields set as expected: %+v", got)
-	}
+	checkStringFields(t, []stringCheck{
+		{"Host", got.Host, "1.2.3.4"},
+		{"SSH.User", got.SSH.User, "admin"},
+		{"SSH.Key", got.SSH.Key, "/k"},
+		{"WireGuard.ServerIP", got.WireGuard.ServerIP, "10.9.0.1/24"},
+		{"WireGuard.ClientIP", got.WireGuard.ClientIP, "10.9.0.2/32"},
+		{"Output.Dir", got.Output.Dir, "/out"},
+		{"Network.Interface", got.Network.Interface, "eth9"},
+		{"Network.IP", got.Network.IP, "10.9.0.3/24"},
+		{"LUKS.Device", got.LUKS.Device, "/dev/sdz1"},
+	})
+	checkIntFields(t, []intCheck{
+		{"SSH.Port", got.SSH.Port, 2200},
+		{"WireGuard.Port", got.WireGuard.Port, 51000},
+		{"Dropbear.Port", got.Dropbear.Port, 2201},
+	})
 }
 
 // errReader returns a non-EOF error on the first Read, exercising edit's

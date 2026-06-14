@@ -78,65 +78,96 @@ func startLUKSServer(t *testing.T, sshPort int, extraQEMU ...string) *luksServer
 	return s
 }
 
+// dialSerial connects to the serial unix socket, retrying once a second until the
+// deadline. It fails the test if no connection is established in time.
+func (s *luksServer) dialSerial(t *testing.T, deadline time.Time) net.Conn {
+	t.Helper()
+	for time.Now().Before(deadline) {
+		c, err := net.Dial("unix", s.serialSock)
+		if err == nil {
+			return c
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatalf("could not connect to serial socket %s within %v", s.serialSock, time.Until(deadline))
+	return nil
+}
+
+// isPassphrasePrompt reports whether the accumulated serial output contains a
+// recognizable LUKS passphrase prompt.
+func isPassphrasePrompt(low string) bool {
+	return strings.Contains(low, "unlock disk") ||
+		strings.Contains(low, "passphrase for") ||
+		strings.Contains(low, "please enter passphrase")
+}
+
+// reachedUserspace reports whether the serial output shows the system reaching
+// userspace (so we can stop watching).
+func reachedUserspace(low string) bool {
+	if strings.Contains(low, "ubo-luks-server login:") {
+		return true
+	}
+	return strings.Contains(low, "reached target") && strings.Contains(low, "multi-user")
+}
+
+// isRetryableTimeout reports whether a read error is a timeout we should keep
+// retrying past (i.e. the deadline has not yet been reached).
+func isRetryableTimeout(err error, deadline time.Time) bool {
+	ne, ok := err.(net.Error)
+	return ok && ne.Timeout() && time.Now().Before(deadline)
+}
+
+// handleSerialChunk appends a freshly read chunk to acc, sends the passphrase if
+// a prompt is showing (throttled via lastSent), and reports whether the system
+// has reached userspace (signalling the caller to stop).
+func handleSerialChunk(conn net.Conn, chunk []byte, acc *strings.Builder, lastSent *time.Time) bool {
+	acc.Write(chunk)
+	low := strings.ToLower(acc.String())
+	if isPassphrasePrompt(low) && time.Since(*lastSent) > 3*time.Second {
+		conn.Write([]byte(luksPassphrase + "\n")) //nolint:errcheck
+		*lastSent = time.Now()
+		acc.Reset()
+	}
+	return reachedUserspace(low)
+}
+
+// answerLUKSPrompts reads the serial stream, sending the passphrase whenever a
+// prompt appears, and returns once the system reaches userspace or the deadline
+// passes. lastSent throttles re-sends so rapid prompt echoes aren't spammed.
+func answerLUKSPrompts(conn net.Conn, deadline time.Time) {
+	br := bufio.NewReader(conn)
+	var acc strings.Builder
+	lastSent := time.Time{}
+	buf := make([]byte, 512)
+	for {
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		n, err := br.Read(buf)
+		if n > 0 && handleSerialChunk(conn, buf[:n], &acc, &lastSent) {
+			return
+		}
+		if err != nil {
+			if isRetryableTimeout(err, deadline) {
+				continue
+			}
+			return
+		}
+	}
+}
+
 // unlock connects to the serial socket and answers the initramfs LUKS passphrase
 // prompt. It keeps responding to any re-prompt until the deadline, so a missed
 // first prompt (if we connect slightly late) still gets answered on retry.
 func (s *luksServer) unlock(t *testing.T, timeout time.Duration) {
 	t.Helper()
 
-	var conn net.Conn
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		c, err := net.Dial("unix", s.serialSock)
-		if err == nil {
-			conn = c
-			break
-		}
-		time.Sleep(time.Second)
-	}
-	if conn == nil {
-		t.Fatalf("could not connect to serial socket %s within %v", s.serialSock, timeout)
-	}
+	conn := s.dialSerial(t, deadline)
 	defer conn.Close()
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		br := bufio.NewReader(conn)
-		var acc strings.Builder
-		lastSent := time.Time{}
-		buf := make([]byte, 512)
-		for {
-			conn.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
-			n, err := br.Read(buf)
-			if n > 0 {
-				chunk := string(buf[:n])
-				acc.WriteString(chunk)
-				low := strings.ToLower(acc.String())
-				if (strings.Contains(low, "unlock disk") ||
-					strings.Contains(low, "passphrase for") ||
-					strings.Contains(low, "please enter passphrase")) &&
-					time.Since(lastSent) > 3*time.Second {
-					conn.Write([]byte(luksPassphrase + "\n")) //nolint:errcheck
-					lastSent = time.Now()
-					acc.Reset()
-				}
-				// Stop once we see the system reaching userspace.
-				if strings.Contains(low, "ubo-luks-server login:") ||
-					strings.Contains(low, "reached target") && strings.Contains(low, "multi-user") {
-					return
-				}
-			}
-			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					if time.Now().After(deadline) {
-						return
-					}
-					continue
-				}
-				return
-			}
-		}
+		answerLUKSPrompts(conn, deadline)
 	}()
 
 	select {

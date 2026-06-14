@@ -103,17 +103,23 @@ func TestDetectNetwork_configIPProvided(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if info.IP != "10.0.0.5" {
-		t.Errorf("IP = %q; want 10.0.0.5", info.IP)
+	checks := []struct {
+		field string
+		got   string
+		want  string
+	}{
+		{"IP", info.IP, "10.0.0.5"},
+		{"Interface", info.Interface, "eth0"},
+		{"Gateway", info.Gateway, "192.168.1.1"},
+		{"Hostname", info.Hostname, "myhost"},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %q; want %q", c.field, c.got, c.want)
+		}
 	}
 	if info.Prefix != 26 {
 		t.Errorf("Prefix = %d; want 26 (from config CIDR)", info.Prefix)
-	}
-	if info.Interface != "eth0" || info.Gateway != "192.168.1.1" {
-		t.Errorf("iface/gw = %q/%q; want eth0/192.168.1.1", info.Interface, info.Gateway)
-	}
-	if info.Hostname != "myhost" {
-		t.Errorf("Hostname = %q; want myhost", info.Hostname)
 	}
 }
 

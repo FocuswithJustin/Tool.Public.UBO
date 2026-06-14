@@ -1,6 +1,9 @@
 BINARY := ubo
 
-.PHONY: build run test test-integration vm-build luks-build clean fmt vet
+.PHONY: build run test test-integration vm-build luks-build clean fmt vet complexity check
+
+# Maximum allowed cyclomatic complexity per function (code and tests).
+CYCLO_MAX := 6
 
 build:
 	go build -o $(BINARY) .
@@ -28,6 +31,21 @@ luks-build:
 # Runs inside nix-shell so wg/ssh-keygen are in PATH.
 test-integration:
 	nix-shell --run "go build -o $(BINARY) . && PROJECT_ROOT=$(CURDIR) go test -v -tags integration -timeout 30m ./tests/"
+
+# complexity: fail if any function (code OR test) exceeds CYCLO_MAX cyclomatic
+# complexity. Runs inside nix-shell so gocyclo is on PATH.
+complexity:
+	@nix-shell --run '\
+		out=$$(gocyclo -over $(CYCLO_MAX) .); \
+		if [ -n "$$out" ]; then \
+			echo "functions over complexity $(CYCLO_MAX):"; \
+			echo "$$out"; \
+			exit 1; \
+		fi; \
+		echo "complexity OK: no function exceeds $(CYCLO_MAX)"'
+
+# check: full local gate — formatting, vet, complexity, and unit tests.
+check: fmt vet complexity test
 
 clean:
 	rm -f $(BINARY)

@@ -149,6 +149,21 @@ func TestUpdateGrubContent_idempotent(t *testing.T) {
 	}
 }
 
+func TestUpdateGrubContent_substringNotMistakenForIP(t *testing.T) {
+	// Params like "gossip=" or "skip=" contain the substring "ip=" but are not
+	// an ip= kernel param; a needed ip= must still be added.
+	content := `GRUB_CMDLINE_LINUX="quiet gossip=on skip=1"`
+	ipParam := "ip=192.168.1.10::192.168.1.1:255.255.255.0:host:eth0:none"
+
+	updated, changed := updateGrubContent(content, ipParam)
+	if !changed {
+		t.Error("expected changed=true: gossip=/skip= must not be mistaken for ip=")
+	}
+	if !strings.Contains(updated, ipParam) {
+		t.Errorf("updated GRUB content missing %q\ngot:\n%s", ipParam, updated)
+	}
+}
+
 // ── ipParam format ────────────────────────────────────────────────────────────
 
 func TestIPParamFormat(t *testing.T) {

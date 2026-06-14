@@ -143,18 +143,19 @@ func sshRun(t *testing.T, cmd string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// TestUBORun_Integration boots a Debian 13 Trixie VM, runs ubo run against
-// it, and verifies both local output files and the deployed remote files.
-func TestUBORun_Integration(t *testing.T) {
-	checkPrereqs(t)
-
-	// Determine SSH wait timeout based on KVM availability.
-	sshTimeout := 5 * time.Minute
+// runSSHTimeout returns the SSH-ready timeout, longer when KVM is unavailable.
+func runSSHTimeout(t *testing.T) time.Duration {
+	t.Helper()
 	if _, err := os.Stat("/dev/kvm"); err != nil {
-		sshTimeout = 15 * time.Minute
 		t.Log("KVM not available — using software emulation (slower boot)")
+		return 15 * time.Minute
 	}
+	return 5 * time.Minute
+}
 
+// bootAndWaitVM starts the test VM and blocks until SSH + cloud-init are ready.
+func bootAndWaitVM(t *testing.T, sshTimeout time.Duration) {
+	t.Helper()
 	t.Log("Starting test VM...")
 	startVM(t)
 
@@ -164,8 +165,12 @@ func TestUBORun_Integration(t *testing.T) {
 	t.Log("Waiting for cloud-init to configure SSH keys...")
 	waitForCloudInit(t, 5*time.Minute)
 	t.Log("VM ready.")
+}
 
-	// ── Write test config ─────────────────────────────────────────────────────
+// prepareRunConfig creates a fresh output dir under tmp/ and writes ubo.toml.
+// It returns the output dir and the config path.
+func prepareRunConfig(t *testing.T) (string, string) {
+	t.Helper()
 	// Use a persistent directory under tmp/ so artifacts survive on failure.
 	outDir := filepath.Join(projectRoot(), "tmp", "test-run-latest")
 	if err := os.RemoveAll(outDir); err != nil {
@@ -200,8 +205,12 @@ dir = %q
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0644); err != nil {
 		t.Fatalf("write test config: %v", err)
 	}
+	return outDir, cfgPath
+}
 
-	// ── Run ubo ──────────────────────────────────────────────────────────────
+// runUbo executes the ubo binary with the given config, failing on error.
+func runUbo(t *testing.T, cfgPath string) {
+	t.Helper()
 	t.Log("Running ubo run...")
 	ubo := exec.Command(filepath.Join(projectRoot(), "ubo"), "run", "--config", cfgPath)
 	ubo.Stdout = os.Stdout
@@ -209,10 +218,12 @@ dir = %q
 	if err := ubo.Run(); err != nil {
 		t.Fatalf("ubo run: %v", err)
 	}
+}
 
-	// ── Local output file checks ──────────────────────────────────────────────
-	t.Log("Checking local output files...")
-
+// checkLocalOutputModes verifies the expected output files exist with the right
+// permission modes (mode 0 skips the mode check).
+func checkLocalOutputModes(t *testing.T, outDir string) {
+	t.Helper()
 	type fileCheck struct {
 		name string
 		mode os.FileMode // 0 = skip mode check
@@ -238,7 +249,11 @@ dir = %q
 			t.Errorf("%s: mode %o; want %o", fc.name, info.Mode().Perm(), fc.mode)
 		}
 	}
+}
 
+// checkLocalOutputContent verifies the content of key generated files.
+func checkLocalOutputContent(t *testing.T, outDir string) {
+	t.Helper()
 	// dropbear_host_key.pub must be an SSH public key
 	pubKeyBytes, _ := os.ReadFile(filepath.Join(outDir, "dropbear_host_key.pub"))
 	if !strings.HasPrefix(strings.TrimSpace(string(pubKeyBytes)), "ssh-") {
@@ -256,10 +271,12 @@ dir = %q
 	if !strings.Contains(string(readme), "cryptroot-unlock") {
 		t.Errorf("README.txt: missing cryptroot-unlock instruction")
 	}
+}
 
-	// ── Remote file checks ────────────────────────────────────────────────────
-	t.Log("Checking remote deployed files...")
-
+// checkRemoteDeployedFiles verifies the files ubo deployed onto the VM exist,
+// are executable, and have the right modes.
+func checkRemoteDeployedFiles(t *testing.T) {
+	t.Helper()
 	remoteFiles := []string{
 		"/etc/wireguard/wg-initramfs.conf",
 		"/etc/initramfs-tools/hooks/wireguard",
@@ -288,7 +305,12 @@ dir = %q
 	if mode != "600" {
 		t.Errorf("wg-initramfs.conf: remote mode=%s want 600", mode)
 	}
+}
 
+// checkRemoteBootConfig verifies dropbear keys, GRUB ip= param, and initramfs
+// rebuild on the VM.
+func checkRemoteBootConfig(t *testing.T) {
+	t.Helper()
 	// Dropbear authorized_keys must exist (check both possible paths)
 	authKeys := sshRun(t,
 		`ls /etc/dropbear/initramfs/authorized_keys 2>/dev/null || `+
@@ -309,6 +331,30 @@ dir = %q
 	if rebuilt == "0" {
 		t.Error("initramfs does not appear to have been rebuilt after deployment")
 	}
+}
+
+// TestUBORun_Integration boots a Debian 13 Trixie VM, runs ubo run against
+// it, and verifies both local output files and the deployed remote files.
+func TestUBORun_Integration(t *testing.T) {
+	checkPrereqs(t)
+
+	bootAndWaitVM(t, runSSHTimeout(t))
+
+	// ── Write test config ─────────────────────────────────────────────────────
+	outDir, cfgPath := prepareRunConfig(t)
+
+	// ── Run ubo ──────────────────────────────────────────────────────────────
+	runUbo(t, cfgPath)
+
+	// ── Local output file checks ──────────────────────────────────────────────
+	t.Log("Checking local output files...")
+	checkLocalOutputModes(t, outDir)
+	checkLocalOutputContent(t, outDir)
+
+	// ── Remote file checks ────────────────────────────────────────────────────
+	t.Log("Checking remote deployed files...")
+	checkRemoteDeployedFiles(t)
+	checkRemoteBootConfig(t)
 
 	t.Log("Remote verification complete.")
 }
