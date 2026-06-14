@@ -1,0 +1,30 @@
+# UBO Configuration — Unlock Before Operation
+# Edit with: ubo configure
+
+# Remote host to configure
+host = "192.254.68.235"
+
+[ssh]
+user = "justin"
+port = 22
+key  = ""   # path to SSH private key; empty = use agent / default keys
+sudo = true   # true = run remote setup via passwordless sudo (for non-root sudo-group users)
+
+[wireguard]
+port      = 51820
+server_ip = "10.42.0.1/24"   # server WireGuard tunnel IP (CIDR)
+client_ip = "10.42.0.2/32"   # client WireGuard tunnel IP (CIDR)
+
+[dropbear]
+port = 22
+
+[output]
+dir = ""   # empty = auto: ./ubo-<host>/
+
+[network]
+# Leave empty to auto-detect from the remote system's routing table
+interface = ""
+ip        = "192.254.68.235/29"   # static IP/CIDR for initramfs (e.g. "192.168.1.100/24")
+
+[luks]
+device = ""   # LUKS block device (e.g. "/dev/sda3"); auto-detected from /etc/crypttab if empty
