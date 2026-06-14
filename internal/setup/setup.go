@@ -94,9 +94,18 @@ func stepWriteConfigs(client *remote.Client, cfg *config.Config, keys *keygen.Ke
 // stepGrubAndInitramfs runs steps 10 and 11: configure GRUB and rebuild initramfs.
 func stepGrubAndInitramfs(ctx context.Context, client *remote.Client, netInfo *NetworkInfo) error {
 	// Step 10: Configure GRUB for initramfs networking
+	if err := validateGrubNetFields(netInfo); err != nil {
+		return fmt.Errorf("step 10 validate network fields: %w", err)
+	}
 	step(10, "configuring GRUB for initramfs networking")
 	if err := configureGrub(ctx, client, netInfo); err != nil {
 		return fmt.Errorf("step 10 configure GRUB: %w", err)
+	}
+
+	// Restrict generated initramfs images to root-only before rebuilding: they
+	// embed the WireGuard private key, so a world-readable /boot would leak it.
+	if err := writeFile(client, "/etc/initramfs-tools/conf.d/ubo", templates.InitramfsUMASKConf, 0644); err != nil {
+		return fmt.Errorf("step 11 write initramfs umask conf: %w", err)
 	}
 
 	// Step 11: Rebuild initramfs
@@ -105,6 +114,22 @@ func stepGrubAndInitramfs(ctx context.Context, client *remote.Client, netInfo *N
 		return fmt.Errorf("step 11 update-initramfs: %w", err)
 	}
 
+	return nil
+}
+
+// validateGrubNetFields ensures the network values that get interpolated into
+// the GRUB ip= kernel parameter are well-formed. The interface name is already
+// validated during detection; here we guard the IP, gateway, and hostname.
+func validateGrubNetFields(info *NetworkInfo) error {
+	if net.ParseIP(info.IP) == nil {
+		return fmt.Errorf("detected IP %q is not a valid address; set network.ip in config", info.IP)
+	}
+	if net.ParseIP(info.Gateway) == nil {
+		return fmt.Errorf("detected gateway %q is not a valid address", info.Gateway)
+	}
+	if !isValidHostname(info.Hostname) {
+		return fmt.Errorf("detected hostname %q contains unexpected characters", info.Hostname)
+	}
 	return nil
 }
 
@@ -512,6 +537,40 @@ var validInterfaceRanges = []charRange{
 // isValidInterfaceChar reports whether c is allowed in an interface name.
 func isValidInterfaceChar(c rune) bool {
 	for _, r := range validInterfaceRanges {
+		if c >= r.lo && c <= r.hi {
+			return true
+		}
+	}
+	return false
+}
+
+// validHostnameRanges enumerates the rune ranges allowed in a hostname that is
+// embedded in the GRUB ip= kernel parameter.
+var validHostnameRanges = []charRange{
+	{'a', 'z'},
+	{'A', 'Z'},
+	{'0', '9'},
+	{'-', '-'},
+	{'.', '.'},
+}
+
+// isValidHostname returns true if name is a plausible hostname (letters, digits,
+// hyphen, dot; max 63 chars) safe to place in the GRUB ip= parameter.
+func isValidHostname(name string) bool {
+	if name == "" || len(name) > 63 {
+		return false
+	}
+	for _, c := range name {
+		if !isValidHostnameChar(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidHostnameChar reports whether c is allowed in a hostname.
+func isValidHostnameChar(c rune) bool {
+	for _, r := range validHostnameRanges {
 		if c >= r.lo && c <= r.hi {
 			return true
 		}

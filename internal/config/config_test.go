@@ -150,6 +150,67 @@ func TestValidate_table(t *testing.T) {
 	}
 }
 
+func TestValidate_luksDevice(t *testing.T) {
+	tests := []struct {
+		name    string
+		device  string
+		wantErr bool
+	}{
+		{"empty (auto-detect)", "", false},
+		{"plain device", "/dev/sda3", false},
+		{"mapper path", "/dev/mapper/cryptroot", false},
+		{"by-uuid path", "/dev/disk/by-uuid/1234-abcd", false},
+		{"command substitution", "/dev/$(reboot)", true},
+		{"backtick", "/dev/`reboot`", true},
+		{"semicolon", "/dev/sda; reboot", true},
+		{"space", "/dev/sda reboot", true},
+		{"not under /dev", "/etc/passwd", true},
+		{"relative", "sda3", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := Default()
+			c.Host = "host"
+			c.LUKS.Device = tt.device
+			err := c.Validate()
+			if tt.wantErr && err == nil {
+				t.Errorf("Validate() = nil; want error for device %q", tt.device)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("Validate() = %v; want nil for device %q", err, tt.device)
+			}
+		})
+	}
+}
+
+func TestValidate_tunnelTopology(t *testing.T) {
+	tests := []struct {
+		name     string
+		serverIP string
+		clientIP string
+		wantErr  bool
+	}{
+		{"valid defaults", "10.42.0.1/24", "10.42.0.2/32", false},
+		{"identical addresses", "10.42.0.1/24", "10.42.0.1/32", true},
+		{"client outside server net", "10.42.0.1/24", "10.99.0.2/32", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := Default()
+			c.Host = "host"
+			c.WireGuard.ServerIP = tt.serverIP
+			c.WireGuard.ClientIP = tt.clientIP
+			err := c.Validate()
+			if tt.wantErr && err == nil {
+				t.Errorf("Validate() = nil; want error for %s / %s", tt.serverIP, tt.clientIP)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("Validate() = %v; want nil for %s / %s", err, tt.serverIP, tt.clientIP)
+			}
+		})
+	}
+}
+
 func TestOutputDir_auto(t *testing.T) {
 	c := Default()
 	c.Host = "192.168.1.1"

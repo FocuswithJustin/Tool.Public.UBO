@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -85,6 +86,7 @@ func (c *Config) Validate() error {
 		validateSSH,
 		validateWireGuard,
 		validateDropbear,
+		validateLUKS,
 	} {
 		if err := check(c); err != nil {
 			return err
@@ -117,11 +119,50 @@ func validateWireGuard(c *Config) error {
 	if _, _, err := net.ParseCIDR(c.WireGuard.ClientIP); err != nil {
 		return fmt.Errorf("wireguard.client_ip invalid CIDR: %w", err)
 	}
+	return validateTunnelTopology(c)
+}
+
+// validateTunnelTopology rejects WireGuard configs whose server and client
+// tunnel IPs collide or whose client IP falls outside the server tunnel network
+// — either is a misconfiguration that yields an unreachable Dropbear.
+func validateTunnelTopology(c *Config) error {
+	serverIP, serverNet, err := net.ParseCIDR(c.WireGuard.ServerIP)
+	if err != nil {
+		return fmt.Errorf("wireguard.server_ip invalid CIDR: %w", err)
+	}
+	clientIP, _, err := net.ParseCIDR(c.WireGuard.ClientIP)
+	if err != nil {
+		return fmt.Errorf("wireguard.client_ip invalid CIDR: %w", err)
+	}
+	if serverIP.Equal(clientIP) {
+		return fmt.Errorf("wireguard.server_ip and wireguard.client_ip must be different addresses")
+	}
+	if !serverNet.Contains(clientIP) {
+		return fmt.Errorf("wireguard.client_ip %s is not within the server tunnel network %s", clientIP, serverNet)
+	}
 	return nil
 }
 
 func validateDropbear(c *Config) error {
 	return validatePort("dropbear.port", c.Dropbear.Port)
+}
+
+// luksDevicePattern matches an absolute /dev path made only of characters that
+// are safe to embed in a shell command. luks.device is interpolated into the
+// remote `cryptsetup luksChangeKey` command; restricting it here prevents shell
+// metacharacters ($()/backticks/spaces/quotes) from being smuggled in.
+var luksDevicePattern = regexp.MustCompile(`^/dev/[A-Za-z0-9/_.:=-]+$`)
+
+// validateLUKS checks that luks.device, when set, is a plausible and shell-safe
+// /dev path. An empty device is valid (it is auto-detected from /etc/crypttab).
+func validateLUKS(c *Config) error {
+	if c.LUKS.Device == "" {
+		return nil
+	}
+	if !luksDevicePattern.MatchString(c.LUKS.Device) {
+		return fmt.Errorf("luks.device %q must be an absolute /dev path using only letters, digits, and /._:=-", c.LUKS.Device)
+	}
+	return nil
 }
 
 // validatePort checks that port is within the valid 1–65535 range.

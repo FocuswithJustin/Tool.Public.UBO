@@ -104,6 +104,21 @@ mkdir -p "${DESTDIR}/etc/wireguard"
 cp /etc/wireguard/wg-initramfs.conf "${DESTDIR}/etc/wireguard/"
 `
 
+// InitramfsUMASKConf is written to /etc/initramfs-tools/conf.d/ubo. It sets
+// UMASK=0077 so update-initramfs creates the boot image mode 0600 (root only).
+//
+// The initramfs embeds the WireGuard server private key (and the Dropbear host
+// key) because they must be available before the root disk is decrypted, so
+// they necessarily live in the unencrypted /boot. By default initramfs images
+// are world-readable (0644), which would let any local unprivileged user
+// extract those secrets with lsinitramfs/unmkinitramfs. UMASK=0077 closes that
+// exposure. GRUB reads the image as raw disk blocks at boot, so 0600 does not
+// affect booting.
+const InitramfsUMASKConf = `# Written by ubo: initramfs images embed the WireGuard private key, so restrict
+# them to root only (otherwise /boot exposes the key to local users).
+UMASK=0077
+`
+
 // InitramfsScriptData holds template variables for InitramfsScriptTmpl.
 type InitramfsScriptData struct {
 	ServerIP string // e.g. "10.42.0.1/24"

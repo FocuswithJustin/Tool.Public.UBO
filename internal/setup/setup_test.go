@@ -183,3 +183,49 @@ func TestIPParamFormat(t *testing.T) {
 		t.Errorf("ip param = %q; want %q", got, want)
 	}
 }
+
+// ── validateGrubNetFields / isValidHostname ───────────────────────────────────
+
+func TestValidateGrubNetFields(t *testing.T) {
+	base := func() *NetworkInfo {
+		return &NetworkInfo{IP: "192.168.1.100", Gateway: "192.168.1.1", Hostname: "myserver", Interface: "eth0"}
+	}
+	if err := validateGrubNetFields(base()); err != nil {
+		t.Errorf("valid fields: unexpected error %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*NetworkInfo)
+	}{
+		{"bad IP", func(n *NetworkInfo) { n.IP = "not-an-ip" }},
+		{"bad gateway", func(n *NetworkInfo) { n.Gateway = "10.0.0.$(reboot)" }},
+		{"hostname with shell metachar", func(n *NetworkInfo) { n.Hostname = "host;reboot" }},
+		{"hostname with space", func(n *NetworkInfo) { n.Hostname = "host name" }},
+		{"empty hostname", func(n *NetworkInfo) { n.Hostname = "" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ni := base()
+			tt.mutate(ni)
+			if err := validateGrubNetFields(ni); err == nil {
+				t.Errorf("validateGrubNetFields() = nil; want error")
+			}
+		})
+	}
+}
+
+func TestIsValidHostname(t *testing.T) {
+	valid := []string{"server", "ubo-luks-server", "host.example.com", "h1"}
+	for _, h := range valid {
+		if !isValidHostname(h) {
+			t.Errorf("isValidHostname(%q) = false; want true", h)
+		}
+	}
+	invalid := []string{"", "host;reboot", "host name", "host`id`", "host$HOME", strings.Repeat("a", 64)}
+	for _, h := range invalid {
+		if isValidHostname(h) {
+			t.Errorf("isValidHostname(%q) = true; want false", h)
+		}
+	}
+}
