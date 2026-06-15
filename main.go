@@ -333,14 +333,11 @@ func writeRunArtifacts(cfg *config.Config, keys *keygen.Keys, outDir, cfgPath st
 		return "", fmt.Errorf("write %s: %w", wgClientPath, err)
 	}
 
-	readme, err := templates.RenderReadme(templates.ReadmeTmplData{
+	readme := templates.RenderReadme(templates.ReadmeTmplData{
 		ServerTunnelIP: serverTunnelIP,
 		DropbearPort:   cfg.Dropbear.Port,
 		ConfigPath:     cfgPath,
 	})
-	if err != nil {
-		return "", fmt.Errorf("render README: %w", err)
-	}
 	readmePath := filepath.Join(outDir, "README.txt")
 	if err := os.WriteFile(readmePath, []byte(readme), 0644); err != nil {
 		return "", fmt.Errorf("write %s: %w", readmePath, err)

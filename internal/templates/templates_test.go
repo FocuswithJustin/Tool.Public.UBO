@@ -434,14 +434,11 @@ func TestRenderDropbearConfig_missingFields(t *testing.T) {
 // ── RenderReadme ──────────────────────────────────────────────────────────────
 
 func TestRenderReadme(t *testing.T) {
-	got, err := RenderReadme(ReadmeTmplData{
+	got := RenderReadme(ReadmeTmplData{
 		ServerTunnelIP: "10.42.0.1",
 		DropbearPort:   22,
 		ConfigPath:     "ubo.toml",
 	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 	if !strings.Contains(got, "10.42.0.1") {
 		t.Errorf("missing server tunnel IP in README, got:\n%s", got)
 	}
@@ -615,10 +612,7 @@ func TestRenderInitramfsScript_errorMessage(t *testing.T) {
 // ── RenderReadme: render with empty data succeeds (no validation guards) ──────
 
 func TestRenderReadme_emptyData(t *testing.T) {
-	got, err := RenderReadme(ReadmeTmplData{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	got := RenderReadme(ReadmeTmplData{})
 	// Even with zero values the template must render its static prose.
 	if !strings.Contains(got, "Remote LUKS Unlock Instructions") {
 		t.Errorf("missing header in README, got:\n%s", got)

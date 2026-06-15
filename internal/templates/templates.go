@@ -350,11 +350,12 @@ Then prompts whether to unlock and boot immediately.
 
 var readmeTmpl = template.Must(template.New("readme").Parse(ReadmeTmpl))
 
-// RenderReadme renders ReadmeTmpl with d.
-func RenderReadme(d ReadmeTmplData) (string, error) {
+// RenderReadme renders ReadmeTmpl with d. It has no required-field validation
+// and cannot fail, so it returns a plain string rather than (string, error).
+func RenderReadme(d ReadmeTmplData) string {
 	var buf bytes.Buffer
 	_ = readmeTmpl.Execute(&buf, d) // pre-parsed template, no error-returning methods: cannot fail
-	return buf.String(), nil
+	return buf.String()
 }
 
 // SetupScriptData holds all inputs needed to render the idempotent setup.sh.
