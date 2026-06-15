@@ -144,10 +144,11 @@ func dialSSH(ctx context.Context, tnet *netstack.Net, addr netip.AddrPort, outpu
 	}
 
 	sshConn, chans, reqs, err := ssh.NewClientConn(tcpConn, addr.String(), &ssh.ClientConfig{
-		User:            "root",
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.FixedHostKey(hostKey),
-		Timeout:         10 * time.Second,
+		User:              "root",
+		Auth:              []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback:   ssh.FixedHostKey(hostKey),
+		HostKeyAlgorithms: []string{hostKey.Type()},
+		Timeout:           10 * time.Second,
 	})
 	if err != nil {
 		tcpConn.Close()
