@@ -5,12 +5,14 @@
 package rootless
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net/netip"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -179,6 +181,7 @@ func handleChangeAndUnlock(ctx context.Context, client *ssh.Client, tnet *netsta
 	if !proceed {
 		return nil
 	}
+	fmt.Println("[ubo] reconnecting to Dropbear for unlock...")
 	newClient, err := dialSSH(ctx, tnet, addr, outputDir, cfg)
 	if err != nil {
 		return fmt.Errorf("reconnect for unlock: %w", err)
@@ -236,8 +239,11 @@ func runChangeKey(client *ssh.Client, cfg *config.Config) (bool, error) {
 		return false, fmt.Errorf("luksChangeKey: %w", err)
 	}
 	fmt.Print("\nChange complete. Unlock and boot now? [Y/n]: ")
-	var ans string
-	fmt.Scanln(&ans)
+	// ReadString consumes the full line including the trailing \n so that the
+	// newline is not left in stdin and forwarded to the next PTY session as a
+	// spurious empty passphrase attempt (fmt.Scanln stops at \n without consuming it).
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	ans := strings.TrimSpace(line)
 	return ans == "" || ans == "y" || ans == "Y", nil
 }
 
