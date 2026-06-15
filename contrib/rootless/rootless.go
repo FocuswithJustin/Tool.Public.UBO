@@ -52,13 +52,7 @@ func Unlock(ctx context.Context, cfg *config.Config, outputDir string, changeKey
 		return handleTunnelFailure(ctx, cfg, outputDir, changeKey, err)
 	}
 
-	client, err := dialSSH(ctx, tnet, serverAddr, outputDir, cfg)
-	if err != nil {
-		return err
-	}
-	defer client.Close()
-
-	return performUnlock(client, cfg, changeKey)
+	return performUnlock(ctx, tnet, serverAddr, outputDir, cfg, changeKey)
 }
 
 // setupWGDevice creates a netstack TUN and configures a wireguard-go device on it.
@@ -157,17 +151,44 @@ func dialSSH(ctx context.Context, tnet *netstack.Net, addr netip.AddrPort, outpu
 	return ssh.NewClient(sshConn, chans, reqs), nil
 }
 
-// performUnlock optionally changes the LUKS passphrase, then runs cryptroot-unlock.
-func performUnlock(client *ssh.Client, cfg *config.Config, changeKey bool) error {
-	if changeKey {
-		proceed, err := runChangeKey(client, cfg)
-		if err != nil {
-			return err
-		}
-		if !proceed {
-			return nil
-		}
+// performUnlock dials Dropbear, optionally changes the LUKS passphrase (closing
+// and reconnecting between the two operations so Dropbear's single-session-per-
+// connection limit is not hit), then runs cryptroot-unlock.
+func performUnlock(ctx context.Context, tnet *netstack.Net, addr netip.AddrPort, outputDir string, cfg *config.Config, changeKey bool) error {
+	client, err := dialSSH(ctx, tnet, addr, outputDir, cfg)
+	if err != nil {
+		return err
 	}
+	defer client.Close() //nolint:errcheck
+	if changeKey {
+		return handleChangeAndUnlock(ctx, client, tnet, addr, outputDir, cfg)
+	}
+	return runUnlock(client)
+}
+
+// handleChangeAndUnlock runs luksChangeKey, closes the first SSH session, then
+// (if the user confirms) reconnects and runs cryptroot-unlock. The reconnect is
+// required because Dropbear in initramfs only allows one active session per
+// connection; reusing the same *ssh.Client after the first session closes hangs.
+func handleChangeAndUnlock(ctx context.Context, client *ssh.Client, tnet *netstack.Net, addr netip.AddrPort, outputDir string, cfg *config.Config) error {
+	proceed, err := runChangeKey(client, cfg)
+	client.Close() //nolint:errcheck — force-close before reconnect; caller's defer closes again harmlessly
+	if err != nil {
+		return err
+	}
+	if !proceed {
+		return nil
+	}
+	newClient, err := dialSSH(ctx, tnet, addr, outputDir, cfg)
+	if err != nil {
+		return fmt.Errorf("reconnect for unlock: %w", err)
+	}
+	defer newClient.Close() //nolint:errcheck
+	return runUnlock(newClient)
+}
+
+// runUnlock runs cryptroot-unlock interactively on an established SSH session.
+func runUnlock(client *ssh.Client) error {
 	fmt.Println("[ubo] unlocking disk (enter LUKS passphrase when prompted)...")
 	if err := runPTY(client, "cryptroot-unlock"); err != nil {
 		return fmt.Errorf("cryptroot-unlock: %w", err)
