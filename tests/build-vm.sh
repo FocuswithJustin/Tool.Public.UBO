@@ -44,8 +44,15 @@ SSH_PUB_KEY=$(cat "$SSH_KEY.pub")
 
 # ── 2. Download Debian 13 cloud image ────────────────────────────────────────
 IMAGE="$TMP/debian-trixie.qcow2"
-IMAGE_SUMS="$TMP/debian-trixie.SHA256SUMS"
+IMAGE_SUMS="$TMP/debian-trixie.SHA512SUMS"
 IMAGE_NAME="debian-13-genericcloud-amd64.qcow2"
+
+# Pinned SHA-512 of the image we expect to download.
+# This is a supply-chain gate: the downloaded image must match exactly.
+# To update: download the new image, run sha512sum on it, and replace the hash
+# below, then commit so the new hash is reviewed before it enters CI.
+# The corresponding build is: debian-13-genericcloud-amd64 / 20260601-2496
+PINNED_SHA512="61264ae6968d765e61cf5607a664ba63099ddfb66b8404aa737d06f89b39c8e0fbaa1517b13705909ff01686d32015a0147436662672b4dacc10b4a171d7993d"
 
 if [ ! -f "$IMAGE" ]; then
     echo "==> Downloading Debian 13 (Trixie) genericcloud image..."
@@ -56,20 +63,42 @@ if [ ! -f "$IMAGE" ]; then
     downloaded=false
     for base in "${BASES[@]}"; do
         echo "  Trying $base ..."
-        if wget -q --show-progress -O "$IMAGE.tmp" "$base/$IMAGE_NAME" && \
-           wget -q -O "$IMAGE_SUMS" "$base/SHA256SUMS"; then
-            # Verify checksum
-            expected=$(grep "$IMAGE_NAME" "$IMAGE_SUMS" | awk '{print $1}')
-            actual=$(sha256sum "$IMAGE.tmp" | awk '{print $1}')
-            if [ "$expected" = "$actual" ]; then
-                mv "$IMAGE.tmp" "$IMAGE"
-                echo "==> Checksum verified."
-                downloaded=true
-                break
-            else
-                echo "  Checksum mismatch (got $actual, expected $expected), skipping."
+        # Fetch SHA512SUMS first so the server-provided expected hash and the
+        # image come from the same snapshot.  If the 'latest' symlink rotates
+        # between two separate wget calls the checksums won't match.
+        if ! wget -q -O "$IMAGE_SUMS" "$base/SHA512SUMS"; then
+            rm -f "$IMAGE_SUMS"
+            continue
+        fi
+        server_expected=$(grep "$IMAGE_NAME" "$IMAGE_SUMS" | awk '{print $1}')
+        if [ -z "$server_expected" ]; then
+            echo "  $IMAGE_NAME not found in SHA512SUMS, skipping."
+            rm -f "$IMAGE_SUMS"
+            continue
+        fi
+        if wget -q --show-progress -O "$IMAGE.tmp" "$base/$IMAGE_NAME"; then
+            actual=$(sha512sum "$IMAGE.tmp" | awk '{print $1}')
+            if [ "$server_expected" != "$actual" ]; then
+                echo "  Server checksum mismatch, skipping."
                 rm -f "$IMAGE.tmp" "$IMAGE_SUMS"
+                continue
             fi
+            # Supply-chain gate: image must match the pinned hash in this script.
+            if [ "$PINNED_SHA512" != "$actual" ]; then
+                echo ""
+                echo "ERROR: Downloaded image does not match the pinned SHA-512 in build-vm.sh."
+                echo "  Actual:  $actual"
+                echo "  Pinned:  $PINNED_SHA512"
+                echo ""
+                echo "If you are intentionally upgrading the image, update PINNED_SHA512 in"
+                echo "tests/build-vm.sh and commit the change so the new hash is reviewed."
+                rm -f "$IMAGE.tmp" "$IMAGE_SUMS"
+                exit 1
+            fi
+            mv "$IMAGE.tmp" "$IMAGE"
+            echo "==> Checksum verified (server + pinned)."
+            downloaded=true
+            break
         else
             rm -f "$IMAGE.tmp" "$IMAGE_SUMS"
         fi
