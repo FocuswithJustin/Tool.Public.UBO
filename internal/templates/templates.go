@@ -168,12 +168,15 @@ fi
 
 ip link set dev "$IFACE" up
 ip addr add {{.StaticIP}} dev "$IFACE" 2>/dev/null || true
-if ! ip route add default via {{.GatewayIP}} 2>/dev/null; then
-    ip route add {{.GatewayIP}}/32 dev "$IFACE" onlink 2>/dev/null || true
-    ip route add default via {{.GatewayIP}} 2>/dev/null || true
+if ! ip route show default | grep -q default; then
+    if ! ip route add default via {{.GatewayIP}} 2>/dev/null; then
+        ip route add {{.GatewayIP}}/32 dev "$IFACE" onlink 2>/dev/null || true
+        ip route add default via {{.GatewayIP}} 2>/dev/null || true
+    fi
 fi
 
 modprobe wireguard 2>/dev/null || true
+ip link del dev wg0 2>/dev/null || true
 ip link add dev wg0 type wireguard
 ip addr add {{.ServerIP}} dev wg0
 wg setconf wg0 /etc/wireguard/wg-initramfs.conf

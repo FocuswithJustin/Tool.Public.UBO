@@ -320,7 +320,7 @@ func writeRunArtifacts(cfg *config.Config, keys *keygen.Keys, outDir, cfgPath st
 		PrivateKey:      keys.ClientWGPrivate,
 		Address:         cfg.WireGuard.ClientIP,
 		ServerPublicKey: keys.ServerWGPublic,
-		ServerEndpoint:  fmt.Sprintf("%s:%d", cfg.Host, cfg.WireGuard.Port),
+		ServerEndpoint:  wgEndpoint(cfg.Host, cfg.WireGuard.Port),
 		AllowedIPs:      serverTunnelIP + "/32",
 	}
 	wgClientINI, err := wgClient.MarshalINI()
@@ -596,6 +596,14 @@ func runChangeKey(client *remote.Client, cfg *config.Config) (bool, error) {
 		return false, nil
 	}
 	return true, nil
+}
+
+// wgEndpoint formats a WireGuard endpoint as host:port, bracketing IPv6 addresses.
+func wgEndpoint(host string, port int) string {
+	if strings.Contains(host, ":") {
+		return fmt.Sprintf("[%s]:%d", host, port)
+	}
+	return fmt.Sprintf("%s:%d", host, port)
 }
 
 // waitForTunnel pings ip once per second for up to maxSec seconds.
