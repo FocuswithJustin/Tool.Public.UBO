@@ -129,6 +129,7 @@ UMASK=0077
 // InitramfsScriptData holds template variables for InitramfsScriptTmpl.
 type InitramfsScriptData struct {
 	ServerIP  string // e.g. "10.42.0.1/24" — WireGuard server tunnel CIDR
+	StaticIP  string // host IP/CIDR for initramfs, e.g. "192.168.1.10/24"
 	GatewayIP string // physical network gateway, e.g. "192.168.1.1"
 	Interface string // physical network interface, e.g. "eth0"
 }
@@ -151,21 +152,24 @@ prereqs() { echo "$PREREQ"; }
 case "$1" in prereqs) prereqs; exit 0;; esac
 set -e
 
-# Wait for default route — max 30 seconds
-TIMEOUT=30
-while [ $TIMEOUT -gt 0 ]; do
-    if ip route show default 2>/dev/null | grep -q default; then
-        break
-    fi
-    sleep 1
-    TIMEOUT=$((TIMEOUT - 1))
-done
+# Resolve the network interface. Predictable names (e.g. enp1s0) require udev
+# naming rules that may not be present in initramfs; fall back to the first
+# non-loopback Ethernet interface found in /sys/class/net if the configured
+# name is not visible.
+IFACE="{{.Interface}}"
+if ! ip link show dev "$IFACE" >/dev/null 2>&1; then
+    for _dev in /sys/class/net/*; do
+        _n=$(basename "$_dev")
+        [ "$_n" = "lo" ] && continue
+        [ "$(cat "$_dev/type" 2>/dev/null)" = "1" ] || continue
+        IFACE="$_n"; break
+    done
+fi
 
-
-# Onlink gateway fallback: if the kernel's ip= setup did not establish a default
-# route (gateway outside the host subnet), add host and default routes manually.
-if ! ip route show default | grep -q default; then
-    ip route add {{.GatewayIP}}/32 dev {{.Interface}} onlink 2>/dev/null || true
+ip link set dev "$IFACE" up
+ip addr add {{.StaticIP}} dev "$IFACE" 2>/dev/null || true
+if ! ip route add default via {{.GatewayIP}} 2>/dev/null; then
+    ip route add {{.GatewayIP}}/32 dev "$IFACE" onlink 2>/dev/null || true
     ip route add default via {{.GatewayIP}} 2>/dev/null || true
 fi
 
@@ -195,11 +199,8 @@ func RenderInitramfsScript(d InitramfsScriptData) (string, error) {
 
 // validateInitramfsScriptData returns an error if d contains invalid fields.
 func validateInitramfsScriptData(d InitramfsScriptData) error {
-	if d.ServerIP == "" {
-		return fmt.Errorf("RenderInitramfsScript: ServerIP is required")
-	}
-	if _, _, err := net.ParseCIDR(d.ServerIP); err != nil {
-		return fmt.Errorf("RenderInitramfsScript: ServerIP %q is not a valid CIDR: %w", d.ServerIP, err)
+	if err := validateScriptCIDRs(d); err != nil {
+		return err
 	}
 	if d.GatewayIP == "" {
 		return fmt.Errorf("RenderInitramfsScript: GatewayIP is required")
@@ -209,6 +210,23 @@ func validateInitramfsScriptData(d InitramfsScriptData) error {
 	}
 	if d.Interface == "" {
 		return fmt.Errorf("RenderInitramfsScript: Interface is required")
+	}
+	return nil
+}
+
+// validateScriptCIDRs checks the CIDR fields of InitramfsScriptData.
+func validateScriptCIDRs(d InitramfsScriptData) error {
+	if d.ServerIP == "" {
+		return fmt.Errorf("RenderInitramfsScript: ServerIP is required")
+	}
+	if _, _, err := net.ParseCIDR(d.ServerIP); err != nil {
+		return fmt.Errorf("RenderInitramfsScript: ServerIP %q is not a valid CIDR: %w", d.ServerIP, err)
+	}
+	if d.StaticIP == "" {
+		return fmt.Errorf("RenderInitramfsScript: StaticIP is required")
+	}
+	if _, _, err := net.ParseCIDR(d.StaticIP); err != nil {
+		return fmt.Errorf("RenderInitramfsScript: StaticIP %q is not a valid CIDR: %w", d.StaticIP, err)
 	}
 	return nil
 }

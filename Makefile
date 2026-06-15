@@ -47,11 +47,8 @@ complexity:
 # check: full local gate — formatting, vet, complexity, and unit tests.
 check: fmt vet complexity test
 
-build-rootless:
-	go build -tags rootless -o $(BINARY)-rootless .
-
 clean:
-	rm -f $(BINARY) $(BINARY)-rootless
+	rm -f $(BINARY)
 
 fmt:
 	gofmt -w .

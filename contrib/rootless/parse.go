@@ -1,5 +1,3 @@
-//go:build rootless
-
 package rootless
 
 import (

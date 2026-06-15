@@ -144,21 +144,21 @@ func TestDispatch_flagParseError(t *testing.T) {
 	}
 }
 
-// "unlock change" maps to unlock-change. As a non-root user, cmdUnlock returns
-// the root-required error after passing validation — confirming the two-word
-// subcommand routed to cmdUnlock.
+// "unlock change" maps to cmdUnlock with changeKey=true.
 func TestDispatch_unlockChangeRouting(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("test assumes non-root execution")
+	setUnlockSeams(t)
+	var gotChangeKey bool
+	osGetuid = func() int { return 1000 }
+	userspaceUnlock = func(_ context.Context, _ *config.Config, _ string, changeKey bool) error {
+		gotChangeKey = changeKey
+		return nil
 	}
-	dir := t.TempDir()
-	cfgPath := writeValidConfig(t, dir, filepath.Join(dir, "out"))
-	err := dispatch([]string{"unlock", "change", "--config", cfgPath})
-	if err == nil {
-		t.Fatal("expected error from cmdUnlock")
+	cfgPath := writeUnlockReady(t, "")
+	if err := dispatch([]string{"unlock", "change", "--config", cfgPath}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "requires root") {
-		t.Errorf("error = %v; want 'requires root'", err)
+	if !gotChangeKey {
+		t.Error("dispatch 'unlock change' did not set changeKey=true")
 	}
 }
 
@@ -482,16 +482,21 @@ func TestDispatch_configure(t *testing.T) {
 	}
 }
 
-// dispatch("unlock") (single word) routes to cmdUnlock with changeKey=false.
+// dispatch("unlock") routes to cmdUnlock with changeKey=false.
 func TestDispatch_unlock(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("test assumes non-root execution")
+	setUnlockSeams(t)
+	var gotChangeKey = true // init to true; expect it to be set false
+	osGetuid = func() int { return 1000 }
+	userspaceUnlock = func(_ context.Context, _ *config.Config, _ string, changeKey bool) error {
+		gotChangeKey = changeKey
+		return nil
 	}
-	dir := t.TempDir()
-	cfgPath := writeValidConfig(t, dir, filepath.Join(dir, "out"))
-	err := dispatch([]string{"unlock", "--config", cfgPath})
-	if err == nil || !strings.Contains(err.Error(), "requires root") {
-		t.Fatalf("error = %v; want 'requires root'", err)
+	cfgPath := writeUnlockReady(t, "")
+	if err := dispatch([]string{"unlock", "--config", cfgPath}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotChangeKey {
+		t.Error("dispatch 'unlock' set changeKey=true; want false")
 	}
 }
 
@@ -501,7 +506,11 @@ func TestDispatch_unlock(t *testing.T) {
 func setRunSeams(t *testing.T) {
 	t.Helper()
 	o1, o2, o3 := keygenGenerateAll, remoteConnect, setupConfigure
-	t.Cleanup(func() { keygenGenerateAll, remoteConnect, setupConfigure = o1, o2, o3 })
+	o4 := checkTools
+	t.Cleanup(func() {
+		keygenGenerateAll, remoteConnect, setupConfigure = o1, o2, o3
+		checkTools = o4
+	})
 }
 
 // happyRunSeams installs seams for a successful cmdRun: keys generated,
@@ -509,6 +518,7 @@ func setRunSeams(t *testing.T) {
 func happyRunSeams(t *testing.T) {
 	t.Helper()
 	setRunSeams(t)
+	checkTools = func(string) error { return nil }
 	keygenGenerateAll = func(outDir string) (*keygen.Keys, error) {
 		return &keygen.Keys{
 			ServerWGPublic:  "serverpubkey",
@@ -864,33 +874,43 @@ func TestCmdUnlock_invalidConfig(t *testing.T) {
 	}
 }
 
-func TestCmdUnlock_requiresRoot(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("test assumes non-root execution; root would pass the guard")
+func TestCmdUnlock_nonRootUsesUserspace(t *testing.T) {
+	setUnlockSeams(t)
+	called := false
+	osGetuid = func() int { return 1000 }
+	userspaceUnlock = func(_ context.Context, _ *config.Config, _ string, changeKey bool) error {
+		called = true
+		if changeKey {
+			t.Error("changeKey should be false")
+		}
+		return nil
 	}
-	dir := t.TempDir()
-	cfgPath := writeValidConfig(t, dir, filepath.Join(dir, "out"))
-	err := cmdUnlock(context.Background(), cfgPath, false)
-	if err == nil {
-		t.Fatal("expected root-required error")
+	cfgPath := writeUnlockReady(t, "")
+	if err := cmdUnlock(context.Background(), cfgPath, false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "requires root") {
-		t.Errorf("error = %v; want 'requires root'", err)
+	if !called {
+		t.Error("userspaceUnlock was not called for non-root uid")
 	}
 }
 
-func TestCmdUnlock_changeRequiresRoot(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("test assumes non-root execution")
+func TestCmdUnlock_nonRootChangeKeyUsesUserspace(t *testing.T) {
+	setUnlockSeams(t)
+	called := false
+	osGetuid = func() int { return 1000 }
+	userspaceUnlock = func(_ context.Context, _ *config.Config, _ string, changeKey bool) error {
+		called = true
+		if !changeKey {
+			t.Error("changeKey should be true")
+		}
+		return nil
 	}
-	dir := t.TempDir()
-	cfgPath := writeValidConfig(t, dir, filepath.Join(dir, "out"))
-	err := cmdUnlock(context.Background(), cfgPath, true)
-	if err == nil {
-		t.Fatal("expected root-required error")
+	cfgPath := writeUnlockReady(t, "")
+	if err := cmdUnlock(context.Background(), cfgPath, true); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "requires root") {
-		t.Errorf("error = %v; want 'requires root'", err)
+	if !called {
+		t.Error("userspaceUnlock was not called for non-root uid with changeKey")
 	}
 }
 
@@ -909,10 +929,14 @@ func setUnlockSeams(t *testing.T) {
 	o1, o2, o3 := osGetuid, remoteConnect, interactiveSession
 	o4, o5 := waitForTunnelFn, unlockStdin
 	o6, o7 := wgQuickUp, wgQuickDown
+	o8, o9 := kernelUnlock, userspaceUnlock
+	o10 := checkTools
 	t.Cleanup(func() {
 		osGetuid, remoteConnect, interactiveSession = o1, o2, o3
 		waitForTunnelFn, unlockStdin = o4, o5
 		wgQuickUp, wgQuickDown = o6, o7
+		kernelUnlock, userspaceUnlock = o8, o9
+		checkTools = o10
 	})
 }
 
@@ -923,6 +947,7 @@ func happyUnlockSeams(t *testing.T) *unlockRecorder {
 	setUnlockSeams(t)
 	rec := &unlockRecorder{}
 	osGetuid = func() int { return 0 }
+	checkTools = func(string) error { return nil }
 	wgQuickUp = func(ctx context.Context, p string) error { rec.upCalled = true; return nil }
 	wgQuickDown = func(p string) error { rec.downCalled = true; return nil }
 	waitForTunnelFn = func(ip string, n int) error { return nil }

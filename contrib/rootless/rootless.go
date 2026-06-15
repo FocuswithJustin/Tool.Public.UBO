@@ -1,5 +1,3 @@
-//go:build rootless
-
 // Package rootless implements a privilege-free unlock path using userspace
 // WireGuard (wireguard-go netstack) and an in-process SSH client
 // (golang.org/x/crypto/ssh). No root is required, no kernel WireGuard module

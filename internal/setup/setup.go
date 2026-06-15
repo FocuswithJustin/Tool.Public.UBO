@@ -113,6 +113,7 @@ func buildSetupScriptData(cfg *config.Config, keys *keygen.Keys, netInfo *Networ
 
 	initScript, err := templates.RenderInitramfsScript(templates.InitramfsScriptData{
 		ServerIP:  cfg.WireGuard.ServerIP,
+		StaticIP:  fmt.Sprintf("%s/%d", netInfo.IP, netInfo.Prefix),
 		GatewayIP: netInfo.Gateway,
 		Interface: netInfo.Interface,
 	})

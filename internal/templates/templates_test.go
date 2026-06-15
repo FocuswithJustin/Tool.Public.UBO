@@ -124,6 +124,7 @@ func TestWireGuardClientConfig_MarshalINI_missingFields(t *testing.T) {
 func validScriptData() InitramfsScriptData {
 	return InitramfsScriptData{
 		ServerIP:  "10.42.0.1/24",
+		StaticIP:  "192.168.1.10/24",
 		GatewayIP: "192.168.1.1",
 		Interface: "eth0",
 	}
@@ -134,11 +135,17 @@ func TestRenderInitramfsScript(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(got, "ip addr add 10.42.0.1/24 dev wg0") {
-		t.Errorf("missing ip addr line, got:\n%s", got)
-	}
 	if !strings.HasPrefix(got, "#!/bin/sh") {
 		t.Errorf("script should start with #!/bin/sh, got:\n%s", got)
+	}
+	if !strings.Contains(got, `ip link set dev "$IFACE" up`) {
+		t.Errorf("missing interface-up line, got:\n%s", got)
+	}
+	if !strings.Contains(got, `ip addr add 192.168.1.10/24 dev "$IFACE"`) {
+		t.Errorf("missing static IP line, got:\n%s", got)
+	}
+	if !strings.Contains(got, "ip addr add 10.42.0.1/24 dev wg0") {
+		t.Errorf("missing wg0 addr line, got:\n%s", got)
 	}
 }
 
@@ -154,6 +161,22 @@ func TestRenderInitramfsScript_invalidCIDR(t *testing.T) {
 	_, err := RenderInitramfsScript(d)
 	if err == nil || !strings.Contains(err.Error(), "not a valid CIDR") {
 		t.Errorf("expected CIDR error, got %v", err)
+	}
+}
+
+func TestRenderInitramfsScript_missingStaticIP(t *testing.T) {
+	d := validScriptData()
+	d.StaticIP = ""
+	if _, err := RenderInitramfsScript(d); err == nil || !strings.Contains(err.Error(), "StaticIP is required") {
+		t.Errorf("expected StaticIP error, got %v", err)
+	}
+}
+
+func TestRenderInitramfsScript_invalidStaticIP(t *testing.T) {
+	d := validScriptData()
+	d.StaticIP = "not-a-cidr"
+	if _, err := RenderInitramfsScript(d); err == nil || !strings.Contains(err.Error(), "not a valid CIDR") {
+		t.Errorf("expected CIDR error for StaticIP, got %v", err)
 	}
 }
 
@@ -186,7 +209,7 @@ func TestRenderInitramfsScript_onlinkFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(got, "ip route add 192.168.1.1/32 dev eth0 onlink") {
+	if !strings.Contains(got, `ip route add 192.168.1.1/32 dev "$IFACE" onlink`) {
 		t.Errorf("missing onlink host route, got:\n%s", got)
 	}
 	if !strings.Contains(got, "ip route add default via 192.168.1.1") {
@@ -204,18 +227,21 @@ func TestRenderInitramfsScript_setE(t *testing.T) {
 	}
 }
 
-func TestRenderInitramfsScript_noAndBreak(t *testing.T) {
-	// The route-wait loop must use `if ... fi; break` so grep's non-zero exit
-	// (route not yet present) does not trigger set -e (audit M1/M2).
+func TestRenderInitramfsScript_directNetworkSetup(t *testing.T) {
+	// The script must configure the network directly (not wait for ip= kernel param)
+	// and fall back to /sys/class/net discovery if the named interface isn't visible.
 	got, err := RenderInitramfsScript(validScriptData())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.Contains(got, "&& break") {
-		t.Error("script must not use '&& break' in route-wait loop (breaks under set -e)")
+	if strings.Contains(got, "TIMEOUT") {
+		t.Error("script must not use a route-wait loop (ip= kernel param unreliable before udev)")
 	}
-	if !strings.Contains(got, "if ip route") {
-		t.Error("script should use 'if ip route ...' pattern for route-wait loop")
+	if !strings.Contains(got, "ip link show dev") {
+		t.Error("script must probe for interface before using it")
+	}
+	if !strings.Contains(got, "/sys/class/net") {
+		t.Error("script must fall back to /sys/class/net discovery")
 	}
 }
 

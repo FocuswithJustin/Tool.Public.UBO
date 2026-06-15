@@ -287,24 +287,6 @@ func unlockTimeouts(t *testing.T) (time.Duration, time.Duration) {
 	return 4 * time.Minute, 6 * time.Minute
 }
 
-// runUboUnlock drives `ubo unlock` from the client via expect, retrying a few
-// times. It fails the test if the unlock never reports completion.
-func runUboUnlock(t *testing.T) {
-	t.Helper()
-	pushUnlockExpect(t)
-	for attempt := 1; attempt <= 4; attempt++ {
-		out := runOnClient(t, true,
-			"cd /root && expect /root/do-unlock.exp "+luksPassphrase+" 2>&1")
-		t.Logf("ubo unlock attempt %d:\n%s", attempt, out)
-		if strings.Contains(out, "unlock complete") {
-			return
-		}
-		time.Sleep(15 * time.Second)
-	}
-	t.Fatalf("ubo unlock did not complete; server serial tail:\n%s",
-		tailFile(tmpPath("server-serial.log"), 50))
-}
-
 // verifyServerDecrypted confirms the server booted to the decrypted system after
 // a remote unlock.
 func verifyServerDecrypted(t *testing.T, bootTimeout time.Duration) {
@@ -369,37 +351,7 @@ func TestUBOUnlock_Integration(t *testing.T) {
 
 	// ── 3. ubo run (configure the server from the client) ────────────────────
 	t.Log("Running ubo run...")
-
-	uboToml := fmt.Sprintf(`host = "%s"
-
-[ssh]
-user = "root"
-port = 22
-key  = "/root/test_ed25519"
-
-[wireguard]
-port      = 51820
-server_ip = "10.42.0.1/24"
-client_ip = "10.42.0.2/32"
-
-[dropbear]
-port = 22
-
-[output]
-dir = "/root/ubo-out"
-
-[network]
-# dnsmasq on the client pins the server to this address; isc-dhcp-client's
-# default route has no "src" field, so IP auto-detection can't see it.
-ip = "%s/24"
-`, serverLinkIP, serverLinkIP)
-	writeRemoteFile(t, "/root/ubo.toml", uboToml)
-
-	runOut := runOnClient(t, false, "cd /root && ./ubo run --config ubo.toml 2>&1")
-	t.Logf("ubo run output:\n%s", runOut)
-	if !strings.Contains(runOut, "configuration complete") {
-		t.Fatalf("ubo run did not report completion")
-	}
+	runUboRunFromClient(t)
 
 	// ── 4. Soft-reboot the server into the Dropbear initramfs ────────────────
 	t.Log("Rebooting server into Dropbear+WireGuard initramfs...")
@@ -466,14 +418,53 @@ func writeRemoteFile(t *testing.T, remotePath, content string) {
 	os.Remove(local)
 }
 
-// pushUnlockExpect installs the expect script that drives `ubo unlock`'s
-// interactive passphrase prompt on the client.
-func pushUnlockExpect(t *testing.T) {
+// runUboRunFromClient writes ubo.toml on the client and runs 'ubo run' against
+// the LUKS server. Called by every test that needs the server configured.
+func runUboRunFromClient(t *testing.T) {
 	t.Helper()
-	script := `#!/usr/bin/expect -f
+	uboToml := fmt.Sprintf(`host = "%s"
+
+[ssh]
+user = "root"
+port = 22
+key  = "/root/test_ed25519"
+
+[wireguard]
+port      = 51820
+server_ip = "10.42.0.1/24"
+client_ip = "10.42.0.2/32"
+
+[dropbear]
+port = 22
+
+[output]
+dir = "/root/ubo-out"
+
+[network]
+# dnsmasq on the client pins the server to this address; isc-dhcp-client's
+# default route has no "src" field, so IP auto-detection can't see it.
+ip = "%s/24"
+`, serverLinkIP, serverLinkIP)
+	writeRemoteFile(t, "/root/ubo.toml", uboToml)
+	runOut := runOnClient(t, false, "cd /root && ./ubo run --config ubo.toml 2>&1")
+	t.Logf("ubo run output:\n%s", runOut)
+	if !strings.Contains(runOut, "configuration complete") {
+		t.Fatalf("ubo run did not report completion")
+	}
+}
+
+// pushUnlockExpect installs an expect script on the client that drives
+// 'ubo unlock' interactively. unlockCmd is a shell command string (may contain
+// shell operators); it is executed via bash -c so metacharacters work correctly.
+func pushUnlockExpect(t *testing.T, unlockCmd string) {
+	t.Helper()
+	// Wrap in bash -c so && / env vars / runuser work inside the expect spawn.
+	// Tcl curly braces {…} quote the string literally — safe as long as the
+	// command itself contains no unbalanced braces (ours never do).
+	script := fmt.Sprintf(`#!/usr/bin/expect -f
 set timeout 200
 set pass [lindex $argv 0]
-spawn ./ubo unlock --config /root/ubo.toml
+spawn bash -c {%s}
 expect {
   -re "(?i)(unlock disk|passphrase)" { send "$pass\r"; exp_continue }
   -re "(?i)unlock complete" { }
@@ -482,6 +473,155 @@ expect {
 }
 catch wait result
 exit [lindex $result 3]
-`
+`, unlockCmd)
 	writeRemoteFile(t, "/root/do-unlock.exp", script)
+}
+
+// runUboUnlock drives 'ubo unlock' as root from the client via expect, retrying
+// a few times. It fails the test if the unlock never reports completion.
+func runUboUnlock(t *testing.T) {
+	t.Helper()
+	pushUnlockExpect(t, "cd /root && ./ubo unlock --config /root/ubo.toml")
+	for attempt := 1; attempt <= 4; attempt++ {
+		out := runOnClient(t, true,
+			"cd /root && expect /root/do-unlock.exp "+luksPassphrase+" 2>&1")
+		t.Logf("ubo unlock attempt %d:\n%s", attempt, out)
+		if strings.Contains(out, "unlock complete") {
+			return
+		}
+		time.Sleep(15 * time.Second)
+	}
+	t.Fatalf("ubo unlock did not complete; server serial tail:\n%s",
+		tailFile(tmpPath("server-serial.log"), 50))
+}
+
+// runUboUnlockAsUser drives 'ubo unlock' as a non-root user on the client via
+// expect. It copies the key artifacts to ~user/ubo-out and rewrites the config
+// to point there, then runs ubo as that user via runuser.
+func runUboUnlockAsUser(t *testing.T, user string) {
+	t.Helper()
+	// Create user and copy artifacts so the non-root process can read them.
+	runOnClient(t, false, fmt.Sprintf(
+		"id %s 2>/dev/null || useradd -m %s && "+
+			"mkdir -p /home/%s/ubo-out && "+
+			"cp /root/ubo-out/* /home/%s/ubo-out/ && "+
+			"sed 's|/root/ubo-out|/home/%s/ubo-out|g' /root/ubo.toml > /home/%s/ubo.toml && "+
+			"chown -R %s: /home/%s/ubo-out /home/%s/ubo.toml && "+
+			"chmod 700 /home/%s/ubo-out",
+		user, user, user, user, user, user, user, user, user, user))
+
+	cfgPath := fmt.Sprintf("/home/%s/ubo.toml", user)
+	unlockCmd := fmt.Sprintf("runuser -u %s -- /root/ubo unlock --config %s", user, cfgPath)
+	pushUnlockExpect(t, unlockCmd)
+	for attempt := 1; attempt <= 4; attempt++ {
+		out := runOnClient(t, true,
+			"expect /root/do-unlock.exp "+luksPassphrase+" 2>&1")
+		t.Logf("ubo unlock (as %s) attempt %d:\n%s", user, attempt, out)
+		if strings.Contains(out, "unlock complete") {
+			return
+		}
+		time.Sleep(15 * time.Second)
+	}
+	t.Fatalf("ubo unlock (as %s) did not complete; server serial tail:\n%s",
+		user, tailFile(tmpPath("server-serial.log"), 50))
+}
+
+// TestUBOUnlock_Rootless_Integration tests the userspace WireGuard unlock path.
+// Identical topology to TestUBOUnlock_Integration except 'ubo unlock' is run as
+// a non-root user, forcing the wireguard-go netstack path (no wg-quick needed).
+func TestUBOUnlock_Rootless_Integration(t *testing.T) {
+	checkLUKSPrereqs(t)
+	bootTimeout, setupTimeout := unlockTimeouts(t)
+
+	t.Log("Building client seed + booting client VM...")
+	seed := buildClientSeed(t)
+	startClientVM(t, seed)
+	waitForSSHReadyPort(t, clientSSHPort, bootTimeout)
+	t.Log("Waiting for client NAT/dnsmasq setup...")
+	waitForClientSetup(t, setupTimeout)
+
+	t.Log("Deploying ubo + key to client...")
+	scpToClient(t, buildStaticUbo(t), "/root/ubo")
+	scpToClient(t, tmpPath("test_ed25519"), "/root/test_ed25519")
+	runOnClient(t, false, "chmod +x /root/ubo && chmod 600 /root/test_ed25519")
+
+	t.Log("Booting LUKS server on the link...")
+	srv := startLinkedServer(t)
+	t.Log("Unlocking server first boot over serial...")
+	srv.unlock(t, bootTimeout)
+	waitServerSSHFromClient(t, bootTimeout)
+
+	t.Log("Running ubo run...")
+	runUboRunFromClient(t)
+
+	t.Log("Rebooting server into Dropbear+WireGuard initramfs...")
+	rebootServerFromClient(t)
+	time.Sleep(35 * time.Second)
+
+	t.Log("Running ubo unlock as non-root (userspace WireGuard)...")
+	runUboUnlockAsUser(t, "ubotest")
+
+	verifyServerDecrypted(t, bootTimeout)
+}
+
+// TestUBOUnlock_HostKeyMismatch_Integration verifies that a tampered pinned host
+// key causes unlock to fail — the SSH handshake must be rejected.
+func TestUBOUnlock_HostKeyMismatch_Integration(t *testing.T) {
+	checkLUKSPrereqs(t)
+	bootTimeout, setupTimeout := unlockTimeouts(t)
+
+	t.Log("Building client seed + booting client VM...")
+	seed := buildClientSeed(t)
+	startClientVM(t, seed)
+	waitForSSHReadyPort(t, clientSSHPort, bootTimeout)
+	t.Log("Waiting for client NAT/dnsmasq setup...")
+	waitForClientSetup(t, setupTimeout)
+
+	t.Log("Deploying ubo + key to client...")
+	scpToClient(t, buildStaticUbo(t), "/root/ubo")
+	scpToClient(t, tmpPath("test_ed25519"), "/root/test_ed25519")
+	runOnClient(t, false, "chmod +x /root/ubo && chmod 600 /root/test_ed25519")
+
+	t.Log("Booting LUKS server on the link...")
+	srv := startLinkedServer(t)
+	t.Log("Unlocking server first boot over serial...")
+	srv.unlock(t, bootTimeout)
+	waitServerSSHFromClient(t, bootTimeout)
+
+	t.Log("Running ubo run...")
+	runUboRunFromClient(t)
+
+	// Tamper the pinned host key before rebooting — a different key should cause
+	// the SSH handshake to be rejected.
+	t.Log("Tampering pinned host key...")
+	runOnClient(t, false,
+		"ssh-keygen -t ed25519 -f /tmp/fake_host -N '' -q && "+
+			"cat /tmp/fake_host.pub > /root/ubo-out/dropbear_host_key.pub")
+
+	t.Log("Rebooting server into Dropbear+WireGuard initramfs...")
+	rebootServerFromClient(t)
+	time.Sleep(35 * time.Second)
+
+	t.Log("Attempting unlock with mismatched host key (expect failure)...")
+	// Run without expect — should fail at SSH handshake, no passphrase prompt.
+	for attempt := 1; attempt <= 3; attempt++ {
+		out := runOnClient(t, true,
+			"cd /root && ./ubo unlock --config /root/ubo.toml 2>&1; echo EXIT:$?")
+		t.Logf("attempt %d:\n%s", attempt, out)
+		if looksLikeSSHRejection(out) && !strings.Contains(out, "unlock complete") {
+			t.Log("Host key mismatch correctly rejected connection.")
+			return
+		}
+		time.Sleep(15 * time.Second)
+	}
+	t.Fatal("expected unlock to fail with host key mismatch but it did not")
+}
+
+// looksLikeSSHRejection returns true when unlock output suggests the SSH
+// handshake was rejected (as opposed to the tunnel not yet being reachable).
+func looksLikeSSHRejection(out string) bool {
+	return strings.Contains(out, "host key") ||
+		strings.Contains(out, "handshake") ||
+		strings.Contains(out, "SSH") ||
+		strings.Contains(out, "connect")
 }

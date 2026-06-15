@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"ubo/contrib/rootless"
 	"ubo/internal/checker"
 	"ubo/internal/config"
 	"ubo/internal/keygen"
@@ -61,14 +62,16 @@ var (
 		return cmd.Run()
 	}
 
-	// doUnlock runs the tunnel+SSH unlock flow. Replaced at init() time by the
-	// rootless build (main_rootless.go) to use wireguard-go netstack instead of
-	// wg-quick + external ssh.
-	doUnlock = defaultDoUnlock
+	// kernelUnlock is the root-privilege unlock path: wg-quick + SSH to Dropbear.
+	// Seamed for unit tests that stub wgQuickUp/waitForTunnelFn/remoteConnect.
+	kernelUnlock = defaultDoUnlock
 
-	// requireRootForUnlock gates the root-privilege check in loadUnlockConfig.
-	// The rootless build sets this to false since no kernel WireGuard is used.
-	requireRootForUnlock = true
+	// userspaceUnlock is the non-root unlock path: wireguard-go netstack +
+	// in-process SSH. No kernel WireGuard module, no wg-quick, no root needed.
+	// Seamed for unit tests.
+	userspaceUnlock = func(ctx context.Context, cfg *config.Config, outDir string, changeKey bool) error {
+		return rootless.Unlock(ctx, cfg, outDir, changeKey)
+	}
 )
 
 const usage = `ubo — Unlock Before Operation
@@ -429,9 +432,9 @@ func printArtifactList(present map[string]bool) {
 	}
 }
 
-// cmdUnlock loads config, checks artifacts, then delegates to doUnlock.
-// doUnlock is defaultDoUnlock in production and is replaced by the rootless
-// build (main_rootless.go) with a privilege-free userspace WireGuard+SSH impl.
+// cmdUnlock loads config, checks artifacts, then delegates to either the kernel
+// (wg-quick, requires root) or userspace (wireguard-go, no root needed) path
+// based on the current process UID.
 func cmdUnlock(ctx context.Context, cfgPath string, changeKey bool) error {
 	cfg, err := loadUnlockConfig(cfgPath)
 	if err != nil {
@@ -445,10 +448,17 @@ func cmdUnlock(ctx context.Context, cfgPath string, changeKey bool) error {
 	); err != nil {
 		return err
 	}
-	return doUnlock(ctx, cfg, outDir, changeKey)
+	if osGetuid() == 0 {
+		if err := checkTools("unlock"); err != nil {
+			return err
+		}
+		return kernelUnlock(ctx, cfg, outDir, changeKey)
+	}
+	fmt.Println("[ubo] non-root: using userspace WireGuard (wireguard-go netstack)...")
+	return userspaceUnlock(ctx, cfg, outDir, changeKey)
 }
 
-// defaultDoUnlock is the standard (requires-root) unlock flow: wg-quick up,
+// defaultDoUnlock is the kernel-path unlock flow (used when root): wg-quick up,
 // wait for tunnel, SSH to Dropbear, cryptroot-unlock, wg-quick down.
 func defaultDoUnlock(ctx context.Context, cfg *config.Config, outDir string, changeKey bool) error {
 	wgConfigPath := filepath.Join(outDir, "client_wg.conf")
@@ -500,8 +510,8 @@ func performUnlock(client *remote.Client, cfg *config.Config, changeKey bool) er
 	return nil
 }
 
-// loadUnlockConfig loads and validates the config and enforces the tool and root
-// preconditions shared by every unlock invocation.
+// loadUnlockConfig loads and validates the config. Privilege and tool checks
+// are done in cmdUnlock after the path (kernel vs userspace) is chosen.
 func loadUnlockConfig(cfgPath string) (*config.Config, error) {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
@@ -509,12 +519,6 @@ func loadUnlockConfig(cfgPath string) (*config.Config, error) {
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
-	}
-	if err := checkTools("unlock"); err != nil {
-		return nil, err
-	}
-	if requireRootForUnlock && osGetuid() != 0 {
-		return nil, fmt.Errorf("unlock requires root privileges\nRun: sudo ubo unlock --config %s", cfgPath)
 	}
 	return cfg, nil
 }
