@@ -208,6 +208,8 @@ dir = %q
 	return outDir, cfgPath
 }
 
+func coverDir() string { return os.Getenv("UBO_COVER_DIR") }
+
 // runUbo executes the ubo binary with the given config, failing on error.
 func runUbo(t *testing.T, cfgPath string) {
 	t.Helper()
@@ -215,6 +217,9 @@ func runUbo(t *testing.T, cfgPath string) {
 	ubo := exec.Command(filepath.Join(projectRoot(), "ubo"), "run", "--config", cfgPath)
 	ubo.Stdout = os.Stdout
 	ubo.Stderr = os.Stderr
+	if dir := coverDir(); dir != "" {
+		ubo.Env = append(os.Environ(), "GOCOVERDIR="+dir)
+	}
 	if err := ubo.Run(); err != nil {
 		t.Fatalf("ubo run: %v", err)
 	}

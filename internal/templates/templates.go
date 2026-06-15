@@ -225,18 +225,16 @@ wg setconf wg0 /etc/wireguard/wg-initramfs.conf
 ip link set dev wg0 up
 `
 
+var initramfsScriptTmpl = template.Must(template.New("wg-script").Parse(InitramfsScriptTmpl))
+
 // RenderInitramfsScript renders InitramfsScriptTmpl with d.
 // It validates that ServerIP is a non-empty CIDR before rendering.
 func RenderInitramfsScript(d InitramfsScriptData) (string, error) {
 	if err := validateInitramfsScriptData(d); err != nil {
 		return "", err
 	}
-	tmpl, err := template.New("wg-script").Parse(InitramfsScriptTmpl)
-	if err != nil {
-		return "", err
-	}
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, d); err != nil {
+	if err := initramfsScriptTmpl.Execute(&buf, d); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
@@ -286,6 +284,8 @@ type DropbearConfigData struct {
 const DropbearConfigTmpl = `DROPBEAR_OPTIONS="-p {{.ServerTunnelIP}}:{{.DropbearPort}} -s -j -k"
 `
 
+var dropbearConfigTmpl = template.Must(template.New("dropbear-conf").Parse(DropbearConfigTmpl))
+
 // RenderDropbearConfig renders DropbearConfigTmpl with d.
 func RenderDropbearConfig(d DropbearConfigData) (string, error) {
 	if d.ServerTunnelIP == "" {
@@ -294,12 +294,8 @@ func RenderDropbearConfig(d DropbearConfigData) (string, error) {
 	if d.DropbearPort == 0 {
 		return "", fmt.Errorf("RenderDropbearConfig: DropbearPort is required")
 	}
-	tmpl, err := template.New("dropbear-conf").Parse(DropbearConfigTmpl)
-	if err != nil {
-		return "", err
-	}
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, d); err != nil {
+	if err := dropbearConfigTmpl.Execute(&buf, d); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
@@ -356,14 +352,12 @@ This connects via WireGuard + Dropbear and runs:
 Then prompts whether to unlock and boot immediately.
 `
 
+var readmeTmpl = template.Must(template.New("readme").Parse(ReadmeTmpl))
+
 // RenderReadme renders ReadmeTmpl with d.
 func RenderReadme(d ReadmeTmplData) (string, error) {
-	tmpl, err := template.New("readme").Parse(ReadmeTmpl)
-	if err != nil {
-		return "", err
-	}
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, d); err != nil {
+	if err := readmeTmpl.Execute(&buf, d); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
@@ -549,6 +543,8 @@ update-initramfs -u -k all >&2
 printf '{"dropbear_pub_key":"%s"}\n' "$DROPBEAR_PUB"
 `
 
+var setupScriptTmpl = template.Must(template.New("setup-script").Parse(SetupScriptTmpl))
+
 // RenderSetupScript renders SetupScriptTmpl with d, base64-encoding all file
 // contents so they can be safely embedded in the shell script.
 func RenderSetupScript(d SetupScriptData) (string, error) {
@@ -568,12 +564,8 @@ func RenderSetupScript(d SetupScriptData) (string, error) {
 		NetHostname:     d.NetHostname,
 		NetInterface:    d.NetInterface,
 	}
-	tmpl, err := template.New("setup-script").Parse(SetupScriptTmpl)
-	if err != nil {
-		return "", err
-	}
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, r); err != nil {
+	if err := setupScriptTmpl.Execute(&buf, r); err != nil {
 		return "", err
 	}
 	return buf.String(), nil

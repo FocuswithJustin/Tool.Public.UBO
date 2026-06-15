@@ -73,6 +73,41 @@ func scpToClient(t *testing.T, localPath, remotePath string) {
 	}
 }
 
+// scpFromClient copies a file (or glob) from the client VM to a local destination.
+func scpFromClient(t *testing.T, remotePath, localDest string) {
+	t.Helper()
+	absKey, _ := filepath.Abs(tmpPath("test_ed25519"))
+	args := []string{
+		"-i", absKey,
+		"-P", fmt.Sprintf("%d", clientSSHPort),
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ConnectTimeout=10",
+		"-o", "BatchMode=yes",
+		"-o", "LogLevel=ERROR",
+		"root@127.0.0.1:" + remotePath,
+		localDest,
+	}
+	out, err := exec.Command("scp", args...).CombinedOutput()
+	if err != nil {
+		t.Logf("scpFromClient %s: %v\n%s", remotePath, err, out)
+	}
+}
+
+// collectVMCoverage SCPs any coverage files from /tmp/ubocov on the client VM
+// into dir on the host. A missing or empty /tmp/ubocov is silently ignored.
+func collectVMCoverage(t *testing.T, dir string) {
+	t.Helper()
+	if dir == "" {
+		return
+	}
+	out := runOnClient(t, true, "ls /tmp/ubocov/cov* 2>/dev/null || true")
+	if strings.TrimSpace(out) == "" {
+		return
+	}
+	scpFromClient(t, "/tmp/ubocov/cov*", dir+"/")
+}
+
 // buildClientSeed writes a NoCloud seed ISO that configures the client VM:
 //   - network-config v1: WAN (DHCP, internet) + LAN (static 10.99.0.1/24), by MAC
 //   - user-data runcmd: IP forwarding + NAT, then install dnsmasq/wireguard-tools/
@@ -157,10 +192,17 @@ runcmd:
 // buildStaticUbo builds a fully static ubo binary (CGO disabled) so it runs
 // inside the Debian VM, which lacks the nix store's ELF interpreter that a normal
 // nix-shell build depends on. Returns the path to the built binary.
+// When INTEGRATION_COVER=1 is set, the binary is built with -cover -coverpkg=./...
+// so coverage data can be collected from VM-side runs.
 func buildStaticUbo(t *testing.T) string {
 	t.Helper()
 	out := tmpPath("ubo-static")
-	cmd := exec.Command("go", "build", "-o", out, ".")
+	args := []string{"build"}
+	if os.Getenv("INTEGRATION_COVER") == "1" {
+		args = append(args, "-cover", "-coverpkg=./...")
+	}
+	args = append(args, "-o", out, ".")
+	cmd := exec.Command("go", args...)
 	cmd.Dir = projectRoot()
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if b, err := cmd.CombinedOutput(); err != nil {
@@ -484,12 +526,19 @@ exit [lindex $result 3]
 // a few times. It fails the test if the unlock never reports completion.
 func runUboUnlock(t *testing.T) {
 	t.Helper()
-	pushUnlockExpect(t, "cd /root && ./ubo unlock --config /root/ubo.toml")
+	dir := coverDir()
+	unlockCmd := "cd /root && ./ubo unlock --config /root/ubo.toml"
+	if dir != "" {
+		runOnClient(t, false, "mkdir -p /tmp/ubocov")
+		unlockCmd = "cd /root && GOCOVERDIR=/tmp/ubocov ./ubo unlock --config /root/ubo.toml"
+	}
+	pushUnlockExpect(t, unlockCmd)
 	for attempt := 1; attempt <= 4; attempt++ {
 		out := runOnClient(t, true,
 			"cd /root && expect /root/do-unlock.exp "+luksPassphrase+" 2>&1")
 		t.Logf("ubo unlock attempt %d:\n%s", attempt, out)
 		if strings.Contains(out, "unlock complete") {
+			collectVMCoverage(t, dir)
 			return
 		}
 		time.Sleep(15 * time.Second)
@@ -503,6 +552,7 @@ func runUboUnlock(t *testing.T) {
 // to point there, then runs ubo as that user via runuser.
 func runUboUnlockAsUser(t *testing.T, user string) {
 	t.Helper()
+	dir := coverDir()
 	// Install ubo in a world-accessible location (/usr/local/bin) so the
 	// non-root user can execute it. /root/ubo is not reachable (dir is 700).
 	// Also create the user, copy key artifacts, and rewrite config paths.
@@ -518,12 +568,17 @@ func runUboUnlockAsUser(t *testing.T, user string) {
 
 	cfgPath := fmt.Sprintf("/home/%s/ubo.toml", user)
 	unlockCmd := fmt.Sprintf("runuser -u %s -- /usr/local/bin/ubo unlock --config %s", user, cfgPath)
+	if dir != "" {
+		runOnClient(t, false, "mkdir -p /tmp/ubocov && chmod 1777 /tmp/ubocov")
+		unlockCmd = fmt.Sprintf("GOCOVERDIR=/tmp/ubocov runuser -u %s -- /usr/local/bin/ubo unlock --config %s", user, cfgPath)
+	}
 	pushUnlockExpect(t, unlockCmd)
 	for attempt := 1; attempt <= 4; attempt++ {
 		out := runOnClient(t, true,
 			"expect /root/do-unlock.exp "+luksPassphrase+" 2>&1")
 		t.Logf("ubo unlock (as %s) attempt %d:\n%s", user, attempt, out)
 		if strings.Contains(out, "unlock complete") {
+			collectVMCoverage(t, dir)
 			return
 		}
 		time.Sleep(15 * time.Second)

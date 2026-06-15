@@ -1,6 +1,6 @@
 BINARY := ubo
 
-.PHONY: build run test test-integration vm-build luks-build clean fmt vet complexity check
+.PHONY: build run test test-integration test-integration-cover vm-build luks-build clean fmt vet complexity check
 
 # Maximum allowed cyclomatic complexity per function (code and tests).
 CYCLO_MAX := 6
@@ -33,6 +33,19 @@ luks-build:
 test-integration:
 	@mkdir -p tmp
 	bash -c 'set -o pipefail; nix-shell --run "go build -o $(BINARY) . && PROJECT_ROOT=$(CURDIR) go test -v -tags integration -timeout 30m ./tests/" 2>&1 | tee tmp/integration-test.log'
+
+test-integration-cover:
+	@mkdir -p tmp/gocov-unit tmp/gocov-integ tmp/gocov-merged
+	@rm -f tmp/gocov-unit/* tmp/gocov-integ/* tmp/gocov-merged/*
+	# Unit tests: -args -test.gocoverdir= writes binary coverage data per test binary.
+	nix-shell --run "go test -count=1 -cover -coverpkg=./... ./... -args -test.gocoverdir=$(CURDIR)/tmp/gocov-unit"
+	# Integration tests: build instrumented binary and run against VMs.
+	bash -c 'set -o pipefail; nix-shell --run "go build -cover -coverpkg=./... -o $(BINARY) . && UBO_COVER_DIR=$(CURDIR)/tmp/gocov-integ INTEGRATION_COVER=1 PROJECT_ROOT=$(CURDIR) go test -v -tags integration -timeout 30m ./tests/" 2>&1 | tee tmp/integration-cover.log'
+	# Merge both sets and produce a single coverage report.
+	nix-shell --run "go tool covdata merge -i tmp/gocov-unit,tmp/gocov-integ -o tmp/gocov-merged && go tool covdata textfmt -i tmp/gocov-merged -o tmp/combined.out"
+	go tool cover -func=tmp/combined.out | grep -v "100.0%" | grep -v "^total" || true
+	@echo ""
+	go tool cover -func=tmp/combined.out | grep "^total"
 
 # complexity: fail if any function (code OR test) exceeds CYCLO_MAX cyclomatic
 # complexity. Runs inside nix-shell so gocyclo is on PATH.
