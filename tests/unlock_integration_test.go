@@ -500,9 +500,12 @@ func runUboUnlock(t *testing.T) {
 // to point there, then runs ubo as that user via runuser.
 func runUboUnlockAsUser(t *testing.T, user string) {
 	t.Helper()
-	// Create user and copy artifacts so the non-root process can read them.
+	// Install ubo in a world-accessible location (/usr/local/bin) so the
+	// non-root user can execute it. /root/ubo is not reachable (dir is 700).
+	// Also create the user, copy key artifacts, and rewrite config paths.
 	runOnClient(t, false, fmt.Sprintf(
-		"id %s 2>/dev/null || useradd -m %s && "+
+		"cp /root/ubo /usr/local/bin/ubo && chmod 755 /usr/local/bin/ubo && "+
+			"id %s 2>/dev/null || useradd -m %s && "+
 			"mkdir -p /home/%s/ubo-out && "+
 			"cp /root/ubo-out/* /home/%s/ubo-out/ && "+
 			"sed 's|/root/ubo-out|/home/%s/ubo-out|g' /root/ubo.toml > /home/%s/ubo.toml && "+
@@ -511,7 +514,7 @@ func runUboUnlockAsUser(t *testing.T, user string) {
 		user, user, user, user, user, user, user, user, user, user))
 
 	cfgPath := fmt.Sprintf("/home/%s/ubo.toml", user)
-	unlockCmd := fmt.Sprintf("runuser -u %s -- /root/ubo unlock --config %s", user, cfgPath)
+	unlockCmd := fmt.Sprintf("runuser -u %s -- /usr/local/bin/ubo unlock --config %s", user, cfgPath)
 	pushUnlockExpect(t, unlockCmd)
 	for attempt := 1; attempt <= 4; attempt++ {
 		out := runOnClient(t, true,
