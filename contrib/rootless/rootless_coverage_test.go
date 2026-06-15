@@ -2,13 +2,20 @@ package rootless
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
+	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"golang.org/x/crypto/ed25519"
+	gossh "golang.org/x/crypto/ssh"
+	"golang.zx2c4.com/wireguard/tun/netstack"
 	"ubo/internal/config"
 )
 
@@ -208,4 +215,193 @@ func genTestKey(t *testing.T) (keyPath, pubPath string) {
 		t.Skip("ssh-keygen not available")
 	}
 	return keyPath, keyPath + ".pub"
+}
+
+// newTestSSHSigner generates an ephemeral ed25519 host key and returns a Signer.
+func newTestSSHSigner(t *testing.T) gossh.Signer {
+	t.Helper()
+	_, privKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate host key: %v", err)
+	}
+	signer, err := gossh.NewSignerFromKey(privKey)
+	if err != nil {
+		t.Fatalf("make signer: %v", err)
+	}
+	return signer
+}
+
+// serveOneTestConn accepts one connection from ln, runs a minimal SSH server
+// that accepts any auth and rejects all channel requests, then closes.
+func serveOneTestConn(ln net.Listener, cfg *gossh.ServerConfig) {
+	conn, err := ln.Accept()
+	ln.Close() //nolint:errcheck
+	if err != nil {
+		return
+	}
+	sc, chans, reqs, err := gossh.NewServerConn(conn, cfg)
+	if err != nil {
+		return
+	}
+	go gossh.DiscardRequests(reqs)
+	for ch := range chans {
+		ch.Reject(gossh.Prohibited, "test server rejects all channels") //nolint:errcheck
+	}
+	sc.Close() //nolint:errcheck
+}
+
+// makeTestClient starts a minimal in-process SSH server and returns a connected
+// *gossh.Client. Uses a real TCP socket so SSH's concurrent writes don't deadlock.
+// The server rejects all channel requests, so NewSession fails — but the client
+// itself is valid for Close() and other non-session operations.
+func makeTestClient(t *testing.T) *gossh.Client {
+	t.Helper()
+	serverCfg := &gossh.ServerConfig{NoClientAuth: true}
+	serverCfg.AddHostKey(newTestSSHSigner(t))
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go serveOneTestConn(ln, serverCfg)
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial test server: %v", err)
+	}
+	sshConn, chans, reqs, err := gossh.NewClientConn(conn, ln.Addr().String(), &gossh.ClientConfig{
+		User:            "test",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		t.Skipf("in-process SSH setup failed: %v", err)
+	}
+	c := gossh.NewClient(sshConn, chans, reqs)
+	t.Cleanup(func() { c.Close() }) //nolint:errcheck
+	return c
+}
+
+// ── runUnlock seam tests ──────────────────────────────────────────────────────
+
+func TestRunUnlock_ptyError(t *testing.T) {
+	orig := runPTYFn
+	t.Cleanup(func() { runPTYFn = orig })
+	runPTYFn = func(_ *gossh.Client, _ string) error { return errors.New("pty boom") }
+
+	err := runUnlock(nil) // nil client: runPTYFn ignores it
+	if err == nil || !strings.Contains(err.Error(), "cryptroot-unlock") {
+		t.Errorf("want cryptroot-unlock error, got %v", err)
+	}
+}
+
+// ── runChangeKey seam tests ───────────────────────────────────────────────────
+
+func TestRunChangeKey_ptyError(t *testing.T) {
+	orig := runPTYFn
+	t.Cleanup(func() { runPTYFn = orig })
+	runPTYFn = func(_ *gossh.Client, _ string) error { return errors.New("pty boom") }
+
+	_, err := runChangeKey(nil, &config.Config{})
+	if err == nil || !strings.Contains(err.Error(), "luksChangeKey") {
+		t.Errorf("want luksChangeKey error, got %v", err)
+	}
+}
+
+func TestRunChangeKey_answerNo(t *testing.T) {
+	orig := runPTYFn
+	t.Cleanup(func() { runPTYFn = orig })
+	runPTYFn = func(_ *gossh.Client, _ string) error { return nil }
+
+	origStdin := stdinReader
+	t.Cleanup(func() { stdinReader = origStdin })
+	stdinReader = strings.NewReader("n\n")
+
+	proceed, err := runChangeKey(nil, &config.Config{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if proceed {
+		t.Error("answer 'n' should return proceed=false")
+	}
+}
+
+func TestRunChangeKey_answerEmpty(t *testing.T) {
+	orig := runPTYFn
+	t.Cleanup(func() { runPTYFn = orig })
+	runPTYFn = func(_ *gossh.Client, _ string) error { return nil }
+
+	origStdin := stdinReader
+	t.Cleanup(func() { stdinReader = origStdin })
+	stdinReader = strings.NewReader("\n")
+
+	proceed, err := runChangeKey(nil, &config.Config{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !proceed {
+		t.Error("empty answer should return proceed=true (default yes)")
+	}
+}
+
+// ── handleChangeAndUnlock seam tests ─────────────────────────────────────────
+
+func TestHandleChangeAndUnlock_runChangeKeyError(t *testing.T) {
+	origCK := runChangeKeyFn
+	t.Cleanup(func() { runChangeKeyFn = origCK })
+	runChangeKeyFn = func(_ *gossh.Client, _ *config.Config) (bool, error) {
+		return false, errors.New("luksChangeKey boom")
+	}
+
+	client := makeTestClient(t)
+	err := handleChangeAndUnlock(context.Background(), client, nil, netip.AddrPort{}, "", &config.Config{})
+	if err == nil || !strings.Contains(err.Error(), "luksChangeKey boom") {
+		t.Errorf("want luksChangeKey error, got %v", err)
+	}
+}
+
+func TestHandleChangeAndUnlock_proceedFalse(t *testing.T) {
+	origCK := runChangeKeyFn
+	t.Cleanup(func() { runChangeKeyFn = origCK })
+	runChangeKeyFn = func(_ *gossh.Client, _ *config.Config) (bool, error) {
+		return false, nil
+	}
+
+	client := makeTestClient(t)
+	err := handleChangeAndUnlock(context.Background(), client, nil, netip.AddrPort{}, "", &config.Config{})
+	if err != nil {
+		t.Errorf("proceed=false should return nil, got %v", err)
+	}
+}
+
+func TestHandleChangeAndUnlock_reconnectError(t *testing.T) {
+	origCK := runChangeKeyFn
+	t.Cleanup(func() { runChangeKeyFn = origCK })
+	runChangeKeyFn = func(_ *gossh.Client, _ *config.Config) (bool, error) { return true, nil }
+
+	origDial := dialSSHFn
+	t.Cleanup(func() { dialSSHFn = origDial })
+	dialSSHFn = func(_ context.Context, _ *netstack.Net, _ netip.AddrPort, _ string, _ *config.Config) (*gossh.Client, error) {
+		return nil, fmt.Errorf("reconnect dial boom")
+	}
+
+	client := makeTestClient(t)
+	err := handleChangeAndUnlock(context.Background(), client, nil, netip.AddrPort{}, "", &config.Config{})
+	if err == nil || !strings.Contains(err.Error(), "reconnect for unlock") {
+		t.Errorf("want reconnect error, got %v", err)
+	}
+}
+
+// ── performUnlock seam tests ──────────────────────────────────────────────────
+
+func TestPerformUnlock_dialError(t *testing.T) {
+	orig := dialSSHFn
+	t.Cleanup(func() { dialSSHFn = orig })
+	dialSSHFn = func(_ context.Context, _ *netstack.Net, _ netip.AddrPort, _ string, _ *config.Config) (*gossh.Client, error) {
+		return nil, fmt.Errorf("dial boom")
+	}
+
+	err := performUnlock(context.Background(), nil, netip.AddrPort{}, "", &config.Config{}, false)
+	if err == nil || !strings.Contains(err.Error(), "dial boom") {
+		t.Errorf("want dial error, got %v", err)
+	}
 }

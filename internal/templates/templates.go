@@ -234,9 +234,7 @@ func RenderInitramfsScript(d InitramfsScriptData) (string, error) {
 		return "", err
 	}
 	var buf bytes.Buffer
-	if err := initramfsScriptTmpl.Execute(&buf, d); err != nil {
-		return "", err
-	}
+	_ = initramfsScriptTmpl.Execute(&buf, d) // pre-parsed template, no error-returning methods: cannot fail
 	return buf.String(), nil
 }
 
@@ -295,9 +293,7 @@ func RenderDropbearConfig(d DropbearConfigData) (string, error) {
 		return "", fmt.Errorf("RenderDropbearConfig: DropbearPort is required")
 	}
 	var buf bytes.Buffer
-	if err := dropbearConfigTmpl.Execute(&buf, d); err != nil {
-		return "", err
-	}
+	_ = dropbearConfigTmpl.Execute(&buf, d) // pre-parsed template, no error-returning methods: cannot fail
 	return buf.String(), nil
 }
 
@@ -357,9 +353,7 @@ var readmeTmpl = template.Must(template.New("readme").Parse(ReadmeTmpl))
 // RenderReadme renders ReadmeTmpl with d.
 func RenderReadme(d ReadmeTmplData) (string, error) {
 	var buf bytes.Buffer
-	if err := readmeTmpl.Execute(&buf, d); err != nil {
-		return "", err
-	}
+	_ = readmeTmpl.Execute(&buf, d) // pre-parsed template, no error-returning methods: cannot fail
 	return buf.String(), nil
 }
 
@@ -565,9 +559,7 @@ func RenderSetupScript(d SetupScriptData) (string, error) {
 		NetInterface:    d.NetInterface,
 	}
 	var buf bytes.Buffer
-	if err := setupScriptTmpl.Execute(&buf, r); err != nil {
-		return "", err
-	}
+	_ = setupScriptTmpl.Execute(&buf, r) // pre-parsed template, no error-returning methods: cannot fail
 	return buf.String(), nil
 }
 

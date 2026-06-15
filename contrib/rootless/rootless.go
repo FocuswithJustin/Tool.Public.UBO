@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/netip"
 	"os"
 	"strings"
@@ -23,6 +24,14 @@ import (
 
 	"ubo/internal/config"
 	"ubo/internal/remote"
+)
+
+// Seams for testing — replaced in unit tests to avoid real SSH/PTY calls.
+var (
+	dialSSHFn                = dialSSH
+	runPTYFn                 = runPTY
+	runChangeKeyFn           = runChangeKey
+	stdinReader    io.Reader = os.Stdin
 )
 
 // Unlock brings up a userspace WireGuard tunnel, connects to Dropbear over it
@@ -157,7 +166,7 @@ func dialSSH(ctx context.Context, tnet *netstack.Net, addr netip.AddrPort, outpu
 // and reconnecting between the two operations so Dropbear's single-session-per-
 // connection limit is not hit), then runs cryptroot-unlock.
 func performUnlock(ctx context.Context, tnet *netstack.Net, addr netip.AddrPort, outputDir string, cfg *config.Config, changeKey bool) error {
-	client, err := dialSSH(ctx, tnet, addr, outputDir, cfg)
+	client, err := dialSSHFn(ctx, tnet, addr, outputDir, cfg)
 	if err != nil {
 		return err
 	}
@@ -173,7 +182,7 @@ func performUnlock(ctx context.Context, tnet *netstack.Net, addr netip.AddrPort,
 // required because Dropbear in initramfs only allows one active session per
 // connection; reusing the same *ssh.Client after the first session closes hangs.
 func handleChangeAndUnlock(ctx context.Context, client *ssh.Client, tnet *netstack.Net, addr netip.AddrPort, outputDir string, cfg *config.Config) error {
-	proceed, err := runChangeKey(client, cfg)
+	proceed, err := runChangeKeyFn(client, cfg)
 	client.Close() //nolint:errcheck — force-close before reconnect; caller's defer closes again harmlessly
 	if err != nil {
 		return err
@@ -182,7 +191,7 @@ func handleChangeAndUnlock(ctx context.Context, client *ssh.Client, tnet *netsta
 		return nil
 	}
 	fmt.Println("[ubo] reconnecting to Dropbear for unlock...")
-	newClient, err := dialSSH(ctx, tnet, addr, outputDir, cfg)
+	newClient, err := dialSSHFn(ctx, tnet, addr, outputDir, cfg)
 	if err != nil {
 		return fmt.Errorf("reconnect for unlock: %w", err)
 	}
@@ -193,7 +202,7 @@ func handleChangeAndUnlock(ctx context.Context, client *ssh.Client, tnet *netsta
 // runUnlock runs cryptroot-unlock interactively on an established SSH session.
 func runUnlock(client *ssh.Client) error {
 	fmt.Println("[ubo] unlocking disk (enter LUKS passphrase when prompted)...")
-	if err := runPTY(client, "cryptroot-unlock"); err != nil {
+	if err := runPTYFn(client, "cryptroot-unlock"); err != nil {
 		return fmt.Errorf("cryptroot-unlock: %w", err)
 	}
 	fmt.Println("[ubo] unlock complete")
@@ -235,14 +244,14 @@ cryptsetup luksChangeKey "$DEV"`
 // session, then prompts whether to proceed to unlock.
 func runChangeKey(client *ssh.Client, cfg *config.Config) (bool, error) {
 	fmt.Println("[ubo] changing LUKS passphrase (enter current passphrase, then new passphrase twice)...")
-	if err := runPTY(client, buildChangeLUKSCmd(cfg)); err != nil {
+	if err := runPTYFn(client, buildChangeLUKSCmd(cfg)); err != nil {
 		return false, fmt.Errorf("luksChangeKey: %w", err)
 	}
 	fmt.Print("\nChange complete. Unlock and boot now? [Y/n]: ")
 	// ReadString consumes the full line including the trailing \n so that the
 	// newline is not left in stdin and forwarded to the next PTY session as a
 	// spurious empty passphrase attempt (fmt.Scanln stops at \n without consuming it).
-	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	line, _ := bufio.NewReader(stdinReader).ReadString('\n')
 	ans := strings.TrimSpace(line)
 	return ans == "" || ans == "y" || ans == "Y", nil
 }
