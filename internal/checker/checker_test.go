@@ -195,3 +195,16 @@ func TestCheckTools_unlock_partialMissing(t *testing.T) {
 		t.Errorf("package for present tool should not appear: %q", msg)
 	}
 }
+
+func TestCheckTools_allPresent_returnNil(t *testing.T) {
+	// Replace runTools with a tool guaranteed to be on PATH so the
+	// "all tools found → return nil" branch is covered regardless of whether
+	// nix-shell tools (wg, ssh-keygen) are available.
+	orig := runTools
+	defer func() { runTools = orig }()
+	runTools = []toolDef{{"sh", "sh-pkg"}}
+
+	if err := CheckTools("run"); err != nil {
+		t.Errorf("expected nil when all tools present, got %v", err)
+	}
+}

@@ -969,11 +969,13 @@ func TestBuildSetupScriptData_validateGrubError(t *testing.T) {
 		},
 		Dropbear: config.DBConfig{Port: 22},
 	}
-	// Invalid IP → validateGrubNetFields fails.
-	netInfo := &NetworkInfo{IP: "not-an-ip", Prefix: 24, Gateway: "192.168.1.1", Interface: "eth0", Hostname: "h"}
+	// IP and Gateway must be valid (RenderInitramfsScript validates them too).
+	// Use an invalid Hostname — checked only by validateGrubNetFields — so the
+	// error is returned from exactly that branch.
+	netInfo := &NetworkInfo{IP: "192.168.1.5", Prefix: 24, Gateway: "192.168.1.1", Interface: "eth0", Hostname: "bad!host"}
 	_, err := buildSetupScriptData(cfg, validWGKeys(), netInfo)
 	if err == nil {
-		t.Error("expected validate network fields error for invalid IP")
+		t.Error("expected validate network fields error for invalid hostname")
 	}
 }
 

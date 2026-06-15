@@ -259,6 +259,36 @@ func TestGenerateAll_sshError(t *testing.T) {
 	}
 }
 
+// --- GenerateAll: full fresh generate (all three steps succeed → return &Keys{}) ---
+
+func TestGenerateAll_freshGenerate(t *testing.T) {
+	bin := fakeToolDir(t)
+	// wg genkey prints a private key; wg pubkey (reads stdin) prints a public key.
+	writeScript(t, bin, "wg", `if [ "$1" = "genkey" ]; then
+  echo "YIbRUuVmBNkRbWJAL0TaTRisBimNMRMkdHjHaJKR9Gs="
+else
+  echo "qGVoBkUNFByAaJqKPGjNBOCHqEfOmNJXLb2Sz3zMpEY="
+fi`)
+	// ssh-keygen must create the private key and .pub files at the path given by -f.
+	writeScript(t, bin, "ssh-keygen", `f=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-f" ]; then f="$2"; shift 2; else shift; fi
+done
+printf "FAKE-PRIVATE-KEY" > "$f"
+chmod 600 "$f"
+printf "ssh-ed25519 AAAA fakekey ubo-client" > "${f}.pub"`)
+	t.Setenv("PATH", bin)
+
+	dir := t.TempDir()
+	keys, err := GenerateAll(dir)
+	if err != nil {
+		t.Fatalf("GenerateAll fresh: %v", err)
+	}
+	if keys.ServerWGPrivate == "" || keys.ClientWGPrivate == "" || keys.ClientSSHKeyPath == "" {
+		t.Errorf("expected all key fields set, got %+v", keys)
+	}
+}
+
 // --- GenerateAll: loadExisting success (reuse path) -------------------------
 
 func TestGenerateAll_reuseExisting(t *testing.T) {
