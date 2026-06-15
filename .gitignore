@@ -1,3 +1,5 @@
 ubo
+ubo-rootless
 tmp/
 ubo-*/
+.claude/
