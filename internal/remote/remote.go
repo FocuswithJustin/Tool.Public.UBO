@@ -32,6 +32,11 @@ type ConnectOptions struct {
 	// non-root account that is in the sudo group (the unlock-time Dropbear
 	// session always runs as root and never needs this).
 	Sudo bool
+
+	// ProxyJump, when non-empty, is passed as -o ProxyJump=<value> to ssh.
+	// Allows reaching the target through a bastion / jump host.
+	// Format: [user@]host[:port]  (same as ssh -J)
+	ProxyJump string
 }
 
 // Client holds the connection parameters used to invoke the ssh binary. There
@@ -43,6 +48,7 @@ type Client struct {
 	keyPath      string
 	sudo         bool
 	sudoPassword string // non-empty means feed via sudo -S instead of -n
+	proxyJump    string // passed as -o ProxyJump=<value>; empty = direct
 
 	// knownHostsFile is the file passed to ssh via UserKnownHostsFile.
 	knownHostsFile string
@@ -64,11 +70,12 @@ func Connect(ctx context.Context, opts *ConnectOptions) (*Client, error) {
 	}
 
 	c := &Client{
-		host:    opts.Host,
-		port:    opts.Port,
-		user:    opts.User,
-		keyPath: opts.KeyPath,
-		sudo:    opts.Sudo,
+		host:      opts.Host,
+		port:      opts.Port,
+		user:      opts.User,
+		keyPath:   opts.KeyPath,
+		sudo:      opts.Sudo,
+		proxyJump: opts.ProxyJump,
 	}
 
 	if err := applyHostKeyMode(c, opts); err != nil {
@@ -207,6 +214,9 @@ func (c *Client) sshArgs() []string {
 	args := []string{"-p", fmt.Sprintf("%d", c.port)}
 	if c.keyPath != "" {
 		args = append(args, "-i", c.keyPath)
+	}
+	if c.proxyJump != "" {
+		args = append(args, "-o", "ProxyJump="+c.proxyJump)
 	}
 	args = append(args,
 		"-o", "BatchMode=yes",

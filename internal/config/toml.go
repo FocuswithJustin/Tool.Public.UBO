@@ -257,10 +257,11 @@ var schema = map[string]map[string]fieldSetter{
 		"host": strField(func(c *Config) *string { return &c.Host }),
 	},
 	"ssh": {
-		"user": strField(func(c *Config) *string { return &c.SSH.User }),
-		"port": intField(func(c *Config) *int { return &c.SSH.Port }),
-		"key":  strField(func(c *Config) *string { return &c.SSH.Key }),
-		"sudo": boolField(func(c *Config) *bool { return &c.SSH.Sudo }),
+		"user":       strField(func(c *Config) *string { return &c.SSH.User }),
+		"port":       intField(func(c *Config) *int { return &c.SSH.Port }),
+		"key":        strField(func(c *Config) *string { return &c.SSH.Key }),
+		"sudo":       boolField(func(c *Config) *bool { return &c.SSH.Sudo }),
+		"proxy_jump": strField(func(c *Config) *string { return &c.SSH.ProxyJump }),
 	},
 	"wireguard": {
 		"port":      intField(func(c *Config) *int { return &c.WireGuard.Port }),
@@ -313,6 +314,7 @@ func Marshal(c *Config) ([]byte, error) {
 	fmt.Fprintf(&b, "port = %d\n", c.SSH.Port)
 	fmt.Fprintf(&b, "key = %s\n", quote(c.SSH.Key))
 	fmt.Fprintf(&b, "sudo = %t\n", c.SSH.Sudo)
+	fmt.Fprintf(&b, "proxy_jump = %s\n", quote(c.SSH.ProxyJump))
 
 	b.WriteString("\n[wireguard]\n")
 	fmt.Fprintf(&b, "port = %d\n", c.WireGuard.Port)

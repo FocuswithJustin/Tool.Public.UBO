@@ -107,6 +107,10 @@ copy_exec /usr/bin/wg
 manual_add_modules wireguard
 copy_exec /usr/sbin/mdadm
 manual_add_modules md_mod raid1
+if command -v lvm >/dev/null 2>&1; then
+    copy_exec /sbin/lvm
+    manual_add_modules dm-mod
+fi
 mkdir -p "${DESTDIR}/etc/wireguard"
 cp /etc/wireguard/wg-initramfs.conf "${DESTDIR}/etc/wireguard/"
 `
@@ -135,6 +139,7 @@ type InitramfsScriptData struct {
 	VLANPhysdev string // parent NIC for VLAN (e.g. "eth0"); empty if not a VLAN
 	VLANID      int    // 802.1Q VLAN ID (0 if not a VLAN)
 	BondSlaves  string // space-separated slave NICs for bond (empty if not bond)
+	BondMode    string // bonding mode e.g. "active-backup" (empty if not bond or unknown)
 }
 
 // InitramfsScriptTmpl is the /etc/initramfs-tools/scripts/init-premount/wireguard
@@ -155,16 +160,34 @@ prereqs() { echo "$PREREQ"; }
 case "$1" in prereqs) prereqs; exit 0;; esac
 set -e
 
-{{- if .VLANPhysdev}}
+{{- if and .VLANPhysdev .BondSlaves}}
+# VLAN on top of a bond: create bond, set mode, enslave NICs, then add VLAN.
+modprobe bonding 2>/dev/null || true
+modprobe 8021q 2>/dev/null || true
+ip link add name "{{.VLANPhysdev}}" type bond 2>/dev/null || true
+{{- if .BondMode}}
+echo "{{.BondMode}}" > /sys/class/net/"{{.VLANPhysdev}}"/bonding/mode 2>/dev/null || true
+{{- end}}
+for _slave in {{.BondSlaves}}; do
+    ip link set dev "$_slave" down 2>/dev/null || true
+    ip link set dev "$_slave" master "{{.VLANPhysdev}}" 2>/dev/null || true
+done
+ip link set dev "{{.VLANPhysdev}}" up
+ip link add link "{{.VLANPhysdev}}" name "{{.Interface}}" type vlan id {{.VLANID}} 2>/dev/null || true
+IFACE="{{.Interface}}"
+{{- else if .VLANPhysdev}}
 # VLAN interface: bring up the physical NIC, then create the VLAN on top of it.
 modprobe 8021q 2>/dev/null || true
 ip link set dev "{{.VLANPhysdev}}" up
 ip link add link "{{.VLANPhysdev}}" name "{{.Interface}}" type vlan id {{.VLANID}} 2>/dev/null || true
 IFACE="{{.Interface}}"
 {{- else if .BondSlaves}}
-# Bond interface: create bond, then enslave the physical NICs.
+# Bond interface: create bond, set mode, then enslave the physical NICs.
 modprobe bonding 2>/dev/null || true
 ip link add name "{{.Interface}}" type bond 2>/dev/null || true
+{{- if .BondMode}}
+echo "{{.BondMode}}" > /sys/class/net/"{{.Interface}}"/bonding/mode 2>/dev/null || true
+{{- end}}
 for _slave in {{.BondSlaves}}; do
     ip link set dev "$_slave" down 2>/dev/null || true
     ip link set dev "$_slave" master "{{.Interface}}" 2>/dev/null || true
@@ -390,6 +413,31 @@ set -e
 echo "[ubo-setup] step 2/11: installing packages" >&2
 DEBIAN_FRONTEND=noninteractive apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dropbear-initramfs wireguard-tools mdadm
+
+# ── Step 2b: Preflight checks ────────────────────────────────────────────────
+# Abort if /boot is on an encrypted volume: the initramfs would embed the WireGuard
+# private key inside the very image that can't be read without unlocking first.
+_boot_dev=$(df /boot 2>/dev/null | awk 'NR==2{print $1}')
+if [ -n "$_boot_dev" ] && cryptsetup isLuks "$_boot_dev" 2>/dev/null; then
+    echo "[ubo-setup] ERROR: /boot is on an encrypted device ($boot_dev); cannot embed keys in initramfs" >&2
+    exit 1
+fi
+
+# Warn if Secure Boot is enabled — our initramfs hook is unsigned.
+if [ -d /sys/firmware/efi/efivars ]; then
+    _sb_file=$(ls /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | head -1)
+    if [ -n "$_sb_file" ]; then
+        _sb=$(od -An -j4 -N1 -t u1 < "$_sb_file" 2>/dev/null | tr -d ' \n')
+        if [ "$_sb" = "1" ]; then
+            echo "[ubo-setup] WARNING: Secure Boot is enabled; the initramfs WireGuard hook is unsigned and may be blocked at boot" >&2
+        fi
+    fi
+fi
+
+# Warn if the WireGuard kernel module is not available.
+if ! modinfo wireguard >/dev/null 2>&1; then
+    echo "[ubo-setup] WARNING: wireguard kernel module not found; ensure linux-headers or linux-image-extra is installed" >&2
+fi
 
 # ── Step 3: Detect dropbear path and regenerate host key ─────────────────────
 echo "[ubo-setup] step 3/11: generating dropbear host key" >&2

@@ -196,7 +196,12 @@ if [ -f /etc/crypttab ]; then
     esac
 fi
 if [ -z "$DEV" ]; then
-    DEV=$(blkid -t TYPE=crypto_LUKS -o device 2>/dev/null | head -1)
+    _ALL=$(blkid -t TYPE=crypto_LUKS -o device 2>/dev/null)
+    _COUNT=$(printf '%s\n' "$_ALL" | grep -c . 2>/dev/null || echo 0)
+    DEV=$(printf '%s\n' "$_ALL" | head -1)
+    if [ "$_COUNT" -gt 1 ]; then
+        echo "[ubo] WARNING: multiple LUKS devices found; using $DEV (set luks.device in config to be explicit)" >&2
+    fi
 fi
 test -n "$DEV" || { echo "could not determine LUKS device; set luks.device in config" >&2; exit 1; }
 cryptsetup luksChangeKey "$DEV"`
@@ -236,6 +241,7 @@ func changeKeyDirectSSH(ctx context.Context, cfg *config.Config, outputDir strin
 		User:           sshUser(cfg),
 		KeyPath:        cfg.SSH.Key,
 		KnownHostsPath: outputDir + "/known_hosts",
+		ProxyJump:      cfg.SSH.ProxyJump,
 	})
 	if err != nil {
 		return fmt.Errorf("direct SSH: %w", err)
@@ -365,4 +371,3 @@ func b64ToHex(b64key string) (string, error) {
 	}
 	return hex.EncodeToString(raw), nil
 }
-

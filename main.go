@@ -258,6 +258,7 @@ func connectForRun(ctx context.Context, cfg *config.Config, outDir string) (*rem
 		KeyPath:        cfg.SSH.Key,
 		KnownHostsPath: filepath.Join(outDir, "ssh_known_hosts"),
 		Sudo:           cfg.SSH.Sudo,
+		ProxyJump:      cfg.SSH.ProxyJump,
 	})
 	if err != nil {
 		return nil, err

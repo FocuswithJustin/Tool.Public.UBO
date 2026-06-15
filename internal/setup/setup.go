@@ -55,6 +55,7 @@ type NetworkInfo struct {
 	VLANPhysdev string   // parent NIC if Interface is a VLAN (empty if not VLAN)
 	VLANID      int      // 802.1Q VLAN ID (0 if not a VLAN)
 	BondSlaves  []string // slave NICs for a bond interface (nil if not bond)
+	BondMode    string   // bonding mode, e.g. "active-backup" (empty if not bond)
 	BridgePorts []string // bridge port NICs (nil if not bridge)
 }
 
@@ -123,6 +124,7 @@ func buildSetupScriptData(cfg *config.Config, keys *keygen.Keys, netInfo *Networ
 		VLANPhysdev: netInfo.VLANPhysdev,
 		VLANID:      netInfo.VLANID,
 		BondSlaves:  strings.Join(netInfo.BondSlaves, " "),
+		BondMode:    netInfo.BondMode,
 	})
 	if err != nil {
 		return templates.SetupScriptData{}, fmt.Errorf("render initramfs script: %w", err)
@@ -426,6 +428,8 @@ func detectHostname(ctx context.Context, client *remote.Client, info *NetworkInf
 func detectInterfaceTopology(ctx context.Context, client *remote.Client, info *NetworkInfo) {
 	detectVLAN(ctx, client, info)
 	detectBond(ctx, client, info)
+	detectBondMode(ctx, client, info)
+	detectVLANBond(ctx, client, info)
 	detectBridge(ctx, client, info)
 }
 
@@ -473,6 +477,38 @@ func detectBond(ctx context.Context, client *remote.Client, info *NetworkInfo) {
 	}
 }
 
+// detectBondMode reads the bonding mode from sysfs and fills info.BondMode
+// (e.g. "active-backup"). Only runs when info.BondSlaves is non-empty.
+func detectBondMode(ctx context.Context, client *remote.Client, info *NetworkInfo) {
+	if len(info.BondSlaves) == 0 {
+		return
+	}
+	out, err := runCommand(ctx, client, "cat /sys/class/net/"+info.Interface+"/bonding/mode 2>/dev/null")
+	if err != nil {
+		return
+	}
+	// sysfs output is "mode-name N", e.g. "active-backup 1"; take first word.
+	if f := strings.Fields(strings.TrimSpace(out)); len(f) > 0 {
+		info.BondMode = f[0]
+	}
+}
+
+// detectVLANBond checks whether the VLAN's parent device is itself a bond.
+// If so, it copies the bond slaves and mode from the parent into info so that
+// the initramfs script can set up bond→VLAN stacking.
+func detectVLANBond(ctx context.Context, client *remote.Client, info *NetworkInfo) {
+	if info.VLANPhysdev == "" {
+		return
+	}
+	physInfo := &NetworkInfo{Interface: info.VLANPhysdev}
+	detectBond(ctx, client, physInfo)
+	detectBondMode(ctx, client, physInfo)
+	if len(physInfo.BondSlaves) > 0 {
+		info.BondSlaves = physInfo.BondSlaves
+		info.BondMode = physInfo.BondMode
+	}
+}
+
 // detectBridge checks whether the interface is a bridge and fills
 // info.BridgePorts with the port interface names when it is.
 func detectBridge(ctx context.Context, client *remote.Client, info *NetworkInfo) {
@@ -492,7 +528,11 @@ func logTopology(info *NetworkInfo) {
 		fmt.Printf("[ubo]   VLAN id=%d physdev=%s\n", info.VLANID, info.VLANPhysdev)
 	}
 	if len(info.BondSlaves) > 0 {
-		fmt.Printf("[ubo]   bond slaves=%s\n", strings.Join(info.BondSlaves, ","))
+		mode := info.BondMode
+		if mode == "" {
+			mode = "unknown"
+		}
+		fmt.Printf("[ubo]   bond mode=%s slaves=%s\n", mode, strings.Join(info.BondSlaves, ","))
 	}
 	if len(info.BridgePorts) > 0 {
 		fmt.Printf("[ubo]   bridge ports=%s\n", strings.Join(info.BridgePorts, ","))

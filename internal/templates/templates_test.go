@@ -291,6 +291,63 @@ func TestRenderInitramfsScript_Bond(t *testing.T) {
 	}
 }
 
+func TestRenderInitramfsScript_BondWithMode(t *testing.T) {
+	d := validScriptData()
+	d.BondSlaves = "eth0 eth1"
+	d.BondMode = "active-backup"
+	d.Interface = "bond0"
+	got, err := RenderInitramfsScript(d)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(got, `echo "active-backup"`) {
+		t.Errorf("bond mode not set in script, got:\n%s", got)
+	}
+	if !strings.Contains(got, `/sys/class/net/"bond0"/bonding/mode`) {
+		t.Errorf("bond mode write path missing, got:\n%s", got)
+	}
+}
+
+func TestRenderInitramfsScript_VLANOnBond(t *testing.T) {
+	d := validScriptData()
+	d.VLANPhysdev = "bond0"
+	d.VLANID = 100
+	d.Interface = "bond0.100"
+	d.BondSlaves = "eth0 eth1"
+	d.BondMode = "active-backup"
+	got, err := RenderInitramfsScript(d)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, want := range []string{
+		"modprobe bonding",
+		"modprobe 8021q",
+		`ip link add name "bond0" type bond`,
+		`echo "active-backup"`,
+		`master "bond0"`,
+		`ip link set dev "bond0" up`,
+		`ip link add link "bond0" name "bond0.100" type vlan id 100`,
+		`IFACE="bond0.100"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("VLAN-on-bond script missing %q\ngot:\n%s", want, got)
+		}
+	}
+	// Must NOT hit the plain-NIC /sys/class/net discovery loop.
+	if strings.Contains(got, "/sys/class/net/*") {
+		t.Error("VLAN-on-bond script must not use /sys/class/net/* fallback loop")
+	}
+}
+
+func TestInitramfsHookTmpl_LVM(t *testing.T) {
+	if !strings.Contains(InitramfsHookTmpl, "lvm") {
+		t.Error("hook template missing LVM support")
+	}
+	if !strings.Contains(InitramfsHookTmpl, "dm-mod") {
+		t.Error("hook template missing dm-mod module")
+	}
+}
+
 func TestRenderSetupScript_SystemdBootSection(t *testing.T) {
 	// Verify the setup script contains the systemd-boot detection block.
 	d := fullSetupScriptData()
@@ -305,6 +362,25 @@ func TestRenderSetupScript_SystemdBootSection(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("setup script missing %q", want)
+		}
+	}
+}
+
+func TestRenderSetupScript_PreflightChecks(t *testing.T) {
+	d := fullSetupScriptData()
+	got, err := RenderSetupScript(d)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, want := range []string{
+		"cryptsetup isLuks",
+		"SecureBoot",
+		"Secure Boot is enabled",
+		"wireguard kernel module not found",
+		"modinfo wireguard",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("setup script missing preflight check for %q", want)
 		}
 	}
 }

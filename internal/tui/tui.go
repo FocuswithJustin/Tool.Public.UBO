@@ -51,6 +51,11 @@ var fields = []fieldDef{
 		setValue: func(c *config.Config, v string) { c.SSH.Key = v },
 	},
 	{
+		label:    "SSH ProxyJump",
+		getValue: func(c *config.Config) string { return c.SSH.ProxyJump },
+		setValue: func(c *config.Config, v string) { c.SSH.ProxyJump = v },
+	},
+	{
 		label: "WireGuard Port", isInt: true,
 		getValue: func(c *config.Config) string { return strconv.Itoa(c.WireGuard.Port) },
 		setValue: func(c *config.Config, v string) { c.WireGuard.Port, _ = strconv.Atoi(v) },

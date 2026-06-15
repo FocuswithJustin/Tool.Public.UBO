@@ -54,15 +54,16 @@ func TestEdit_FullScript(t *testing.T) {
 	cfg := config.Default()
 	cfg.Host = "192.168.1.100"
 
-	// Field order: Host, SSH User, SSH Port, SSH Key Path, WireGuard Port,
-	// WG Server IP, WG Client IP, Dropbear Port, Output Dir, Network Interface,
-	// Network IP, LUKS Device.
+	// Field order: Host, SSH User, SSH Port, SSH Key Path, SSH ProxyJump,
+	// WireGuard Port, WG Server IP, WG Client IP, Dropbear Port, Output Dir,
+	// Network Interface, Network IP, LUKS Device.
 	script := strings.Join([]string{
 		"",         // Host: keep 192.168.1.100
 		"admin",    // SSH User: change
 		"abc",      // SSH Port: invalid -> re-prompt
 		"2222",     // SSH Port: valid
 		"",         // SSH Key Path: keep
+		"",         // SSH ProxyJump: keep
 		"51999",    // WireGuard Port: change
 		"",         // WG Server IP: keep
 		"",         // WG Client IP: keep
@@ -276,18 +277,19 @@ func TestRun_LoadErrorOnMalformedFile(t *testing.T) {
 func TestEdit_AllFieldsSet(t *testing.T) {
 	cfg := config.Default()
 	script := strings.Join([]string{
-		"1.2.3.4",     // Host
-		"admin",       // SSH User
-		"2200",        // SSH Port
-		"/k",          // SSH Key Path
-		"51000",       // WireGuard Port
-		"10.9.0.1/24", // WG Server IP
-		"10.9.0.2/32", // WG Client IP
-		"2201",        // Dropbear Port
-		"/out",        // Output Dir
-		"eth9",        // Network Interface
-		"10.9.0.3/24", // Network IP
-		"/dev/sdz1",   // LUKS Device
+		"1.2.3.4",         // Host
+		"admin",           // SSH User
+		"2200",            // SSH Port
+		"/k",              // SSH Key Path
+		"user@bastion:22", // SSH ProxyJump
+		"51000",           // WireGuard Port
+		"10.9.0.1/24",     // WG Server IP
+		"10.9.0.2/32",     // WG Client IP
+		"2201",            // Dropbear Port
+		"/out",            // Output Dir
+		"eth9",            // Network Interface
+		"10.9.0.3/24",     // Network IP
+		"/dev/sdz1",       // LUKS Device
 	}, "\n") + "\n"
 
 	var out bytes.Buffer
@@ -299,6 +301,7 @@ func TestEdit_AllFieldsSet(t *testing.T) {
 		{"Host", got.Host, "1.2.3.4"},
 		{"SSH.User", got.SSH.User, "admin"},
 		{"SSH.Key", got.SSH.Key, "/k"},
+		{"SSH.ProxyJump", got.SSH.ProxyJump, "user@bastion:22"},
 		{"WireGuard.ServerIP", got.WireGuard.ServerIP, "10.9.0.1/24"},
 		{"WireGuard.ClientIP", got.WireGuard.ClientIP, "10.9.0.2/32"},
 		{"Output.Dir", got.Output.Dir, "/out"},

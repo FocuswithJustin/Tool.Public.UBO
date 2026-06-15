@@ -20,10 +20,11 @@ type Config struct {
 }
 
 type SSHConfig struct {
-	User string `toml:"user"`
-	Port int    `toml:"port"`
-	Key  string `toml:"key"`
-	Sudo bool   `toml:"sudo"`
+	User      string `toml:"user"`
+	Port      int    `toml:"port"`
+	Key       string `toml:"key"`
+	Sudo      bool   `toml:"sudo"`
+	ProxyJump string `toml:"proxy_jump"` // e.g. "user@bastion:22"; empty = direct connection
 }
 
 type WGConfig struct {
@@ -213,8 +214,9 @@ host = "192.168.1.100"
 [ssh]
 user = "root"
 port = 22
-key  = ""   # path to SSH private key; empty = use agent / default keys
-sudo = false   # true = run remote setup via passwordless sudo (for non-root sudo-group users)
+key        = ""   # path to SSH private key; empty = use agent / default keys
+sudo       = false   # true = run remote setup via passwordless sudo (for non-root sudo-group users)
+proxy_jump = ""   # SSH jump host, e.g. "user@bastion:22"; empty = direct connection
 
 [wireguard]
 port      = 51820
