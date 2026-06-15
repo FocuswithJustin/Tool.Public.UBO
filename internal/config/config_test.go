@@ -369,3 +369,19 @@ func TestOutputDir_colonInHost(t *testing.T) {
 		t.Errorf("OutputDir() = %q; should not contain brackets", got)
 	}
 }
+
+func TestValidateTunnelTopology_badServerCIDR(t *testing.T) {
+	c := Default()
+	c.WireGuard.ServerIP = "not-a-cidr"
+	if err := validateTunnelTopology(c); err == nil {
+		t.Error("expected error for invalid server CIDR")
+	}
+}
+
+func TestValidateTunnelTopology_badClientCIDR(t *testing.T) {
+	c := Default()
+	c.WireGuard.ClientIP = "not-a-cidr"
+	if err := validateTunnelTopology(c); err == nil {
+		t.Error("expected error for invalid client CIDR")
+	}
+}

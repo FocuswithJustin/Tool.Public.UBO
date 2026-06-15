@@ -247,6 +247,9 @@ func runChangeKey(client *ssh.Client, cfg *config.Config) (bool, error) {
 	return ans == "" || ans == "y" || ans == "Y", nil
 }
 
+// changeKeyDirectSSHFn is a seam for testing.
+var changeKeyDirectSSHFn = changeKeyDirectSSH
+
 // handleTunnelFailure is called when the WireGuard/Dropbear tunnel is not
 // reachable. For plain unlock it surfaces the error. For key-change it falls
 // back to a direct SSH connection (the system is already running).
@@ -255,7 +258,7 @@ func handleTunnelFailure(ctx context.Context, cfg *config.Config, outputDir stri
 		return tunnelErr
 	}
 	fmt.Println("[ubo] initramfs not reachable; trying direct SSH for LUKS key change...")
-	return changeKeyDirectSSH(ctx, cfg, outputDir)
+	return changeKeyDirectSSHFn(ctx, cfg, outputDir)
 }
 
 // changeKeyDirectSSH connects to the running system via regular SSH and runs

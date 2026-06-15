@@ -804,3 +804,227 @@ func TestConfigure_pinnedKeyWriteError(t *testing.T) {
 		t.Fatalf("expected save key error, got %v", err)
 	}
 }
+
+// ── logTopology branches ──────────────────────────────────────────────────────
+
+func TestLogTopology_VLANOnly(t *testing.T) {
+	logTopology(&NetworkInfo{VLANPhysdev: "eth0", VLANID: 100})
+}
+
+func TestLogTopology_BondWithMode(t *testing.T) {
+	logTopology(&NetworkInfo{BondSlaves: []string{"eth0", "eth1"}, BondMode: "active-backup"})
+}
+
+func TestLogTopology_BondUnknownMode(t *testing.T) {
+	logTopology(&NetworkInfo{BondSlaves: []string{"eth0"}, BondMode: ""})
+}
+
+func TestLogTopology_Bridge(t *testing.T) {
+	logTopology(&NetworkInfo{BridgePorts: []string{"eth0", "eth1"}})
+}
+
+// ── firstInetAddr — invalid CIDR hits continue ────────────────────────────────
+
+func TestFirstInetAddr_invalidCIDR(t *testing.T) {
+	ip, prefix := firstInetAddr("    inet 0.0.0.0/33 scope global")
+	if ip != "" || prefix != 0 {
+		t.Errorf("firstInetAddr(invalid CIDR) = %q, %d; want empty, 0", ip, prefix)
+	}
+}
+
+// ── fillIPFromAddr uncovered paths ────────────────────────────────────────────
+
+func TestFillIPFromAddr_emptyInterface(t *testing.T) {
+	f := &fakeRemote{}
+	defer f.install()()
+	info := &NetworkInfo{Interface: ""}
+	fillIPFromAddr(context.Background(), nil, info)
+	if info.IP != "" {
+		t.Errorf("IP should stay empty with no interface, got %q", info.IP)
+	}
+}
+
+func TestFillIPFromAddr_commandError(t *testing.T) {
+	f := &fakeRemote{runDefault: cmdResult{err: errBoom}}
+	defer f.install()()
+	info := &NetworkInfo{Interface: "eth0"}
+	fillIPFromAddr(context.Background(), nil, info)
+	if info.IP != "" {
+		t.Errorf("IP should stay empty on command error, got %q", info.IP)
+	}
+}
+
+// ── topology detection error paths ───────────────────────────────────────────
+
+func TestDetectVLAN_commandError(t *testing.T) {
+	f := &fakeRemote{runDefault: cmdResult{err: errBoom}}
+	defer f.install()()
+	info := &NetworkInfo{Interface: "eth0"}
+	detectVLAN(context.Background(), nil, info)
+	if info.VLANPhysdev != "" {
+		t.Error("VLANPhysdev should be empty on error")
+	}
+}
+
+func TestDetectBond_commandError(t *testing.T) {
+	f := &fakeRemote{runDefault: cmdResult{err: errBoom}}
+	defer f.install()()
+	info := &NetworkInfo{Interface: "eth0"}
+	detectBond(context.Background(), nil, info)
+	if len(info.BondSlaves) != 0 {
+		t.Error("BondSlaves should be empty on error")
+	}
+}
+
+func TestDetectBondMode_commandError(t *testing.T) {
+	f := &fakeRemote{runDefault: cmdResult{err: errBoom}}
+	defer f.install()()
+	info := &NetworkInfo{Interface: "bond0", BondSlaves: []string{"eth0"}}
+	detectBondMode(context.Background(), nil, info)
+	if info.BondMode != "" {
+		t.Error("BondMode should be empty on error")
+	}
+}
+
+func TestDetectBridge_commandError(t *testing.T) {
+	f := &fakeRemote{runDefault: cmdResult{err: errBoom}}
+	defer f.install()()
+	info := &NetworkInfo{Interface: "br0"}
+	detectBridge(context.Background(), nil, info)
+	if len(info.BridgePorts) != 0 {
+		t.Error("BridgePorts should be empty on error")
+	}
+}
+
+func TestDetectBond_emptyOutput(t *testing.T) {
+	f := &fakeRemote{runDefault: cmdResult{out: ""}}
+	defer f.install()()
+	info := &NetworkInfo{Interface: "eth0"}
+	detectBond(context.Background(), nil, info)
+	if len(info.BondSlaves) != 0 {
+		t.Error("BondSlaves should be empty for empty output")
+	}
+}
+
+func TestDetectBridge_emptyOutput(t *testing.T) {
+	f := &fakeRemote{runDefault: cmdResult{out: ""}}
+	defer f.install()()
+	info := &NetworkInfo{Interface: "br0"}
+	detectBridge(context.Background(), nil, info)
+	if len(info.BridgePorts) != 0 {
+		t.Error("BridgePorts should be empty for empty output")
+	}
+}
+
+// ── buildSetupScriptData error from renderWGConfig ───────────────────────────
+
+func TestBuildSetupScriptData_renderWGError(t *testing.T) {
+	cfg := &config.Config{
+		WireGuard: config.WGConfig{ServerIP: "10.42.0.1/24", ClientIP: "10.42.0.2/32"},
+		Dropbear:  config.DBConfig{Port: 22},
+	}
+	keys := &keygen.Keys{} // empty keys → MarshalINI fails
+	netInfo := &NetworkInfo{IP: "192.168.1.1", Prefix: 24, Gateway: "192.168.1.1", Interface: "eth0", Hostname: "h"}
+	_, err := buildSetupScriptData(cfg, keys, netInfo)
+	if err == nil {
+		t.Error("expected error from empty WireGuard keys")
+	}
+}
+
+// ── buildSetupScriptData: render initramfs script error ──────────────────────
+
+// validWGKeys returns the minimum key material that passes renderWGConfig.
+func validWGKeys() *keygen.Keys {
+	return &keygen.Keys{
+		ServerWGPrivate: "serverpriv",
+		ServerWGPublic:  "serverpub",
+		ClientWGPrivate: "clientpriv",
+		ClientWGPublic:  "clientpub",
+	}
+}
+
+func TestBuildSetupScriptData_renderInitramfsError(t *testing.T) {
+	cfg := &config.Config{
+		WireGuard: config.WGConfig{
+			Port:     51820,
+			ServerIP: "10.42.0.1/24",
+			ClientIP: "10.42.0.2/32",
+		},
+		Dropbear: config.DBConfig{Port: 22},
+	}
+	// GatewayIP empty → RenderInitramfsScript fails.
+	netInfo := &NetworkInfo{IP: "192.168.1.1", Prefix: 24, Gateway: "", Interface: "eth0", Hostname: "h"}
+	_, err := buildSetupScriptData(cfg, validWGKeys(), netInfo)
+	if err == nil {
+		t.Error("expected render initramfs script error for empty Gateway")
+	}
+}
+
+func TestBuildSetupScriptData_validateGrubError(t *testing.T) {
+	cfg := &config.Config{
+		WireGuard: config.WGConfig{
+			Port:     51820,
+			ServerIP: "10.42.0.1/24",
+			ClientIP: "10.42.0.2/32",
+		},
+		Dropbear: config.DBConfig{Port: 22},
+	}
+	// Invalid IP → validateGrubNetFields fails.
+	netInfo := &NetworkInfo{IP: "not-an-ip", Prefix: 24, Gateway: "192.168.1.1", Interface: "eth0", Hostname: "h"}
+	_, err := buildSetupScriptData(cfg, validWGKeys(), netInfo)
+	if err == nil {
+		t.Error("expected validate network fields error for invalid IP")
+	}
+}
+
+// ── runSetupScript error/success paths ───────────────────────────────────────
+
+func TestRunSetupScript_uploadError(t *testing.T) {
+	f := &fakeRemote{writeErrs: map[string]error{"/tmp/ubo-setup.sh": errBoom}}
+	defer f.install()()
+	_, err := runSetupScript(context.Background(), nil, "#!/bin/sh\necho hi")
+	if err == nil || !strings.Contains(err.Error(), "upload setup script") {
+		t.Errorf("expected upload error, got %v", err)
+	}
+}
+
+func TestRunSetupScript_runError(t *testing.T) {
+	f := &fakeRemote{runDefault: cmdResult{err: errBoom}}
+	defer f.install()()
+	_, err := runSetupScript(context.Background(), nil, "#!/bin/sh\necho hi")
+	if err == nil || !strings.Contains(err.Error(), "run setup script") {
+		t.Errorf("expected run error, got %v", err)
+	}
+}
+
+func TestRunSetupScript_success(t *testing.T) {
+	f := &fakeRemote{
+		runResponses: map[string]cmdResult{
+			"sh /tmp/ubo-setup.sh": {out: `{"dropbear_pub_key":"ssh-ed25519 AAAA"}`},
+		},
+	}
+	defer f.install()()
+	out, err := runSetupScript(context.Background(), nil, "#!/bin/sh\necho hi")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out, "dropbear_pub_key") {
+		t.Errorf("output = %q; want JSON result", out)
+	}
+}
+
+func TestBuildSetupScriptData_renderDropbearError(t *testing.T) {
+	cfg := &config.Config{
+		WireGuard: config.WGConfig{
+			Port:     51820,
+			ServerIP: "10.42.0.1/24",
+			ClientIP: "10.42.0.2/32",
+		},
+		Dropbear: config.DBConfig{Port: 0}, // 0 → RenderDropbearConfig fails
+	}
+	netInfo := &NetworkInfo{IP: "192.168.1.1", Prefix: 24, Gateway: "192.168.1.1", Interface: "eth0", Hostname: "h"}
+	_, err := buildSetupScriptData(cfg, validWGKeys(), netInfo)
+	if err == nil {
+		t.Error("expected render dropbear config error for Port=0")
+	}
+}

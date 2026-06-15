@@ -1,0 +1,211 @@
+package rootless
+
+import (
+	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"ubo/internal/config"
+)
+
+// ── sshPort ───────────────────────────────────────────────────────────────────
+
+func TestSSHPort_default(t *testing.T) {
+	cfg := &config.Config{}
+	if got := sshPort(cfg); got != 22 {
+		t.Errorf("sshPort(zero) = %d; want 22", got)
+	}
+}
+
+func TestSSHPort_custom(t *testing.T) {
+	cfg := &config.Config{SSH: config.SSHConfig{Port: 2222}}
+	if got := sshPort(cfg); got != 2222 {
+		t.Errorf("sshPort(2222) = %d; want 2222", got)
+	}
+}
+
+// ── sshUser ───────────────────────────────────────────────────────────────────
+
+func TestSSHUser_default(t *testing.T) {
+	cfg := &config.Config{}
+	if got := sshUser(cfg); got != "root" {
+		t.Errorf("sshUser(empty) = %q; want root", got)
+	}
+}
+
+func TestSSHUser_custom(t *testing.T) {
+	cfg := &config.Config{SSH: config.SSHConfig{User: "admin"}}
+	if got := sshUser(cfg); got != "admin" {
+		t.Errorf("sshUser(admin) = %q; want admin", got)
+	}
+}
+
+// ── parseFirstAddr ────────────────────────────────────────────────────────────
+
+func TestParseFirstAddr_validCIDR(t *testing.T) {
+	addr, err := parseFirstAddr("10.42.0.2/32")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if addr.String() != "10.42.0.2" {
+		t.Errorf("parseFirstAddr(CIDR) = %q; want 10.42.0.2", addr.String())
+	}
+}
+
+func TestParseFirstAddr_bareIP(t *testing.T) {
+	addr, err := parseFirstAddr("10.42.0.2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if addr.String() != "10.42.0.2" {
+		t.Errorf("parseFirstAddr(bare IP) = %q; want 10.42.0.2", addr.String())
+	}
+}
+
+func TestParseFirstAddr_invalid(t *testing.T) {
+	if _, err := parseFirstAddr("not-an-ip"); err == nil {
+		t.Error("expected error for invalid address")
+	}
+}
+
+// ── loadSSHKey ────────────────────────────────────────────────────────────────
+
+func TestLoadSSHKey_missingFile(t *testing.T) {
+	if _, err := loadSSHKey(filepath.Join(t.TempDir(), "no_such_key")); err == nil {
+		t.Error("expected error for missing file")
+	}
+}
+
+func TestLoadSSHKey_invalidData(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "bad_key")
+	if err := os.WriteFile(p, []byte("this is not a key"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadSSHKey(p); err == nil {
+		t.Error("expected error for invalid key data")
+	}
+}
+
+func TestLoadSSHKey_validKey(t *testing.T) {
+	keyPath, _ := genTestKey(t)
+	if _, err := loadSSHKey(keyPath); err != nil {
+		t.Fatalf("loadSSHKey valid key: %v", err)
+	}
+}
+
+// ── loadPinnedKey ─────────────────────────────────────────────────────────────
+
+func TestLoadPinnedKey_missingFile(t *testing.T) {
+	if _, err := loadPinnedKey(filepath.Join(t.TempDir(), "no_such.pub")); err == nil {
+		t.Error("expected error for missing file")
+	}
+}
+
+func TestLoadPinnedKey_invalidData(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "bad.pub")
+	if err := os.WriteFile(p, []byte("not a public key"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPinnedKey(p); err == nil {
+		t.Error("expected error for invalid pub key data")
+	}
+}
+
+func TestLoadPinnedKey_validKey(t *testing.T) {
+	_, pubPath := genTestKey(t)
+	if _, err := loadPinnedKey(pubPath); err != nil {
+		t.Fatalf("loadPinnedKey valid pub: %v", err)
+	}
+}
+
+// ── buildIPC ──────────────────────────────────────────────────────────────────
+
+func TestBuildIPC_valid(t *testing.T) {
+	wgCfg := &wgClientConfig{
+		PrivateKey: "YIbRUuVmBNkRbWJAL0TaTRisBimNMRMkdHjHaJKR9Gs=",
+		PeerPubKey: "qGVoBkUNFByAaJqKPGjNBOCHqEfOmNJXLb2Sz3zMpEY=",
+		Endpoint:   "1.2.3.4:51820",
+		AllowedIPs: "10.42.0.1/32",
+	}
+	ipc, err := buildIPC(wgCfg)
+	if err != nil {
+		t.Fatalf("buildIPC: %v", err)
+	}
+	for _, want := range []string{"private_key=", "public_key=", "endpoint=1.2.3.4:51820", "allowed_ip=10.42.0.1/32"} {
+		if !strings.Contains(ipc, want) {
+			t.Errorf("buildIPC output missing %q\ngot:\n%s", want, ipc)
+		}
+	}
+}
+
+func TestBuildIPC_badPrivateKey(t *testing.T) {
+	wgCfg := &wgClientConfig{
+		PrivateKey: "!!!invalid-base64",
+		PeerPubKey: "qGVoBkUNFByAaJqKPGjNBOCHqEfOmNJXLb2Sz3zMpEY=",
+		Endpoint:   "1.2.3.4:51820",
+		AllowedIPs: "10.42.0.1/32",
+	}
+	if _, err := buildIPC(wgCfg); err == nil {
+		t.Error("expected error for invalid private key base64")
+	}
+}
+
+func TestBuildIPC_badPeerPubKey(t *testing.T) {
+	wgCfg := &wgClientConfig{
+		PrivateKey: "YIbRUuVmBNkRbWJAL0TaTRisBimNMRMkdHjHaJKR9Gs=",
+		PeerPubKey: "!!!invalid-base64",
+		Endpoint:   "1.2.3.4:51820",
+		AllowedIPs: "10.42.0.1/32",
+	}
+	if _, err := buildIPC(wgCfg); err == nil {
+		t.Error("expected error for invalid peer public key base64")
+	}
+}
+
+// ── handleTunnelFailure ───────────────────────────────────────────────────────
+
+func TestHandleTunnelFailure_changeKeyFalse(t *testing.T) {
+	sentinel := errors.New("tunnel down")
+	err := handleTunnelFailure(context.Background(), &config.Config{}, "/tmp/out", false, sentinel)
+	if err != sentinel {
+		t.Errorf("handleTunnelFailure(changeKey=false) = %v; want sentinel error", err)
+	}
+}
+
+func TestHandleTunnelFailure_changeKeyTrue(t *testing.T) {
+	orig := changeKeyDirectSSHFn
+	t.Cleanup(func() { changeKeyDirectSSHFn = orig })
+
+	called := false
+	changeKeyDirectSSHFn = func(_ context.Context, _ *config.Config, _ string) error {
+		called = true
+		return nil
+	}
+
+	err := handleTunnelFailure(context.Background(), &config.Config{}, "/tmp/out", true, errors.New("tunnel"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !called {
+		t.Error("changeKeyDirectSSHFn was not called when changeKey=true")
+	}
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+// genTestKey generates an ed25519 key pair in a temp dir and returns the
+// private key path and public key path. Skips if ssh-keygen is unavailable.
+func genTestKey(t *testing.T) (keyPath, pubPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	keyPath = filepath.Join(dir, "test_key")
+	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-f", keyPath, "-N", "", "-C", "test")
+	if err := cmd.Run(); err != nil {
+		t.Skip("ssh-keygen not available")
+	}
+	return keyPath, keyPath + ".pub"
+}

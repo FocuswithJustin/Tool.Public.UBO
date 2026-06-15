@@ -1200,3 +1200,47 @@ func TestWaitForTunnel_loopback(t *testing.T) {
 	// timeout error. Both are valid depending on environment ping permissions.
 	_ = waitForTunnel("127.0.0.1", 1)
 }
+
+// --- wgEndpoint -------------------------------------------------------------
+
+func TestWgEndpoint_ipv4(t *testing.T) {
+	got := wgEndpoint("1.2.3.4", 51820)
+	if got != "1.2.3.4:51820" {
+		t.Errorf("wgEndpoint(ipv4) = %q; want 1.2.3.4:51820", got)
+	}
+}
+
+func TestWgEndpoint_ipv6(t *testing.T) {
+	got := wgEndpoint("2001:db8::1", 51820)
+	if got != "[2001:db8::1]:51820" {
+		t.Errorf("wgEndpoint(ipv6) = %q; want [2001:db8::1]:51820", got)
+	}
+}
+
+// --- connectForRun ----------------------------------------------------------
+
+func TestConnectForRun_ensureSudoFails(t *testing.T) {
+	setSudoSeams(t)
+	setRunSeams(t)
+	remoteConnect = func(ctx context.Context, opts *remote.ConnectOptions) (*remote.Client, error) {
+		return &remote.Client{}, nil
+	}
+	// sudo=true + probe fails + readSudoPassword fails -> ensureSudo returns error
+	sudoProbe = func(ctx context.Context, c *remote.Client) error { return errBoom }
+	readSudoPassword = func(prompt string) (string, error) { return "", errBoom }
+
+	dir := t.TempDir()
+	outDir := filepath.Join(dir, "out")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeSudoConfig(t, dir, outDir)
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	_, err = connectForRun(context.Background(), cfg, outDir)
+	if err == nil {
+		t.Fatal("expected error when ensureSudo fails")
+	}
+}

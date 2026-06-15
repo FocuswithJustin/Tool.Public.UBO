@@ -742,3 +742,41 @@ func TestClose_RemoveErrorWhenAlreadyGone(t *testing.T) {
 		t.Fatalf("close should ignore already-removed file: %v", err)
 	}
 }
+
+func TestSshArgs_withProxyJump(t *testing.T) {
+	c := &Client{
+		host:           "target.example.com",
+		port:           22,
+		user:           "root",
+		knownHostsFile: "/tmp/kh",
+		strictMode:     "yes",
+		proxyJump:      "user@bastion:22",
+	}
+	args := c.sshArgs()
+	found := false
+	for _, a := range args {
+		if a == "ProxyJump=user@bastion:22" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("sshArgs missing ProxyJump option: %v", args)
+	}
+}
+
+func TestSudoStdin_nilBase(t *testing.T) {
+	c := &Client{sudo: true, sudoPassword: "secret"}
+	r := c.sudoStdin(nil)
+	data, _ := io.ReadAll(r)
+	if string(data) != "secret\n" {
+		t.Errorf("sudoStdin(nil) = %q; want 'secret\\n'", string(data))
+	}
+}
+
+func TestSudoStdin_noSudoWithBase(t *testing.T) {
+	c := &Client{sudo: false, sudoPassword: "ignored"}
+	base := strings.NewReader("x")
+	if got := c.sudoStdin(base); got != base {
+		t.Error("sudoStdin with sudo=false should return base unchanged")
+	}
+}

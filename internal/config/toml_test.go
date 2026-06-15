@@ -311,3 +311,36 @@ func TestMarshal_quotesContainHash(t *testing.T) {
 		t.Errorf("Host = %q; want a#b#c", got.Host)
 	}
 }
+
+func TestParseBoolValue_trailingComment(t *testing.T) {
+	// sudo = true # comment — the inline comment must be stripped.
+	cfg := Default()
+	if err := parseTOML([]byte("[ssh]\nsudo = true # enable sudo"), cfg); err != nil {
+		t.Fatalf("parseTOML: %v", err)
+	}
+	if !cfg.SSH.Sudo {
+		t.Error("SSH.Sudo = false; want true after stripping inline comment")
+	}
+}
+
+func TestParseBoolValue_invalid(t *testing.T) {
+	// Must start with 't' or 'f' to reach parseBoolValue; "truthy" is not "true".
+	cfg := Default()
+	if err := parseTOML([]byte("[ssh]\nsudo = truthy"), cfg); err == nil {
+		t.Error("expected error for invalid boolean value")
+	}
+}
+
+func TestBoolField_wrongTypeString(t *testing.T) {
+	cfg := Default()
+	if err := parseTOML([]byte(`[ssh]`+"\nsudo = \"yes\""), cfg); err == nil {
+		t.Error("expected error when string is given for bool field")
+	}
+}
+
+func TestBoolField_wrongTypeInt(t *testing.T) {
+	cfg := Default()
+	if err := parseTOML([]byte("[ssh]\nsudo = 1"), cfg); err == nil {
+		t.Error("expected error when integer is given for bool field")
+	}
+}

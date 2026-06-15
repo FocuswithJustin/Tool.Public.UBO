@@ -258,3 +258,25 @@ func TestGenerateAll_sshError(t *testing.T) {
 		t.Fatalf("want client SSH keypair error, got %v", err)
 	}
 }
+
+// --- GenerateAll: loadExisting success (reuse path) -------------------------
+
+func TestGenerateAll_reuseExisting(t *testing.T) {
+	bin := fakeToolDir(t)
+	// Provide wg and ssh-keygen so fresh generation would work if somehow triggered,
+	// but since all files are pre-seeded, they should never be called.
+	writeScript(t, bin, "wg", "exit 99\n")
+	writeScript(t, bin, "ssh-keygen", "exit 99\n")
+	t.Setenv("PATH", bin)
+
+	dir := t.TempDir()
+	seedKeyFiles(t, dir)
+
+	keys, err := GenerateAll(dir)
+	if err != nil {
+		t.Fatalf("GenerateAll with existing keys: %v", err)
+	}
+	if keys.ServerWGPrivate != "spriv" {
+		t.Errorf("ServerWGPrivate = %q; want spriv (reused)", keys.ServerWGPrivate)
+	}
+}

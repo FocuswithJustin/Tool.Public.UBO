@@ -106,3 +106,14 @@ func TestBuildChangeLUKSCmd_autoDetect_containsCrypttabFallback(t *testing.T) {
 		t.Error("auto-detect cmd must fall back to blkid")
 	}
 }
+
+func TestApplyWGLine_noEquals(t *testing.T) {
+	cfg := &wgClientConfig{}
+	// A line with no '=' should be silently ignored (ok=false from strings.Cut).
+	applyWGLine(cfg, "DNS")
+	applyWGLine(cfg, "PersistentKeepalive 25")
+	// No field should have been set.
+	if cfg.PrivateKey != "" || cfg.Endpoint != "" {
+		t.Error("applyWGLine with no '=' should not set any field")
+	}
+}
