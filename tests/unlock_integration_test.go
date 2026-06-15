@@ -230,7 +230,10 @@ func startLinkedServer(t *testing.T) *luksServer {
 		"-nographic",
 		"-drive", "file=" + tmpPath("debian-luks.qcow2") + ",format=qcow2,if=virtio,snapshot=on",
 		"-netdev", fmt.Sprintf("socket,id=link,connect=127.0.0.1:%d", linkPort),
-		"-device", "virtio-net-pci,netdev=link,mac=" + serverLinkMAC,
+		// Use e1000 (not virtio-net-pci) so the NIC driver is NOT automatically
+		// included in initramfs — the same gap present on real physical hardware.
+		// Our setup detects the driver and adds it to /etc/initramfs-tools/modules.
+		"-device", "e1000,netdev=link,mac=" + serverLinkMAC,
 		"-chardev", "socket,id=serial0,path=" + serialSock + ",server=on,wait=off,logfile=" + serialLog,
 		"-serial", "chardev:serial0",
 	}

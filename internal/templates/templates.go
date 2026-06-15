@@ -407,6 +407,16 @@ printf '%s' '{{.DropbearConf}}' | base64 -d > "$DROPBEAR_DIR/dropbear.conf"
 mkdir -p /etc/initramfs-tools/conf.d
 printf '%s' '{{.UMASKConf}}' | base64 -d > /etc/initramfs-tools/conf.d/ubo
 
+# ── Step 9b: Ensure NIC driver is included in initramfs ──────────────────────
+# update-initramfs includes storage drivers for LUKS but skips NIC drivers on
+# systems where the root filesystem is local (not NFS). Detect and add it.
+NIC_DRIVER=$(basename "$(readlink /sys/class/net/{{.NetInterface}}/device/driver 2>/dev/null)" 2>/dev/null || true)
+if [ -n "$NIC_DRIVER" ]; then
+    echo "[ubo-setup] NIC driver: $NIC_DRIVER" >&2
+    grep -qxF "$NIC_DRIVER" /etc/initramfs-tools/modules 2>/dev/null || \
+        echo "$NIC_DRIVER" >> /etc/initramfs-tools/modules
+fi
+
 # ── Step 10: Configure GRUB ───────────────────────────────────────────────────
 echo "[ubo-setup] step 10/11: configuring GRUB" >&2
 GRUB_FILE=/etc/default/grub
