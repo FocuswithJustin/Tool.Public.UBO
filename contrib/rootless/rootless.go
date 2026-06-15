@@ -28,10 +28,12 @@ import (
 
 // Seams for testing — replaced in unit tests to avoid real SSH/PTY calls.
 var (
-	dialSSHFn                = dialSSH
-	runPTYFn                 = runPTY
-	runChangeKeyFn           = runChangeKey
-	stdinReader    io.Reader = os.Stdin
+	dialSSHFn                  = dialSSH
+	runPTYFn                   = runPTY
+	runChangeKeyFn             = runChangeKey
+	stdinReader      io.Reader = os.Stdin
+	remoteConnectFn            = remote.Connect
+	remoteInteractFn           = remote.InteractiveSession
 )
 
 // Unlock brings up a userspace WireGuard tunnel, connects to Dropbear over it
@@ -274,7 +276,7 @@ func handleTunnelFailure(ctx context.Context, cfg *config.Config, outputDir stri
 // luksChangeKey. Used when the WireGuard/Dropbear tunnel is not up (the system
 // has already completed the initramfs stage).
 func changeKeyDirectSSH(ctx context.Context, cfg *config.Config, outputDir string) error {
-	client, err := remote.Connect(ctx, &remote.ConnectOptions{
+	client, err := remoteConnectFn(ctx, &remote.ConnectOptions{
 		Host:           cfg.Host,
 		Port:           sshPort(cfg),
 		User:           sshUser(cfg),
@@ -287,7 +289,7 @@ func changeKeyDirectSSH(ctx context.Context, cfg *config.Config, outputDir strin
 	}
 	defer client.Close() //nolint:errcheck
 	fmt.Println("[ubo] changing LUKS passphrase on running system (no reboot needed)...")
-	return remote.InteractiveSession(client, buildChangeLUKSCmd(cfg))
+	return remoteInteractFn(client, buildChangeLUKSCmd(cfg))
 }
 
 // sshPort returns the configured SSH port, defaulting to 22.

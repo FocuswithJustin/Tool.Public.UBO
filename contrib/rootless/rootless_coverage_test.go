@@ -17,6 +17,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 	"ubo/internal/config"
+	"ubo/internal/remote"
 )
 
 // ── sshPort ───────────────────────────────────────────────────────────────────
@@ -388,6 +389,63 @@ func TestHandleChangeAndUnlock_reconnectError(t *testing.T) {
 	err := handleChangeAndUnlock(context.Background(), client, nil, netip.AddrPort{}, "", &config.Config{})
 	if err == nil || !strings.Contains(err.Error(), "reconnect for unlock") {
 		t.Errorf("want reconnect error, got %v", err)
+	}
+}
+
+func TestHandleChangeAndUnlock_happyPath(t *testing.T) {
+	origCK := runChangeKeyFn
+	t.Cleanup(func() { runChangeKeyFn = origCK })
+	runChangeKeyFn = func(_ *gossh.Client, _ *config.Config) (bool, error) { return true, nil }
+
+	origDial := dialSSHFn
+	t.Cleanup(func() { dialSSHFn = origDial })
+	fakeNewClient := makeTestClient(t)
+	dialSSHFn = func(_ context.Context, _ *netstack.Net, _ netip.AddrPort, _ string, _ *config.Config) (*gossh.Client, error) {
+		return fakeNewClient, nil
+	}
+
+	origPTY := runPTYFn
+	t.Cleanup(func() { runPTYFn = origPTY })
+	runPTYFn = func(_ *gossh.Client, _ string) error { return nil }
+
+	client := makeTestClient(t)
+	err := handleChangeAndUnlock(context.Background(), client, nil, netip.AddrPort{}, "", &config.Config{})
+	if err != nil {
+		t.Errorf("happy path should return nil, got %v", err)
+	}
+}
+
+// ── performUnlock seam tests ──────────────────────────────────────────────────
+
+// ── changeKeyDirectSSH seam tests ────────────────────────────────────────────
+
+func TestChangeKeyDirectSSH_connectError(t *testing.T) {
+	origConn := remoteConnectFn
+	t.Cleanup(func() { remoteConnectFn = origConn })
+	remoteConnectFn = func(_ context.Context, _ *remote.ConnectOptions) (*remote.Client, error) {
+		return nil, fmt.Errorf("connect boom")
+	}
+
+	err := changeKeyDirectSSH(context.Background(), &config.Config{}, t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "connect boom") {
+		t.Errorf("want connect error, got %v", err)
+	}
+}
+
+func TestChangeKeyDirectSSH_happyPath(t *testing.T) {
+	origConn := remoteConnectFn
+	t.Cleanup(func() { remoteConnectFn = origConn })
+	remoteConnectFn = func(_ context.Context, _ *remote.ConnectOptions) (*remote.Client, error) {
+		return &remote.Client{}, nil
+	}
+
+	origInteract := remoteInteractFn
+	t.Cleanup(func() { remoteInteractFn = origInteract })
+	remoteInteractFn = func(_ *remote.Client, _ string) error { return nil }
+
+	err := changeKeyDirectSSH(context.Background(), &config.Config{}, t.TempDir())
+	if err != nil {
+		t.Errorf("happy path should return nil, got %v", err)
 	}
 }
 
