@@ -338,6 +338,27 @@ func checkRemoteBootConfig(t *testing.T) {
 	}
 }
 
+// TestUBOBinaryErrorExit exercises main()'s error path (fmt.Fprintf + os.Exit(1))
+// by calling the binary with a nonexistent config file. The coverage-instrumented
+// binary writes coverage data before os.Exit, so the error-exit branch is captured.
+func TestUBOBinaryErrorExit(t *testing.T) {
+	checkPrereqs(t)
+	ubo := exec.Command(filepath.Join(projectRoot(), "ubo"), "run", "--config", "/nonexistent/ubo-no-such-file.toml")
+	ubo.Stdout = os.Stdout
+	ubo.Stderr = os.Stderr
+	if dir := coverDir(); dir != "" {
+		ubo.Env = append(os.Environ(), "GOCOVERDIR="+dir)
+	}
+	err := ubo.Run()
+	if err == nil {
+		t.Fatal("expected ubo to fail with nonexistent config")
+	}
+	// Exit code 1 is expected; any other error is unexpected.
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got %v", err)
+	}
+}
+
 // TestUBORun_Integration boots a Debian 13 Trixie VM, runs ubo run against
 // it, and verifies both local output files and the deployed remote files.
 func TestUBORun_Integration(t *testing.T) {
