@@ -245,6 +245,89 @@ func TestRenderInitramfsScript_directNetworkSetup(t *testing.T) {
 	}
 }
 
+func TestRenderInitramfsScript_VLAN(t *testing.T) {
+	d := validScriptData()
+	d.VLANPhysdev = "eth0"
+	d.VLANID = 10
+	d.Interface = "eth0.10"
+	got, err := RenderInitramfsScript(d)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, want := range []string{
+		"modprobe 8021q",
+		`ip link set dev "eth0" up`,
+		`ip link add link "eth0" name "eth0.10" type vlan id 10`,
+		`IFACE="eth0.10"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("VLAN script missing %q\ngot:\n%s", want, got)
+		}
+	}
+	// Must NOT fall through to the plain-NIC /sys/class/net fallback.
+	if strings.Contains(got, "/sys/class/net") {
+		t.Error("VLAN script must not use /sys/class/net fallback")
+	}
+}
+
+func TestRenderInitramfsScript_Bond(t *testing.T) {
+	d := validScriptData()
+	d.BondSlaves = "eth0 eth1"
+	d.Interface = "bond0"
+	got, err := RenderInitramfsScript(d)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, want := range []string{
+		"modprobe bonding",
+		`ip link add name "bond0" type bond`,
+		"eth0 eth1",
+		`master "bond0"`,
+		`IFACE="bond0"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("bond script missing %q\ngot:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderSetupScript_SystemdBootSection(t *testing.T) {
+	// Verify the setup script contains the systemd-boot detection block.
+	d := fullSetupScriptData()
+	got, err := RenderSetupScript(d)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, want := range []string{
+		"/boot/loader/entries",
+		"/efi/loader/entries",
+		"WARNING: no GRUB or systemd-boot",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("setup script missing %q", want)
+		}
+	}
+}
+
+func TestRenderSetupScript_NICDriverSection(t *testing.T) {
+	d := fullSetupScriptData()
+	got, err := RenderSetupScript(d)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, want := range []string{
+		"bonding/slaves",
+		"brif/",
+		"lower_*",
+		"8021q",
+		"_drv_for",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("setup script missing NIC topology detection for %q", want)
+		}
+	}
+}
+
 // ── RenderDropbearConfig ──────────────────────────────────────────────────────
 
 func TestRenderDropbearConfig(t *testing.T) {

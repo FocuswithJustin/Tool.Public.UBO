@@ -128,10 +128,13 @@ UMASK=0077
 
 // InitramfsScriptData holds template variables for InitramfsScriptTmpl.
 type InitramfsScriptData struct {
-	ServerIP  string // e.g. "10.42.0.1/24" — WireGuard server tunnel CIDR
-	StaticIP  string // host IP/CIDR for initramfs, e.g. "192.168.1.10/24"
-	GatewayIP string // physical network gateway, e.g. "192.168.1.1"
-	Interface string // physical network interface, e.g. "eth0"
+	ServerIP    string // e.g. "10.42.0.1/24" — WireGuard server tunnel CIDR
+	StaticIP    string // host IP/CIDR for initramfs, e.g. "192.168.1.10/24"
+	GatewayIP   string // physical network gateway, e.g. "192.168.1.1"
+	Interface   string // network interface name (VLAN, bond, bridge, or plain NIC)
+	VLANPhysdev string // parent NIC for VLAN (e.g. "eth0"); empty if not a VLAN
+	VLANID      int    // 802.1Q VLAN ID (0 if not a VLAN)
+	BondSlaves  string // space-separated slave NICs for bond (empty if not bond)
 }
 
 // InitramfsScriptTmpl is the /etc/initramfs-tools/scripts/init-premount/wireguard
@@ -152,10 +155,25 @@ prereqs() { echo "$PREREQ"; }
 case "$1" in prereqs) prereqs; exit 0;; esac
 set -e
 
-# Resolve the network interface. Predictable names (e.g. enp1s0) require udev
-# naming rules that may not be present in initramfs; fall back to the first
-# non-loopback Ethernet interface found in /sys/class/net if the configured
-# name is not visible.
+{{- if .VLANPhysdev}}
+# VLAN interface: bring up the physical NIC, then create the VLAN on top of it.
+modprobe 8021q 2>/dev/null || true
+ip link set dev "{{.VLANPhysdev}}" up
+ip link add link "{{.VLANPhysdev}}" name "{{.Interface}}" type vlan id {{.VLANID}} 2>/dev/null || true
+IFACE="{{.Interface}}"
+{{- else if .BondSlaves}}
+# Bond interface: create bond, then enslave the physical NICs.
+modprobe bonding 2>/dev/null || true
+ip link add name "{{.Interface}}" type bond 2>/dev/null || true
+for _slave in {{.BondSlaves}}; do
+    ip link set dev "$_slave" down 2>/dev/null || true
+    ip link set dev "$_slave" master "{{.Interface}}" 2>/dev/null || true
+done
+IFACE="{{.Interface}}"
+{{- else}}
+# Plain NIC. Predictable names (e.g. enp1s0) need udev rules that may not be
+# present in initramfs; fall back to the first non-loopback Ethernet interface
+# found in /sys/class/net if the configured name is not visible.
 IFACE="{{.Interface}}"
 if ! ip link show dev "$IFACE" >/dev/null 2>&1; then
     for _dev in /sys/class/net/*; do
@@ -165,6 +183,7 @@ if ! ip link show dev "$IFACE" >/dev/null 2>&1; then
         IFACE="$_n"; break
     done
 fi
+{{- end}}
 
 ip link set dev "$IFACE" up
 ip addr add {{.StaticIP}} dev "$IFACE" 2>/dev/null || true
@@ -410,28 +429,68 @@ printf '%s' '{{.DropbearConf}}' | base64 -d > "$DROPBEAR_DIR/dropbear.conf"
 mkdir -p /etc/initramfs-tools/conf.d
 printf '%s' '{{.UMASKConf}}' | base64 -d > /etc/initramfs-tools/conf.d/ubo
 
-# ── Step 9b: Ensure NIC driver is included in initramfs ──────────────────────
+# ── Step 9b: Ensure NIC driver(s) are included in initramfs ──────────────────
 # update-initramfs includes storage drivers for LUKS but skips NIC drivers on
-# systems where the root filesystem is local (not NFS). Detect and add it.
-NIC_DRIVER=$(basename "$(readlink /sys/class/net/{{.NetInterface}}/device/driver 2>/dev/null)" 2>/dev/null || true)
-if [ -n "$NIC_DRIVER" ]; then
-    echo "[ubo-setup] NIC driver: $NIC_DRIVER" >&2
-    grep -qxF "$NIC_DRIVER" /etc/initramfs-tools/modules 2>/dev/null || \
-        echo "$NIC_DRIVER" >> /etc/initramfs-tools/modules
+# systems where the root filesystem is local (not NFS). Detect and add each
+# required module (handles plain NIC, bond, bridge, and VLAN topologies).
+_add_mod() {
+    [ -z "$1" ] && return
+    grep -qxF "$1" /etc/initramfs-tools/modules 2>/dev/null || \
+        echo "$1" >> /etc/initramfs-tools/modules
+    echo "[ubo-setup] initramfs module: $1" >&2
+}
+_drv_for() {
+    basename "$(readlink /sys/class/net/"$1"/device/driver 2>/dev/null)" 2>/dev/null || true
+}
+_NIC="{{.NetInterface}}"
+if [ -f /sys/class/net/"$_NIC"/bonding/slaves ]; then
+    _add_mod bonding
+    for _sl in $(cat /sys/class/net/"$_NIC"/bonding/slaves); do _add_mod "$(_drv_for "$_sl")"; done
+elif ls /sys/class/net/"$_NIC"/brif/ >/dev/null 2>&1; then
+    _add_mod bridge
+    for _pt in $(ls /sys/class/net/"$_NIC"/brif/); do _add_mod "$(_drv_for "$_pt")"; done
+elif ls /sys/class/net/"$_NIC"/lower_* >/dev/null 2>&1; then
+    _add_mod 8021q
+    for _lw in /sys/class/net/"$_NIC"/lower_*; do
+        _pd=$(basename "$(readlink "$_lw" 2>/dev/null)" 2>/dev/null || true)
+        [ -n "$_pd" ] && _add_mod "$(_drv_for "$_pd")"
+    done
+else
+    _add_mod "$(_drv_for "$_NIC")"
 fi
 
-# ── Step 10: Configure GRUB ───────────────────────────────────────────────────
-echo "[ubo-setup] step 10/11: configuring GRUB" >&2
-GRUB_FILE=/etc/default/grub
+# ── Step 10: Configure bootloader ─────────────────────────────────────────────
+echo "[ubo-setup] step 10/11: configuring bootloader" >&2
 IP_PARAM="ip={{.NetIP}}::{{.NetGateway}}:{{.NetMask}}:{{.NetHostname}}:{{.NetInterface}}:none"
-if grep -qE '^GRUB_CMDLINE_LINUX="[^"]*ip=' "$GRUB_FILE" 2>/dev/null; then
-    echo "[ubo-setup] GRUB_CMDLINE_LINUX already contains ip=; skipping" >&2
-elif grep -qE '^GRUB_CMDLINE_LINUX="' "$GRUB_FILE" 2>/dev/null; then
-    sed -i "s|^GRUB_CMDLINE_LINUX=\"\(.*\)\"|GRUB_CMDLINE_LINUX=\"\1 $IP_PARAM\"|" "$GRUB_FILE"
-    update-grub 2>&1 >&2
+if [ -f /etc/default/grub ]; then
+    GRUB_FILE=/etc/default/grub
+    if grep -qE '^GRUB_CMDLINE_LINUX="[^"]*ip=' "$GRUB_FILE" 2>/dev/null; then
+        echo "[ubo-setup] GRUB_CMDLINE_LINUX already contains ip=; skipping" >&2
+    elif grep -qE '^GRUB_CMDLINE_LINUX="' "$GRUB_FILE" 2>/dev/null; then
+        sed -i "s|^GRUB_CMDLINE_LINUX=\"\(.*\)\"|GRUB_CMDLINE_LINUX=\"\1 $IP_PARAM\"|" "$GRUB_FILE"
+        update-grub 2>&1 >&2
+    else
+        printf '\nGRUB_CMDLINE_LINUX="%s"\n' "$IP_PARAM" >> "$GRUB_FILE"
+        update-grub 2>&1 >&2
+    fi
 else
-    printf '\nGRUB_CMDLINE_LINUX="%s"\n' "$IP_PARAM" >> "$GRUB_FILE"
-    update-grub 2>&1 >&2
+    _updated=0
+    for _efi_dir in /boot/loader/entries /efi/loader/entries /boot/efi/loader/entries; do
+        [ -d "$_efi_dir" ] || continue
+        for _entry in "$_efi_dir"/*.conf; do
+            [ -f "$_entry" ] || continue
+            grep -q ' ip=' "$_entry" && continue
+            grep -q '^options ' "$_entry" || continue
+            sed -i "s|^\(options .*\)$|\1 $IP_PARAM|" "$_entry" && _updated=1
+        done
+    done
+    if [ "$_updated" = "1" ]; then
+        echo "[ubo-setup] added $IP_PARAM to systemd-boot entries" >&2
+    elif ls /boot/loader/entries/*.conf /efi/loader/entries/*.conf /boot/efi/loader/entries/*.conf >/dev/null 2>&1; then
+        echo "[ubo-setup] systemd-boot entries already contain ip=; skipping" >&2
+    else
+        echo "[ubo-setup] WARNING: no GRUB or systemd-boot config found; add manually: $IP_PARAM" >&2
+    fi
 fi
 
 # ── Step 11: Rebuild initramfs ────────────────────────────────────────────────

@@ -3,7 +3,10 @@ package rootless
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"ubo/internal/config"
 )
 
 const sampleWGConf = `[Interface]
@@ -80,5 +83,26 @@ func TestB64ToHex_wrongLength(t *testing.T) {
 	// 16 bytes base64
 	if _, err := b64ToHex("AAAAAAAAAAAAAAAAAAAAAA=="); err == nil {
 		t.Error("expected error for non-32-byte key")
+	}
+}
+
+// ── buildChangeLUKSCmd ────────────────────────────────────────────────────────
+
+func TestBuildChangeLUKSCmd_deviceFromConfig(t *testing.T) {
+	cfg := &config.Config{LUKS: config.LUKSConfig{Device: "/dev/sda3"}}
+	cmd := buildChangeLUKSCmd(cfg)
+	if cmd != `cryptsetup luksChangeKey "/dev/sda3"` {
+		t.Errorf("unexpected cmd for explicit device: %q", cmd)
+	}
+}
+
+func TestBuildChangeLUKSCmd_autoDetect_containsCrypttabFallback(t *testing.T) {
+	cfg := &config.Config{}
+	cmd := buildChangeLUKSCmd(cfg)
+	if !strings.Contains(cmd, "/etc/crypttab") {
+		t.Error("auto-detect cmd must try /etc/crypttab")
+	}
+	if !strings.Contains(cmd, "blkid -t TYPE=crypto_LUKS") {
+		t.Error("auto-detect cmd must fall back to blkid")
 	}
 }

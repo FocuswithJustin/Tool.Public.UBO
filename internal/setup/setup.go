@@ -47,11 +47,15 @@ func step(n int, msg string) {
 
 // NetworkInfo holds the detected network configuration of the remote host.
 type NetworkInfo struct {
-	Interface string
-	IP        string
-	Prefix    int
-	Gateway   string
-	Hostname  string
+	Interface   string
+	IP          string
+	Prefix      int
+	Gateway     string
+	Hostname    string
+	VLANPhysdev string   // parent NIC if Interface is a VLAN (empty if not VLAN)
+	VLANID      int      // 802.1Q VLAN ID (0 if not a VLAN)
+	BondSlaves  []string // slave NICs for a bond interface (nil if not bond)
+	BridgePorts []string // bridge port NICs (nil if not bridge)
 }
 
 // dropbearPaths holds the detected dropbear-initramfs config directory and key file.
@@ -112,10 +116,13 @@ func buildSetupScriptData(cfg *config.Config, keys *keygen.Keys, netInfo *Networ
 	}
 
 	initScript, err := templates.RenderInitramfsScript(templates.InitramfsScriptData{
-		ServerIP:  cfg.WireGuard.ServerIP,
-		StaticIP:  fmt.Sprintf("%s/%d", netInfo.IP, netInfo.Prefix),
-		GatewayIP: netInfo.Gateway,
-		Interface: netInfo.Interface,
+		ServerIP:    cfg.WireGuard.ServerIP,
+		StaticIP:    fmt.Sprintf("%s/%d", netInfo.IP, netInfo.Prefix),
+		GatewayIP:   netInfo.Gateway,
+		Interface:   netInfo.Interface,
+		VLANPhysdev: netInfo.VLANPhysdev,
+		VLANID:      netInfo.VLANID,
+		BondSlaves:  strings.Join(netInfo.BondSlaves, " "),
 	})
 	if err != nil {
 		return templates.SetupScriptData{}, fmt.Errorf("render initramfs script: %w", err)
@@ -223,6 +230,7 @@ func stepDetectNetwork(ctx context.Context, client *remote.Client, cfg *config.C
 	}
 	fmt.Printf("[ubo]   interface=%s ip=%s/%d gateway=%s hostname=%s\n",
 		netInfo.Interface, netInfo.IP, netInfo.Prefix, netInfo.Gateway, netInfo.Hostname)
+	logTopology(netInfo)
 	return netInfo, nil
 }
 
@@ -254,6 +262,7 @@ func detectNetwork(ctx context.Context, client *remote.Client, cfg *config.Confi
 
 	detectPrefix(ctx, client, info)
 	detectHostname(ctx, client, info)
+	detectInterfaceTopology(ctx, client, info)
 
 	return info, validateNetworkInfo(info)
 }
@@ -409,6 +418,84 @@ func detectHostname(ctx context.Context, client *remote.Client, info *NetworkInf
 	info.Hostname = strings.TrimSpace(hostnameOut)
 	if info.Hostname == "" {
 		info.Hostname = "server"
+	}
+}
+
+// detectInterfaceTopology detects whether the network interface is a VLAN,
+// bond, or bridge, and fills the corresponding NetworkInfo fields.
+func detectInterfaceTopology(ctx context.Context, client *remote.Client, info *NetworkInfo) {
+	detectVLAN(ctx, client, info)
+	detectBond(ctx, client, info)
+	detectBridge(ctx, client, info)
+}
+
+// vlanParentRe matches the "@parent:" portion of an `ip -d link show` line.
+var vlanParentRe = regexp.MustCompile(`@(\S+?):`)
+
+// vlanIDRe matches the VLAN id from `ip -d link show` detailed output.
+var vlanIDRe = regexp.MustCompile(`\bvlan\b.*\bid\s+(\d+)`)
+
+// detectVLAN checks whether the interface is an 802.1Q VLAN and fills
+// info.VLANPhysdev and info.VLANID when it is.
+func detectVLAN(ctx context.Context, client *remote.Client, info *NetworkInfo) {
+	out, err := runCommand(ctx, client, "ip -d link show "+info.Interface+" 2>/dev/null")
+	if err != nil {
+		return
+	}
+	physdev, id := parseVLANLink(out)
+	if physdev != "" && id > 0 {
+		info.VLANPhysdev = physdev
+		info.VLANID = id
+	}
+}
+
+// parseVLANLink extracts the parent device and VLAN ID from `ip -d link show` output.
+func parseVLANLink(out string) (physdev string, id int) {
+	if m := vlanParentRe.FindStringSubmatch(out); m != nil {
+		physdev = strings.TrimSpace(m[1])
+	}
+	if m := vlanIDRe.FindStringSubmatch(out); m != nil {
+		fmt.Sscanf(m[1], "%d", &id)
+	}
+	return
+}
+
+// detectBond checks whether the interface is a bonding master and fills
+// info.BondSlaves with the slave interface names when it is.
+func detectBond(ctx context.Context, client *remote.Client, info *NetworkInfo) {
+	out, err := runCommand(ctx, client, "cat /sys/class/net/"+info.Interface+"/bonding/slaves 2>/dev/null")
+	if err != nil {
+		return
+	}
+	slaves := strings.Fields(strings.TrimSpace(out))
+	if len(slaves) > 0 {
+		info.BondSlaves = slaves
+	}
+}
+
+// detectBridge checks whether the interface is a bridge and fills
+// info.BridgePorts with the port interface names when it is.
+func detectBridge(ctx context.Context, client *remote.Client, info *NetworkInfo) {
+	out, err := runCommand(ctx, client, "ls /sys/class/net/"+info.Interface+"/brif/ 2>/dev/null")
+	if err != nil {
+		return
+	}
+	ports := strings.Fields(strings.TrimSpace(out))
+	if len(ports) > 0 {
+		info.BridgePorts = ports
+	}
+}
+
+// logTopology prints detected interface topology to stdout.
+func logTopology(info *NetworkInfo) {
+	if info.VLANPhysdev != "" {
+		fmt.Printf("[ubo]   VLAN id=%d physdev=%s\n", info.VLANID, info.VLANPhysdev)
+	}
+	if len(info.BondSlaves) > 0 {
+		fmt.Printf("[ubo]   bond slaves=%s\n", strings.Join(info.BondSlaves, ","))
+	}
+	if len(info.BridgePorts) > 0 {
+		fmt.Printf("[ubo]   bridge ports=%s\n", strings.Join(info.BridgePorts, ","))
 	}
 }
 

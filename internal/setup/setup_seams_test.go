@@ -312,6 +312,83 @@ func TestDetectNetwork_gatewayEmptyError(t *testing.T) {
 	}
 }
 
+// ── detectInterfaceTopology ───────────────────────────────────────────────────
+
+func TestDetectNetwork_VLAN(t *testing.T) {
+	f := &fakeRemote{runResponses: map[string]cmdResult{
+		"ip route show default":                {out: "default via 192.168.1.1 dev eth0.10 src 192.168.1.50"},
+		"ip -4 addr show dev eth0.10":          {out: "    inet 192.168.1.50/24 scope global eth0.10"},
+		"ip -d link show eth0.10 2>/dev/null":  {out: "2: eth0.10@eth0: <BROADCAST>\n    vlan protocol 802.1Q id 10 <REORDER_HDR>"},
+		"hostname":                              {out: "myhost"},
+	}}
+	defer f.install()()
+	info, err := detectNetwork(context.Background(), nil, &config.Config{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.VLANPhysdev != "eth0" {
+		t.Errorf("VLANPhysdev = %q; want eth0", info.VLANPhysdev)
+	}
+	if info.VLANID != 10 {
+		t.Errorf("VLANID = %d; want 10", info.VLANID)
+	}
+}
+
+func TestDetectNetwork_Bond(t *testing.T) {
+	f := &fakeRemote{runResponses: map[string]cmdResult{
+		"ip route show default":                             {out: "default via 192.168.1.1 dev bond0 src 192.168.1.50"},
+		"ip -4 addr show dev bond0":                        {out: "    inet 192.168.1.50/24 scope global bond0"},
+		"ip -d link show bond0 2>/dev/null":                {out: "3: bond0: <BROADCAST,MULTICAST,MASTER,UP>"},
+		"cat /sys/class/net/bond0/bonding/slaves 2>/dev/null": {out: "eth0 eth1"},
+		"hostname":                                          {out: "myhost"},
+	}}
+	defer f.install()()
+	info, err := detectNetwork(context.Background(), nil, &config.Config{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(info.BondSlaves) != 2 || info.BondSlaves[0] != "eth0" || info.BondSlaves[1] != "eth1" {
+		t.Errorf("BondSlaves = %v; want [eth0 eth1]", info.BondSlaves)
+	}
+}
+
+func TestDetectNetwork_Bridge(t *testing.T) {
+	f := &fakeRemote{runResponses: map[string]cmdResult{
+		"ip route show default":                    {out: "default via 192.168.1.1 dev br0 src 192.168.1.50"},
+		"ip -4 addr show dev br0":                  {out: "    inet 192.168.1.50/24 scope global br0"},
+		"ip -d link show br0 2>/dev/null":          {out: "4: br0: <BROADCAST,MULTICAST,UP>"},
+		"ls /sys/class/net/br0/brif/ 2>/dev/null":  {out: "eth0"},
+		"hostname":                                  {out: "myhost"},
+	}}
+	defer f.install()()
+	info, err := detectNetwork(context.Background(), nil, &config.Config{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(info.BridgePorts) != 1 || info.BridgePorts[0] != "eth0" {
+		t.Errorf("BridgePorts = %v; want [eth0]", info.BridgePorts)
+	}
+}
+
+func TestParseVLANLink(t *testing.T) {
+	out := "2: eth0.100@eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether 52:54:00:ab:cd:ef\n    vlan protocol 802.1Q id 100 <REORDER_HDR>"
+	physdev, id := parseVLANLink(out)
+	if physdev != "eth0" {
+		t.Errorf("physdev = %q; want eth0", physdev)
+	}
+	if id != 100 {
+		t.Errorf("id = %d; want 100", id)
+	}
+}
+
+func TestParseVLANLink_notVLAN(t *testing.T) {
+	out := "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether 52:54:00:ab:cd:ef"
+	physdev, id := parseVLANLink(out)
+	if physdev != "" || id != 0 {
+		t.Errorf("expected empty physdev and 0 id for plain NIC, got %q/%d", physdev, id)
+	}
+}
+
 // ── detectDropbearPaths ───────────────────────────────────────────────────────
 
 const dbDetectCmd = `if [ -d /etc/dropbear/initramfs ]; then echo /etc/dropbear/initramfs; ` +

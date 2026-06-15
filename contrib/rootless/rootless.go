@@ -9,7 +9,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"net"
 	"net/netip"
 	"os"
 	"time"
@@ -21,6 +20,7 @@ import (
 	"golang.zx2c4.com/wireguard/tun/netstack"
 
 	"ubo/internal/config"
+	"ubo/internal/remote"
 )
 
 // Unlock brings up a userspace WireGuard tunnel, connects to Dropbear over it
@@ -49,7 +49,7 @@ func Unlock(ctx context.Context, cfg *config.Config, outputDir string, changeKey
 
 	fmt.Printf("[ubo] waiting for tunnel to %s...\n", serverIP)
 	if err := waitTunnel(ctx, tnet, serverAddr); err != nil {
-		return err
+		return handleTunnelFailure(ctx, cfg, outputDir, changeKey, err)
 	}
 
 	client, err := dialSSH(ctx, tnet, serverAddr, outputDir, cfg)
@@ -176,30 +176,89 @@ func performUnlock(client *ssh.Client, cfg *config.Config, changeKey bool) error
 	return nil
 }
 
-// runChangeKey runs luksChangeKey interactively and asks whether to proceed to unlock.
-func runChangeKey(client *ssh.Client, cfg *config.Config) (bool, error) {
-	changeCmd := `SRC=$(awk 'NF && !/^#/{print $2; exit}' /etc/crypttab)
-case "$SRC" in
-  UUID=*) DEV="/dev/disk/by-uuid/${SRC#UUID=}" ;;
-  PARTUUID=*) DEV="/dev/disk/by-partuuid/${SRC#PARTUUID=}" ;;
-  LABEL=*) DEV="/dev/disk/by-label/${SRC#LABEL=}" ;;
-  PARTLABEL=*) DEV="/dev/disk/by-partlabel/${SRC#PARTLABEL=}" ;;
-  *) DEV="$SRC" ;;
-esac
-test -n "$DEV" || { echo "could not determine LUKS device from /etc/crypttab" >&2; exit 1; }
-cryptsetup luksChangeKey "$DEV"`
+// buildChangeLUKSCmd returns the shell command to run cryptsetup luksChangeKey.
+// When cfg.LUKS.Device is set it is used directly. Otherwise the device is
+// detected from /etc/crypttab (running system) or blkid (initramfs at boot,
+// where /etc/crypttab lives on the encrypted root and is not yet accessible).
+func buildChangeLUKSCmd(cfg *config.Config) string {
 	if cfg.LUKS.Device != "" {
-		changeCmd = fmt.Sprintf("cryptsetup luksChangeKey %q", cfg.LUKS.Device)
+		return fmt.Sprintf("cryptsetup luksChangeKey %q", cfg.LUKS.Device)
 	}
+	return `DEV=""
+if [ -f /etc/crypttab ]; then
+    SRC=$(awk 'NF && !/^#/{print $2; exit}' /etc/crypttab)
+    case "$SRC" in
+      UUID=*) DEV="/dev/disk/by-uuid/${SRC#UUID=}" ;;
+      PARTUUID=*) DEV="/dev/disk/by-partuuid/${SRC#PARTUUID=}" ;;
+      LABEL=*) DEV="/dev/disk/by-label/${SRC#LABEL=}" ;;
+      PARTLABEL=*) DEV="/dev/disk/by-partlabel/${SRC#PARTLABEL=}" ;;
+      *) DEV="$SRC" ;;
+    esac
+fi
+if [ -z "$DEV" ]; then
+    DEV=$(blkid -t TYPE=crypto_LUKS -o device 2>/dev/null | head -1)
+fi
+test -n "$DEV" || { echo "could not determine LUKS device; set luks.device in config" >&2; exit 1; }
+cryptsetup luksChangeKey "$DEV"`
+}
 
+// runChangeKey runs luksChangeKey interactively via the initramfs Dropbear
+// session, then prompts whether to proceed to unlock.
+func runChangeKey(client *ssh.Client, cfg *config.Config) (bool, error) {
 	fmt.Println("[ubo] changing LUKS passphrase (enter current passphrase, then new passphrase twice)...")
-	if err := runPTY(client, changeCmd); err != nil {
+	if err := runPTY(client, buildChangeLUKSCmd(cfg)); err != nil {
 		return false, fmt.Errorf("luksChangeKey: %w", err)
 	}
 	fmt.Print("\nChange complete. Unlock and boot now? [Y/n]: ")
 	var ans string
 	fmt.Scanln(&ans)
 	return ans == "" || ans == "y" || ans == "Y", nil
+}
+
+// handleTunnelFailure is called when the WireGuard/Dropbear tunnel is not
+// reachable. For plain unlock it surfaces the error. For key-change it falls
+// back to a direct SSH connection (the system is already running).
+func handleTunnelFailure(ctx context.Context, cfg *config.Config, outputDir string, changeKey bool, tunnelErr error) error {
+	if !changeKey {
+		return tunnelErr
+	}
+	fmt.Println("[ubo] initramfs not reachable; trying direct SSH for LUKS key change...")
+	return changeKeyDirectSSH(ctx, cfg, outputDir)
+}
+
+// changeKeyDirectSSH connects to the running system via regular SSH and runs
+// luksChangeKey. Used when the WireGuard/Dropbear tunnel is not up (the system
+// has already completed the initramfs stage).
+func changeKeyDirectSSH(ctx context.Context, cfg *config.Config, outputDir string) error {
+	client, err := remote.Connect(ctx, &remote.ConnectOptions{
+		Host:           cfg.Host,
+		Port:           sshPort(cfg),
+		User:           sshUser(cfg),
+		KeyPath:        cfg.SSH.Key,
+		KnownHostsPath: outputDir + "/known_hosts",
+	})
+	if err != nil {
+		return fmt.Errorf("direct SSH: %w", err)
+	}
+	defer client.Close() //nolint:errcheck
+	fmt.Println("[ubo] changing LUKS passphrase on running system (no reboot needed)...")
+	return remote.InteractiveSession(client, buildChangeLUKSCmd(cfg))
+}
+
+// sshPort returns the configured SSH port, defaulting to 22.
+func sshPort(cfg *config.Config) int {
+	if cfg.SSH.Port == 0 {
+		return 22
+	}
+	return cfg.SSH.Port
+}
+
+// sshUser returns the configured SSH user, defaulting to "root".
+func sshUser(cfg *config.Config) string {
+	if cfg.SSH.User == "" {
+		return "root"
+	}
+	return cfg.SSH.User
 }
 
 // runPTY opens an SSH session with a PTY and runs cmd, wiring the local terminal.
@@ -307,6 +366,3 @@ func b64ToHex(b64key string) (string, error) {
 	return hex.EncodeToString(raw), nil
 }
 
-// parseFirstAddr (net.IP variant) resolves an endpoint host for dialing.
-// Used internally by waitTunnel via the standard net package.
-var _ = net.IP(nil) // keep net imported for potential future use
