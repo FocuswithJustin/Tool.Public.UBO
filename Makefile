@@ -29,8 +29,10 @@ luks-build:
 # test-integration: boot the VM(s) and run integration tests against them.
 # Requires: make vm-build (and make luks-build for the LUKS/unlock tests).
 # Runs inside nix-shell so wg/ssh-keygen are in PATH.
+# Output is tee'd to tmp/integration-test.log so you can tail -f it while it runs.
 test-integration:
-	nix-shell --run "go build -o $(BINARY) . && PROJECT_ROOT=$(CURDIR) go test -v -tags integration -timeout 30m ./tests/"
+	@mkdir -p tmp
+	nix-shell --run "go build -o $(BINARY) . && PROJECT_ROOT=$(CURDIR) go test -v -tags integration -timeout 30m ./tests/" 2>&1 | tee tmp/integration-test.log
 
 # complexity: fail if any function (code OR test) exceeds CYCLO_MAX cyclomatic
 # complexity. Runs inside nix-shell so gocyclo is on PATH.
