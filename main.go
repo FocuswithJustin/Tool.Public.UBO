@@ -574,6 +574,7 @@ case "$SRC" in
   *) DEV="$SRC" ;;
 esac
 test -n "$DEV" || { echo "could not determine LUKS device from /etc/crypttab" >&2; exit 1; }
+echo "[ubo] LUKS device: $DEV" >&2
 cryptsetup luksChangeKey "$DEV"`
 
 // runChangeKey performs the interactive LUKS passphrase change and asks whether

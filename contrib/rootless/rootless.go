@@ -261,6 +261,7 @@ if [ -z "$DEV" ]; then
     fi
 fi
 test -n "$DEV" || { echo "could not determine LUKS device; set luks.device in config" >&2; exit 1; }
+echo "[ubo] LUKS device: $DEV" >&2
 cryptsetup luksChangeKey "$DEV"`
 }
 
@@ -296,7 +297,8 @@ func handleTunnelFailure(ctx context.Context, cfg *config.Config, outputDir stri
 
 // changeKeyDirectSSH connects to the running system via regular SSH and runs
 // luksChangeKey. Used when the WireGuard/Dropbear tunnel is not up (the system
-// has already completed the initramfs stage).
+// has already completed the initramfs stage). cfg.SSH.Sudo is forwarded so
+// that the cryptsetup command is wrapped with sudo when the SSH user is not root.
 func changeKeyDirectSSH(ctx context.Context, cfg *config.Config, outputDir string) error {
 	client, err := remoteConnectFn(ctx, &remote.ConnectOptions{
 		Host:           cfg.Host,
@@ -305,6 +307,7 @@ func changeKeyDirectSSH(ctx context.Context, cfg *config.Config, outputDir strin
 		KeyPath:        cfg.SSH.Key,
 		KnownHostsPath: outputDir + "/known_hosts",
 		ProxyJump:      cfg.SSH.ProxyJump,
+		Sudo:           cfg.SSH.Sudo,
 	})
 	if err != nil {
 		return fmt.Errorf("direct SSH: %w", err)

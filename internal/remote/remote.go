@@ -249,6 +249,18 @@ func (c *Client) sudoCmd(cmd string) string {
 	return "sudo " + flag + " sh -c '" + escaped + "'"
 }
 
+// interactiveSudoCmd wraps cmd for interactive PTY sessions when sudo is
+// required. Unlike sudoCmd it does not use -n (non-interactive) or -S (stdin
+// password): instead sudo prompts on the allocated TTY, which is the right
+// behaviour for cryptsetup luksChangeKey run over an SSH PTY.
+func (c *Client) interactiveSudoCmd(cmd string) string {
+	if !c.sudo {
+		return cmd
+	}
+	escaped := strings.ReplaceAll(cmd, "'", `'\''`)
+	return "sudo sh -c '" + escaped + "'"
+}
+
 // sudoStdin prepends the sudo password line to base when password-mode sudo is
 // in use. base may be nil (no process stdin). Returns nil when sudo is inactive
 // or NOPASSWD mode is used, leaving the caller's existing stdin handling intact.
@@ -343,10 +355,12 @@ func ReadFile(c *Client, remotePath string) (string, error) {
 // InteractiveSession runs cmd on the remote with a forced PTY (`ssh -t`),
 // wiring the local stdin/stdout/stderr to the ssh process. Required for
 // cryptroot-unlock and cryptsetup luksChangeKey, which both need a real TTY.
+// When the client has sudo enabled the command is wrapped with `sudo sh -c`
+// so that privileged block-device access works for non-root SSH users.
 func InteractiveSession(c *Client, cmd string) error {
 	args := []string{"-t", "-o", "LogLevel=ERROR"}
 	args = append(args, c.sshArgs()...)
-	args = append(args, cmd)
+	args = append(args, c.interactiveSudoCmd(cmd))
 
 	command := exec.Command("ssh", args...)
 	command.Stdin = os.Stdin

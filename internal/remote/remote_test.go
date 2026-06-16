@@ -454,6 +454,39 @@ func TestSudoCmd_singleQuoteEscaping(t *testing.T) {
 	}
 }
 
+func TestInteractiveSudoCmd_noSudo_passthrough(t *testing.T) {
+	c := newTOFUClient(t)
+	if got := c.interactiveSudoCmd("cryptsetup luksChangeKey /dev/sda3"); got != "cryptsetup luksChangeKey /dev/sda3" {
+		t.Errorf("interactiveSudoCmd without sudo = %q; want passthrough", got)
+	}
+}
+
+func TestInteractiveSudoCmd_withSudo_wrapsSudoSh(t *testing.T) {
+	c := newSudoClient(t)
+	got := c.interactiveSudoCmd("cryptsetup luksChangeKey /dev/sda3")
+	if !strings.HasPrefix(got, "sudo sh -c '") {
+		t.Errorf("interactiveSudoCmd = %q; want 'sudo sh -c' prefix", got)
+	}
+	if !strings.Contains(got, "cryptsetup luksChangeKey") {
+		t.Errorf("interactiveSudoCmd = %q; original command missing", got)
+	}
+	// Must NOT contain -n or -S (PTY sessions need interactive sudo)
+	if strings.Contains(got, " -n ") || strings.Contains(got, " -S ") {
+		t.Errorf("interactiveSudoCmd = %q; must not use -n or -S for interactive use", got)
+	}
+}
+
+func TestInteractiveSudoCmd_singleQuoteEscaping(t *testing.T) {
+	c := newSudoClient(t)
+	got := c.interactiveSudoCmd("echo 'hello'")
+	if strings.Contains(got, "echo 'hello'") {
+		t.Errorf("interactiveSudoCmd = %q; inner single quotes not escaped", got)
+	}
+	if !strings.Contains(got, `'\''`) {
+		t.Errorf("interactiveSudoCmd = %q; want escaped single quotes", got)
+	}
+}
+
 func TestSudoStdin_noSudo(t *testing.T) {
 	c := newTOFUClient(t)
 	if got := c.sudoStdin(nil); got != nil {
@@ -679,6 +712,23 @@ func TestInteractiveSession_Failure(t *testing.T) {
 	if err := InteractiveSession(c, "exit 1"); err == nil ||
 		!strings.Contains(err.Error(), "remote session") {
 		t.Fatalf("expected remote session error, got %v", err)
+	}
+}
+
+func TestInteractiveSession_Sudo(t *testing.T) {
+	argv := installFakeSSH(t)
+	c := newTOFUClient(t)
+	c.sudo = true
+	if err := InteractiveSession(c, "cryptsetup luksChangeKey /dev/sda3"); err != nil {
+		t.Fatalf("interactive sudo: %v", err)
+	}
+	args := readArgv(t, argv)
+	last := args[len(args)-1]
+	if !strings.HasPrefix(last, "sudo sh -c '") {
+		t.Errorf("expected sudo wrapper as last arg, got %q", last)
+	}
+	if !strings.Contains(last, "cryptsetup luksChangeKey") {
+		t.Errorf("expected original command inside wrapper, got %q", last)
 	}
 }
 
