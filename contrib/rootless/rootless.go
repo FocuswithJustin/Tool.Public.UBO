@@ -245,7 +245,7 @@ DEV=""
 if [ -f /etc/crypttab ]; then
     SRC=$(awk 'NF && !/^#/{print $2; exit}' /etc/crypttab)
     case "$SRC" in
-      UUID=*) DEV="/dev/disk/by-uuid/${SRC#UUID=}" ;;
+      UUID=*) DEV=$(blkid -U "${SRC#UUID=}" 2>/dev/null); [ -z "$DEV" ] && DEV="/dev/disk/by-uuid/${SRC#UUID=}" ;;
       PARTUUID=*) DEV="/dev/disk/by-partuuid/${SRC#PARTUUID=}" ;;
       LABEL=*) DEV="/dev/disk/by-label/${SRC#LABEL=}" ;;
       PARTLABEL=*) DEV="/dev/disk/by-partlabel/${SRC#PARTLABEL=}" ;;

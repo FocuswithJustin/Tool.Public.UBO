@@ -560,10 +560,14 @@ func tearDownTunnel(wgConfigPath string) {
 // crypttabChangeKeyCmd resolves the first LUKS backing device from /etc/crypttab
 // to a usable device path before running cryptsetup luksChangeKey. crypttab
 // field 2 is commonly a tag form (UUID=, PARTUUID=, LABEL=, PARTLABEL=) that
-// cryptsetup rejects directly, so each tag is mapped to its /dev/disk/by-* path.
-const crypttabChangeKeyCmd = `SRC=$(awk 'NF && !/^#/{print $2; exit}' /etc/crypttab)
+// cryptsetup rejects directly, so each tag is mapped to a real block device.
+// UUID= is resolved via blkid -U (more reliable than /dev/disk/by-uuid/ which
+// may not exist in early boot or non-interactive SSH sessions). Non-interactive
+// SSH sessions often have a minimal PATH that omits /sbin; prepend it explicitly.
+const crypttabChangeKeyCmd = `PATH=/usr/local/sbin:/usr/sbin:/sbin:$PATH
+SRC=$(awk 'NF && !/^#/{print $2; exit}' /etc/crypttab)
 case "$SRC" in
-  UUID=*) DEV="/dev/disk/by-uuid/${SRC#UUID=}" ;;
+  UUID=*) DEV=$(blkid -U "${SRC#UUID=}" 2>/dev/null); [ -z "$DEV" ] && DEV="/dev/disk/by-uuid/${SRC#UUID=}" ;;
   PARTUUID=*) DEV="/dev/disk/by-partuuid/${SRC#PARTUUID=}" ;;
   LABEL=*) DEV="/dev/disk/by-label/${SRC#LABEL=}" ;;
   PARTLABEL=*) DEV="/dev/disk/by-partlabel/${SRC#PARTLABEL=}" ;;
@@ -577,7 +581,7 @@ cryptsetup luksChangeKey "$DEV"`
 func runChangeKey(client *remote.Client, cfg *config.Config) (bool, error) {
 	changeCmd := crypttabChangeKeyCmd
 	if cfg.LUKS.Device != "" {
-		changeCmd = fmt.Sprintf("cryptsetup luksChangeKey %q", cfg.LUKS.Device)
+		changeCmd = fmt.Sprintf("PATH=/usr/local/sbin:/usr/sbin:/sbin:$PATH cryptsetup luksChangeKey %q", cfg.LUKS.Device)
 	}
 
 	fmt.Println("[ubo] changing LUKS passphrase (enter current passphrase, then new passphrase twice)...")

@@ -678,6 +678,199 @@ func TestUBOUnlock_HostKeyMismatch_Integration(t *testing.T) {
 	t.Fatal("expected unlock to fail with host key mismatch but it did not")
 }
 
+// newLUKSPassphrase is the passphrase we change to in unlock-change tests.
+const newLUKSPassphrase = "newtestphrase"
+
+// setupChangeKeyUser creates a non-root user on the client VM and populates its
+// home directory with the artifacts that 'ubo unlock change' needs: the WG/SSH
+// unlock artifacts in ~/ubo-out, the admin SSH key for the direct-SSH fallback,
+// and a ubo.toml whose paths all point into the user's home.
+func setupChangeKeyUser(t *testing.T, user string) {
+	t.Helper()
+	runOnClient(t, false, fmt.Sprintf(
+		"cp /root/ubo /usr/local/bin/ubo && chmod 755 /usr/local/bin/ubo && "+
+			"id %s 2>/dev/null || useradd -m %s && "+
+			"mkdir -p /home/%s/ubo-out && "+
+			"cp /root/ubo-out/* /home/%s/ubo-out/ && "+
+			"cp /root/test_ed25519 /home/%s/test_ed25519 && "+
+			"chmod 600 /home/%s/test_ed25519 && "+
+			"sed 's|/root/ubo-out|/home/%s/ubo-out|g; s|/root/test_ed25519|/home/%s/test_ed25519|g' "+
+			"/root/ubo.toml > /home/%s/ubo.toml && "+
+			"chown -R %s: /home/%s/ubo-out /home/%s/ubo.toml /home/%s/test_ed25519 && "+
+			"chmod 700 /home/%s/ubo-out",
+		user, user, user, user, user, user, user, user, user, user, user, user, user, user))
+}
+
+// pushChangeKeyExpect installs an expect script on the client that drives
+// 'ubo unlock change'. oldPass is the current LUKS passphrase; newPass is the
+// desired replacement. If unlockAfter is true, the script also answers Y to
+// "boot now?" and supplies newPass to the subsequent cryptroot-unlock prompt.
+func pushChangeKeyExpect(t *testing.T, unlockCmd string, unlockAfter bool) {
+	t.Helper()
+	bootLine := ""
+	unlockLines := ""
+	if unlockAfter {
+		bootLine = `  -re {(?i)boot now} { send "y\r"; exp_continue }`
+		unlockLines = "  -re {(?i)(unlock disk|enter passphrase)} { send \"$newpass\\r\"; exp_continue }\n" +
+			"  -re {(?i)unlock complete} { }"
+	}
+	script := fmt.Sprintf(`#!/usr/bin/expect -f
+set timeout 200
+set oldpass [lindex $argv 0]
+set newpass [lindex $argv 1]
+spawn bash -c {%s}
+expect {
+  -re {(?i)passphrase to be changed}  { send "$oldpass\r"; exp_continue }
+  -re {(?i)new passphrase}            { send "$newpass\r"; exp_continue }
+  -re {(?i)verify passphrase}         { send "$newpass\r"; exp_continue }
+%s
+%s
+  timeout { puts "EXPECT_TIMEOUT"; exit 1 }
+  eof { }
+}
+catch wait result
+exit [lindex $result 3]
+`, unlockCmd, bootLine, unlockLines)
+	writeRemoteFile(t, "/root/do-change.exp", script)
+}
+
+// changeKeySucceeded reports whether the expect output from 'ubo unlock change'
+// indicates success. For the direct-SSH path (unlockAfter=false) success means
+// no EXPECT_TIMEOUT or error; for the initramfs path it requires "unlock complete".
+func changeKeySucceeded(out string, unlockAfter bool) bool {
+	if strings.Contains(out, "EXPECT_TIMEOUT") {
+		return false
+	}
+	if unlockAfter {
+		return strings.Contains(out, "unlock complete")
+	}
+	return !strings.Contains(out, "error") && !strings.Contains(out, "Error")
+}
+
+// runUboUnlockChangeAsUser drives 'ubo unlock change' as a non-root user on the
+// client via expect, passing oldPass and newPass as argv. When unlockAfter is
+// true the expect script also handles the subsequent cryptroot-unlock prompt.
+// Returns true on success.
+func runUboUnlockChangeAsUser(t *testing.T, user string, unlockAfter bool) bool {
+	t.Helper()
+	dir := coverDir()
+	cfgPath := fmt.Sprintf("/home/%s/ubo.toml", user)
+	unlockCmd := fmt.Sprintf("runuser -u %s -- /usr/local/bin/ubo unlock change --config %s", user, cfgPath)
+	if dir != "" {
+		runOnClient(t, false, "mkdir -p /tmp/ubocov && chmod 1777 /tmp/ubocov")
+		unlockCmd = fmt.Sprintf("GOCOVERDIR=/tmp/ubocov runuser -u %s -- /usr/local/bin/ubo unlock change --config %s", user, cfgPath)
+	}
+	pushChangeKeyExpect(t, unlockCmd, unlockAfter)
+
+	attempts := 3
+	if unlockAfter {
+		attempts = 4 // initramfs path may need a retry while WG peer comes up
+	}
+	for attempt := 1; attempt <= attempts; attempt++ {
+		out := runOnClient(t, true,
+			"expect /root/do-change.exp "+luksPassphrase+" "+newLUKSPassphrase+" 2>&1")
+		t.Logf("ubo unlock change (as %s) attempt %d:\n%s", user, attempt, out)
+		if changeKeySucceeded(out, unlockAfter) {
+			collectVMCoverage(t, dir)
+			return true
+		}
+		time.Sleep(15 * time.Second)
+	}
+	return false
+}
+
+// TestUBOUnlockChange_DirectSSH_Integration exercises the 'ubo unlock change'
+// direct-SSH fallback path: the server is running normally (not in the initramfs
+// Dropbear stage), so the WireGuard tunnel attempt times out and the code falls
+// back to changeKeyDirectSSH, which connects to the live system's sshd and runs
+// cryptsetup luksChangeKey interactively.
+func TestUBOUnlockChange_DirectSSH_Integration(t *testing.T) {
+	checkLUKSPrereqs(t)
+
+	bootTimeout, setupTimeout := unlockTimeouts(t)
+
+	t.Log("Building client seed + booting client VM...")
+	seed := buildClientSeed(t)
+	startClientVM(t, seed)
+	waitForSSHReadyPort(t, clientSSHPort, bootTimeout)
+	t.Log("Waiting for client NAT/dnsmasq setup...")
+	waitForClientSetup(t, setupTimeout)
+
+	t.Log("Deploying ubo + key to client...")
+	scpToClient(t, buildStaticUbo(t), "/root/ubo")
+	scpToClient(t, tmpPath("test_ed25519"), "/root/test_ed25519")
+	runOnClient(t, false, "chmod +x /root/ubo && chmod 600 /root/test_ed25519")
+
+	t.Log("Booting LUKS server on the link...")
+	srv := startLinkedServer(t)
+	t.Log("Unlocking server first boot over serial...")
+	srv.unlock(t, bootTimeout)
+	waitServerSSHFromClient(t, bootTimeout)
+
+	t.Log("Running ubo run...")
+	runUboRunFromClient(t)
+
+	// Server remains running (NOT rebooted into initramfs). The WireGuard tunnel
+	// will time out because port 51820 is not listening on the running system,
+	// triggering the direct-SSH fallback path in changeKeyDirectSSH.
+	t.Log("Setting up non-root user for unlock-change test...")
+	setupChangeKeyUser(t, "ubotest")
+
+	t.Log("Running ubo unlock change (expect WG timeout → direct SSH fallback)...")
+	if !runUboUnlockChangeAsUser(t, "ubotest", false) {
+		t.Fatalf("ubo unlock change did not complete via direct SSH; server serial tail:\n%s",
+			tailFile(tmpPath("server-serial.log"), 30))
+	}
+	t.Log("LUKS passphrase changed via direct SSH fallback: OK")
+}
+
+// TestUBOUnlockChange_Initramfs_Integration exercises the 'ubo unlock change'
+// initramfs path: the server is in the Dropbear+WireGuard initramfs stage, the
+// WireGuard tunnel connects, luksChangeKey is run interactively, and then (after
+// answering Y to "boot now?") cryptroot-unlock is driven with the new passphrase.
+// The server must boot to the decrypted system.
+func TestUBOUnlockChange_Initramfs_Integration(t *testing.T) {
+	checkLUKSPrereqs(t)
+
+	bootTimeout, setupTimeout := unlockTimeouts(t)
+
+	t.Log("Building client seed + booting client VM...")
+	seed := buildClientSeed(t)
+	startClientVM(t, seed)
+	waitForSSHReadyPort(t, clientSSHPort, bootTimeout)
+	t.Log("Waiting for client NAT/dnsmasq setup...")
+	waitForClientSetup(t, setupTimeout)
+
+	t.Log("Deploying ubo + key to client...")
+	scpToClient(t, buildStaticUbo(t), "/root/ubo")
+	scpToClient(t, tmpPath("test_ed25519"), "/root/test_ed25519")
+	runOnClient(t, false, "chmod +x /root/ubo && chmod 600 /root/test_ed25519")
+
+	t.Log("Booting LUKS server on the link...")
+	srv := startLinkedServer(t)
+	t.Log("Unlocking server first boot over serial...")
+	srv.unlock(t, bootTimeout)
+	waitServerSSHFromClient(t, bootTimeout)
+
+	t.Log("Running ubo run...")
+	runUboRunFromClient(t)
+
+	t.Log("Setting up non-root user for unlock-change test...")
+	setupChangeKeyUser(t, "ubotest")
+
+	t.Log("Rebooting server into Dropbear+WireGuard initramfs...")
+	rebootServerFromClient(t)
+	time.Sleep(35 * time.Second)
+
+	t.Log("Running ubo unlock change (initramfs path: change key then boot)...")
+	if !runUboUnlockChangeAsUser(t, "ubotest", true) {
+		t.Fatalf("ubo unlock change in initramfs did not complete; server serial tail:\n%s",
+			tailFile(tmpPath("server-serial.log"), 50))
+	}
+
+	verifyServerDecrypted(t, bootTimeout)
+}
+
 // looksLikeSSHRejection returns true when unlock output suggests the SSH
 // handshake was rejected (as opposed to the tunnel not yet being reachable).
 func looksLikeSSHRejection(out string) bool {

@@ -338,6 +338,41 @@ func checkRemoteBootConfig(t *testing.T) {
 	}
 }
 
+// TestUBOInit_Integration runs 'ubo init' and verifies it produces a valid TOML
+// config file containing all expected sections. No VM is required.
+func TestUBOInit_Integration(t *testing.T) {
+	checkPrereqs(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "ubo-init-test.toml")
+
+	ubo := exec.Command(filepath.Join(projectRoot(), "ubo"), "init", "--config", cfgPath)
+	ubo.Stdout = os.Stdout
+	ubo.Stderr = os.Stderr
+	if err := ubo.Run(); err != nil {
+		t.Fatalf("ubo init: %v", err)
+	}
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read generated config: %v", err)
+	}
+	content := string(data)
+
+	for _, want := range []string{"[ssh]", "[wireguard]", "[dropbear]", "[output]", "[network]", "[luks]"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("generated config missing section %s", want)
+		}
+	}
+
+	// Running init again on the same path must fail (file already exists).
+	ubo2 := exec.Command(filepath.Join(projectRoot(), "ubo"), "init", "--config", cfgPath)
+	if err := ubo2.Run(); err == nil {
+		t.Error("expected ubo init to fail when config already exists")
+	}
+
+	t.Log("ubo init: OK")
+}
+
 // TestUBOBinaryErrorExit exercises main()'s error path (fmt.Fprintf + os.Exit(1))
 // by calling the binary with a nonexistent config file. The coverage-instrumented
 // binary writes coverage data before os.Exit, so the error-exit branch is captured.
