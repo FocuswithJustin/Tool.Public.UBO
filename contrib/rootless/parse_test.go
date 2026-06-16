@@ -91,8 +91,11 @@ func TestB64ToHex_wrongLength(t *testing.T) {
 func TestBuildChangeLUKSCmd_deviceFromConfig(t *testing.T) {
 	cfg := &config.Config{LUKS: config.LUKSConfig{Device: "/dev/sda3"}}
 	cmd := buildChangeLUKSCmd(cfg)
-	if cmd != `cryptsetup luksChangeKey "/dev/sda3"` {
+	if !strings.Contains(cmd, `cryptsetup luksChangeKey "/dev/sda3"`) {
 		t.Errorf("unexpected cmd for explicit device: %q", cmd)
+	}
+	if !strings.Contains(cmd, "PATH=") {
+		t.Errorf("cmd must set PATH for non-interactive SSH: %q", cmd)
 	}
 }
 

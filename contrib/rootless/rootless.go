@@ -234,10 +234,14 @@ func runUnlock(client *ssh.Client) error {
 // detected from /etc/crypttab (running system) or blkid (initramfs at boot,
 // where /etc/crypttab lives on the encrypted root and is not yet accessible).
 func buildChangeLUKSCmd(cfg *config.Config) string {
+	// Non-interactive SSH sessions often have a minimal PATH that omits /sbin and
+	// /usr/sbin. Prepend them so cryptsetup and blkid are always found.
+	const sbinPath = `PATH=/usr/local/sbin:/usr/sbin:/sbin:$PATH`
 	if cfg.LUKS.Device != "" {
-		return fmt.Sprintf("cryptsetup luksChangeKey %q", cfg.LUKS.Device)
+		return fmt.Sprintf("%s cryptsetup luksChangeKey %q", sbinPath, cfg.LUKS.Device)
 	}
-	return `DEV=""
+	return sbinPath + `
+DEV=""
 if [ -f /etc/crypttab ]; then
     SRC=$(awk 'NF && !/^#/{print $2; exit}' /etc/crypttab)
     case "$SRC" in
