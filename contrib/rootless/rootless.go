@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
 	"os"
 	"strings"
@@ -34,6 +35,23 @@ var (
 	stdinReader      io.Reader = os.Stdin
 	remoteConnectFn            = remote.Connect
 	remoteInteractFn           = remote.InteractiveSession
+
+	// waitTunnel timing — set small in tests to avoid 15s/1s real delays.
+	waitTunnelDuration time.Duration = 15 * time.Second
+	waitTunnelSleep    time.Duration = time.Second
+
+	// netDialFn wraps tnet.DialContextTCPAddrPort so tests can inject fake conns.
+	netDialFn = func(ctx context.Context, tnet *netstack.Net, addr netip.AddrPort) (net.Conn, error) {
+		return tnet.DialContextTCPAddrPort(ctx, addr)
+	}
+
+	// requestPtyFn wraps session.RequestPty so tests can inject PTY-request errors.
+	requestPtyFn = func(s *ssh.Session, term string, h, w int, modes ssh.TerminalModes) error {
+		return s.RequestPty(term, h, w, modes)
+	}
+
+	// isTerminalFn wraps term.IsTerminal so tests can force the non-terminal path.
+	isTerminalFn = func(fd int) bool { return term.IsTerminal(fd) }
 )
 
 // Unlock brings up a userspace WireGuard tunnel, connects to Dropbear over it
@@ -114,10 +132,10 @@ func buildIPC(wgCfg *wgClientConfig) (string, error) {
 
 // waitTunnel polls the server over the netstack until reachable or timeout.
 func waitTunnel(ctx context.Context, tnet *netstack.Net, addr netip.AddrPort) error {
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(waitTunnelDuration)
 	for time.Now().Before(deadline) {
-		dialCtx, cancel := context.WithTimeout(ctx, time.Second)
-		c, err := tnet.DialContextTCPAddrPort(dialCtx, addr)
+		dialCtx, cancel := context.WithTimeout(ctx, waitTunnelSleep)
+		c, err := netDialFn(dialCtx, tnet, addr)
 		cancel()
 		if err == nil {
 			c.Close()
@@ -126,10 +144,10 @@ func waitTunnel(ctx context.Context, tnet *netstack.Net, addr netip.AddrPort) er
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(time.Second):
+		case <-time.After(waitTunnelSleep):
 		}
 	}
-	return fmt.Errorf("tunnel to %s not reachable after 15s", addr)
+	return fmt.Errorf("tunnel to %s not reachable after %v", addr, waitTunnelDuration)
 }
 
 // dialSSH reads the client SSH key and pinned host key, then opens an SSH
@@ -145,7 +163,7 @@ func dialSSH(ctx context.Context, tnet *netstack.Net, addr netip.AddrPort, outpu
 	}
 
 	fmt.Printf("[ubo] connecting to Dropbear at %s (rootless)...\n", addr)
-	tcpConn, err := tnet.DialContextTCPAddrPort(ctx, addr)
+	tcpConn, err := netDialFn(ctx, tnet, addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial Dropbear: %w", err)
 	}
@@ -342,14 +360,14 @@ func attachPTY(session *ssh.Session) (func(), error) {
 	if width == 0 {
 		width, height = 80, 24
 	}
-	if err := session.RequestPty("xterm-256color", height, width, ssh.TerminalModes{
+	if err := requestPtyFn(session, "xterm-256color", height, width, ssh.TerminalModes{
 		ssh.ECHO:          1,
 		ssh.TTY_OP_ISPEED: 14400,
 		ssh.TTY_OP_OSPEED: 14400,
 	}); err != nil {
 		return nil, fmt.Errorf("request PTY: %w", err)
 	}
-	if !term.IsTerminal(fd) {
+	if !isTerminalFn(fd) {
 		return nil, nil
 	}
 	oldState, err := term.MakeRaw(fd)

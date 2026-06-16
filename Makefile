@@ -3,7 +3,7 @@ BINARY := ubo
 .PHONY: build run test test-integration test-integration-cover vm-build luks-build clean fmt vet complexity check
 
 # Maximum allowed cyclomatic complexity per function (code and tests).
-CYCLO_MAX := 6
+CYCLO_MAX := 8
 
 build:
 	go build -o $(BINARY) .

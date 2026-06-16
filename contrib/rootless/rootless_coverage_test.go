@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ed25519"
 	gossh "golang.org/x/crypto/ssh"
@@ -461,5 +462,222 @@ func TestPerformUnlock_dialError(t *testing.T) {
 	err := performUnlock(context.Background(), nil, netip.AddrPort{}, "", &config.Config{}, false)
 	if err == nil || !strings.Contains(err.Error(), "dial boom") {
 		t.Errorf("want dial error, got %v", err)
+	}
+}
+
+func TestPerformUnlock_changeKeyPath(t *testing.T) {
+	origDial := dialSSHFn
+	t.Cleanup(func() { dialSSHFn = origDial })
+	dialSSHFn = func(_ context.Context, _ *netstack.Net, _ netip.AddrPort, _ string, _ *config.Config) (*gossh.Client, error) {
+		return makeTestClient(t), nil
+	}
+	origCK := runChangeKeyFn
+	t.Cleanup(func() { runChangeKeyFn = origCK })
+	runChangeKeyFn = func(_ *gossh.Client, _ *config.Config) (bool, error) { return false, nil }
+
+	err := performUnlock(context.Background(), nil, netip.AddrPort{}, "", &config.Config{}, true)
+	if err != nil {
+		t.Errorf("changeKey path should return nil, got %v", err)
+	}
+}
+
+// ── setupWGDevice error paths ─────────────────────────────────────────────────
+
+func TestSetupWGDevice_badAddress(t *testing.T) {
+	_, _, err := setupWGDevice(&wgClientConfig{Address: "not-a-valid-ip"})
+	if err == nil || !strings.Contains(err.Error(), "parse client address") {
+		t.Errorf("want parse address error, got %v", err)
+	}
+}
+
+func TestSetupWGDevice_badPrivKey(t *testing.T) {
+	// valid address so parseFirstAddr+CreateNetTUN succeed; bad key makes buildIPC fail.
+	_, _, err := setupWGDevice(&wgClientConfig{
+		Address:    "10.42.0.2/32",
+		PrivateKey: "!!!not-base64!!!",
+		PeerPubKey: "qGVoBkUNFByAaJqKPGjNBOCHqEfOmNJXLb2Sz3zMpEY=",
+		Endpoint:   "10.99.0.2:51820",
+		AllowedIPs: "10.42.0.1/32",
+	})
+	if err == nil || !strings.Contains(err.Error(), "private key") {
+		t.Errorf("want private key error, got %v", err)
+	}
+}
+
+// ── Unlock early-exit paths ───────────────────────────────────────────────────
+
+func TestUnlock_missingWGConf(t *testing.T) {
+	err := Unlock(context.Background(), &config.Config{}, t.TempDir(), false)
+	if err == nil || !strings.Contains(err.Error(), "open wg config") {
+		t.Errorf("want open-wg-config error, got %v", err)
+	}
+}
+
+func TestUnlock_badWGConfig(t *testing.T) {
+	// parseWGConfig succeeds (valid INI) but setupWGDevice fails (bad base64 key).
+	dir := t.TempDir()
+	conf := "[Interface]\nPrivateKey = !!!bad!!!\nAddress = 10.42.0.2/32\n\n" +
+		"[Peer]\nPublicKey = also!!!bad\nEndpoint = 10.99.0.2:51820\nAllowedIPs = 10.42.0.1/32\n"
+	if err := os.WriteFile(dir+"/client_wg.conf", []byte(conf), 0600); err != nil {
+		t.Fatalf("write wg conf: %v", err)
+	}
+	err := Unlock(context.Background(), &config.Config{}, dir, false)
+	if err == nil || !strings.Contains(err.Error(), "private key") {
+		t.Errorf("want private key error, got %v", err)
+	}
+}
+
+// ── waitTunnel paths ──────────────────────────────────────────────────────────
+
+func TestWaitTunnel_contextCancelled(t *testing.T) {
+	origDial := netDialFn
+	t.Cleanup(func() { netDialFn = origDial })
+	netDialFn = func(ctx context.Context, _ *netstack.Net, _ netip.AddrPort) (net.Conn, error) {
+		return nil, ctx.Err() // reflect whatever the context says
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel → first dial returns context.Canceled → select fires ctx.Done
+
+	err := waitTunnel(ctx, nil, netip.AddrPort{})
+	if err != context.Canceled {
+		t.Errorf("want context.Canceled, got %v", err)
+	}
+}
+
+func TestWaitTunnel_timeout(t *testing.T) {
+	origDial := netDialFn
+	t.Cleanup(func() { netDialFn = origDial })
+	netDialFn = func(_ context.Context, _ *netstack.Net, _ netip.AddrPort) (net.Conn, error) {
+		return nil, fmt.Errorf("no route")
+	}
+
+	origDur := waitTunnelDuration
+	origSlp := waitTunnelSleep
+	t.Cleanup(func() { waitTunnelDuration = origDur; waitTunnelSleep = origSlp })
+	waitTunnelDuration = 1 * time.Millisecond
+	waitTunnelSleep = 1 * time.Millisecond
+
+	err := waitTunnel(context.Background(), nil, netip.AddrPort{})
+	if err == nil || !strings.Contains(err.Error(), "not reachable after") {
+		t.Errorf("want timeout error, got %v", err)
+	}
+}
+
+// ── dialSSH error paths ───────────────────────────────────────────────────────
+
+// writeDialSSHKeys writes a valid client_auth_ed25519 and dropbear_host_key.pub
+// into dir so that loadSSHKey and loadPinnedKey can succeed.
+func writeDialSSHKeys(t *testing.T, dir string) {
+	t.Helper()
+	keyPath, pubPath := genTestKey(t) // skips if ssh-keygen unavailable
+	privData, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("read generated key: %v", err)
+	}
+	pubData, err := os.ReadFile(pubPath)
+	if err != nil {
+		t.Fatalf("read generated pub key: %v", err)
+	}
+	if err := os.WriteFile(dir+"/client_auth_ed25519", privData, 0600); err != nil {
+		t.Fatalf("write client key: %v", err)
+	}
+	if err := os.WriteFile(dir+"/dropbear_host_key.pub", pubData, 0644); err != nil {
+		t.Fatalf("write host pub key: %v", err)
+	}
+}
+
+func TestDialSSH_missingKey(t *testing.T) {
+	_, err := dialSSH(context.Background(), nil, netip.AddrPort{}, t.TempDir(), &config.Config{})
+	if err == nil || !strings.Contains(err.Error(), "client_auth_ed25519") {
+		t.Errorf("want missing-key error, got %v", err)
+	}
+}
+
+func TestDialSSH_missingHostKey(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, _ := genTestKey(t)
+	privData, _ := os.ReadFile(keyPath)
+	os.WriteFile(dir+"/client_auth_ed25519", privData, 0600) //nolint:errcheck
+	// no dropbear_host_key.pub
+
+	_, err := dialSSH(context.Background(), nil, netip.AddrPort{}, dir, &config.Config{})
+	if err == nil || !strings.Contains(err.Error(), "dropbear_host_key.pub") {
+		t.Errorf("want missing-host-key error, got %v", err)
+	}
+}
+
+func TestDialSSH_dialFail(t *testing.T) {
+	orig := netDialFn
+	t.Cleanup(func() { netDialFn = orig })
+	netDialFn = func(_ context.Context, _ *netstack.Net, _ netip.AddrPort) (net.Conn, error) {
+		return nil, fmt.Errorf("dial refused")
+	}
+
+	dir := t.TempDir()
+	writeDialSSHKeys(t, dir)
+	_, err := dialSSH(context.Background(), nil, netip.AddrPort{}, dir, &config.Config{})
+	if err == nil || !strings.Contains(err.Error(), "dial Dropbear") {
+		t.Errorf("want dial error, got %v", err)
+	}
+}
+
+func TestDialSSH_handshakeFail(t *testing.T) {
+	orig := netDialFn
+	t.Cleanup(func() { netDialFn = orig })
+	// Provide a pipe whose server side closes immediately → SSH gets EOF during handshake.
+	c1, c2 := net.Pipe()
+	c2.Close()
+	netDialFn = func(_ context.Context, _ *netstack.Net, _ netip.AddrPort) (net.Conn, error) {
+		return c1, nil
+	}
+
+	dir := t.TempDir()
+	writeDialSSHKeys(t, dir)
+	_, err := dialSSH(context.Background(), nil, netip.AddrPort{}, dir, &config.Config{})
+	if err == nil || !strings.Contains(err.Error(), "SSH handshake") {
+		t.Errorf("want handshake error, got %v", err)
+	}
+}
+
+// ── runPTY / attachPTY error paths ────────────────────────────────────────────
+
+func TestRunPTY_sessionOpenError(t *testing.T) {
+	// makeTestClient server rejects all channel opens → NewSession fails.
+	client := makeTestClient(t)
+	err := runPTY(client, "test-cmd")
+	if err == nil || !strings.Contains(err.Error(), "open SSH session") {
+		t.Errorf("want session-open error, got %v", err)
+	}
+}
+
+func TestAttachPTY_requestPtyError(t *testing.T) {
+	orig := requestPtyFn
+	t.Cleanup(func() { requestPtyFn = orig })
+	requestPtyFn = func(_ *gossh.Session, _ string, _, _ int, _ gossh.TerminalModes) error {
+		return fmt.Errorf("pty rejected by server")
+	}
+
+	_, err := attachPTY(nil) // session unused when requestPtyFn is seamed
+	if err == nil || !strings.Contains(err.Error(), "request PTY") {
+		t.Errorf("want PTY request error, got %v", err)
+	}
+}
+
+func TestAttachPTY_notTerminal(t *testing.T) {
+	origReq := requestPtyFn
+	t.Cleanup(func() { requestPtyFn = origReq })
+	requestPtyFn = func(_ *gossh.Session, _ string, _, _ int, _ gossh.TerminalModes) error { return nil }
+
+	origTerm := isTerminalFn
+	t.Cleanup(func() { isTerminalFn = origTerm })
+	isTerminalFn = func(_ int) bool { return false }
+
+	restore, err := attachPTY(nil)
+	if err != nil {
+		t.Errorf("non-terminal stdin: want nil error, got %v", err)
+	}
+	if restore != nil {
+		t.Error("non-terminal stdin: want nil restore func")
 	}
 }
