@@ -116,11 +116,22 @@ func buildSetupScriptData(cfg *config.Config, keys *keygen.Keys, netInfo *Networ
 		return templates.SetupScriptData{}, err
 	}
 
+	// Bridge interfaces (e.g. br0) don't exist in initramfs. Use the first
+	// bridge port (physical NIC) for both the initramfs WireGuard script and
+	// the GRUB ip= kernel parameter. The NIC driver is still detected
+	// correctly because the port name resolves directly to its driver.
+	initramfsIface := netInfo.Interface
+	if len(netInfo.BridgePorts) > 0 {
+		initramfsIface = netInfo.BridgePorts[0]
+		fmt.Printf("[ubo]   bridge detected: using port %s for initramfs networking (bridge %s is not present in initramfs)\n",
+			initramfsIface, netInfo.Interface)
+	}
+
 	initScript, err := templates.RenderInitramfsScript(templates.InitramfsScriptData{
 		ServerIP:    cfg.WireGuard.ServerIP,
 		StaticIP:    fmt.Sprintf("%s/%d", netInfo.IP, netInfo.Prefix),
 		GatewayIP:   netInfo.Gateway,
-		Interface:   netInfo.Interface,
+		Interface:   initramfsIface,
 		VLANPhysdev: netInfo.VLANPhysdev,
 		VLANID:      netInfo.VLANID,
 		BondSlaves:  strings.Join(netInfo.BondSlaves, " "),
@@ -153,7 +164,7 @@ func buildSetupScriptData(cfg *config.Config, keys *keygen.Keys, netInfo *Networ
 		NetGateway:      netInfo.Gateway,
 		NetMask:         prefixToNetmask(netInfo.Prefix),
 		NetHostname:     netInfo.Hostname,
-		NetInterface:    netInfo.Interface,
+		NetInterface:    initramfsIface,
 	}, nil
 }
 

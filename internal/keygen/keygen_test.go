@@ -7,20 +7,6 @@ import (
 	"testing"
 )
 
-// skipIfToolMissing skips the test if the error indicates a required external
-// tool (wg, ssh-keygen) is not available in PATH.
-func skipIfToolMissing(t *testing.T, err error) {
-	t.Helper()
-	if err == nil {
-		return
-	}
-	for _, sig := range []string{"wg genkey", "ssh-keygen", "executable file not found"} {
-		if strings.Contains(err.Error(), sig) {
-			t.Skipf("required tool not in PATH; skipping: %v", err)
-		}
-	}
-}
-
 // assertFileMode fails unless dir/name exists with the expected permission bits.
 func assertFileMode(t *testing.T, dir, name string, want os.FileMode) {
 	t.Helper()
@@ -49,7 +35,6 @@ func TestGenerateWireGuardKeypair(t *testing.T) {
 	dir := t.TempDir()
 
 	priv, pub, err := GenerateWireGuardKeypair("test_wg", dir)
-	skipIfToolMissing(t, err)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -79,7 +64,6 @@ func TestGenerateSSHKeypair(t *testing.T) {
 	dir := t.TempDir()
 
 	keyPath, pubKey, err := GenerateSSHKeypair("client_auth", dir)
-	skipIfToolMissing(t, err)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -112,7 +96,6 @@ func TestGenerateSSHKeypair_idempotent(t *testing.T) {
 	dir := t.TempDir()
 
 	_, _, err := GenerateSSHKeypair("client_auth", dir)
-	skipIfToolMissing(t, err)
 	if err != nil {
 		t.Fatalf("first call error: %v", err)
 	}
@@ -150,7 +133,6 @@ func TestGenerateAll(t *testing.T) {
 	dir := t.TempDir()
 
 	keys, err := GenerateAll(dir)
-	skipIfToolMissing(t, err)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -186,7 +168,6 @@ func TestGenerateAll_reuse(t *testing.T) {
 	dir := t.TempDir()
 
 	first, err := GenerateAll(dir)
-	skipIfToolMissing(t, err)
 	if err != nil {
 		t.Fatalf("first GenerateAll: %v", err)
 	}

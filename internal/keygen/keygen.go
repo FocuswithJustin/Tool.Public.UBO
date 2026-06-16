@@ -1,11 +1,17 @@
 package keygen
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/ssh"
 )
 
 // Keys holds all generated key material for a UBO deployment.
@@ -100,70 +106,96 @@ func readTrimmedFiles(outputDir string, names []string) ([]string, error) {
 	return vals, nil
 }
 
-// GenerateWireGuardKeypair uses wg to generate a keypair.
+// generateWGPrivateKey returns a fresh WireGuard private key as a base64
+// string. The key is a random 32-byte Curve25519 scalar clamped per RFC 7748.
+func generateWGPrivateKey() (string, error) {
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		return "", fmt.Errorf("generate random bytes: %w", err)
+	}
+	// Clamp per RFC 7748 §5 (identical to WireGuard spec).
+	key[0] &= 248
+	key[31] = (key[31] & 127) | 64
+	return base64.StdEncoding.EncodeToString(key[:]), nil
+}
+
+// deriveWGPublicKey computes the Curve25519 public key for a base64-encoded
+// WireGuard private key.
+func deriveWGPublicKey(privateB64 string) (string, error) {
+	priv, err := base64.StdEncoding.DecodeString(privateB64)
+	if err != nil {
+		return "", fmt.Errorf("decode private key: %w", err)
+	}
+	pub, err := curve25519.X25519(priv, curve25519.Basepoint)
+	if err != nil {
+		return "", fmt.Errorf("derive public key: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(pub), nil
+}
+
+// GenerateWireGuardKeypair generates a WireGuard keypair entirely in-process
+// using crypto/rand and golang.org/x/crypto/curve25519. No external wg binary
+// is required.
 // Private key is written to <outputDir>/<name>_private.key (mode 0600).
 // Public key is written to <outputDir>/<name>_public.key (mode 0644).
 func GenerateWireGuardKeypair(name, outputDir string) (privateKey, publicKey string, err error) {
 	privPath := filepath.Join(outputDir, name+"_private.key")
 	pubPath := filepath.Join(outputDir, name+"_public.key")
 
-	// Generate private key
-	privCmd := exec.Command("wg", "genkey")
-	privOut, err := privCmd.Output()
+	privateKey, err = generateWGPrivateKey()
 	if err != nil {
-		return "", "", fmt.Errorf("wg genkey: %w", err)
+		return "", "", err
 	}
-	privateKey = strings.TrimSpace(string(privOut))
-
 	if err := os.WriteFile(privPath, []byte(privateKey+"\n"), 0600); err != nil {
 		return "", "", fmt.Errorf("write %s: %w", privPath, err)
 	}
 
-	// Derive public key from private key
-	pubCmd := exec.Command("wg", "pubkey")
-	pubCmd.Stdin = strings.NewReader(privateKey + "\n")
-	pubOut, err := pubCmd.Output()
+	publicKey, err = deriveWGPublicKey(privateKey)
 	if err != nil {
-		os.Remove(privPath)
-		return "", "", fmt.Errorf("wg pubkey: %w", err)
+		os.Remove(privPath) //nolint:errcheck
+		return "", "", err
 	}
-	publicKey = strings.TrimSpace(string(pubOut))
-
 	if err := os.WriteFile(pubPath, []byte(publicKey+"\n"), 0644); err != nil {
-		os.Remove(privPath)
+		os.Remove(privPath) //nolint:errcheck
 		return "", "", fmt.Errorf("write %s: %w", pubPath, err)
 	}
 
 	return privateKey, publicKey, nil
 }
 
-// GenerateSSHKeypair uses ssh-keygen to create an ed25519 keypair.
-// Private key written to <outputDir>/<name> (mode 0600).
+// GenerateSSHKeypair generates an ed25519 SSH keypair entirely in-process
+// using crypto/ed25519 and golang.org/x/crypto/ssh. No external ssh-keygen
+// binary is required.
+// Private key is written to <outputDir>/<name> (mode 0600) in OpenSSH format.
 // Returns the private key path and authorized_keys-format public key string.
 func GenerateSSHKeypair(name, outputDir string) (keyPath, pubKey string, err error) {
 	keyPath = filepath.Join(outputDir, name)
 	pubPath := keyPath + ".pub"
 
-	// Remove any existing keys so ssh-keygen doesn't prompt to overwrite
-	os.Remove(keyPath)
-	os.Remove(pubPath)
-
-	cmd := exec.Command("ssh-keygen",
-		"-t", "ed25519",
-		"-f", keyPath,
-		"-N", "",
-		"-C", "ubo-client",
-	)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", "", fmt.Errorf("ssh-keygen: %w\n%s", err, strings.TrimSpace(string(out)))
-	}
-
-	pubBytes, err := os.ReadFile(pubPath)
+	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		os.Remove(keyPath)
-		return "", "", fmt.Errorf("read %s: %w", pubPath, err)
+		return "", "", fmt.Errorf("generate ed25519 key: %w", err)
 	}
-	pubKey = strings.TrimSpace(string(pubBytes))
+
+	privBlock, err := ssh.MarshalPrivateKey(edPriv, "")
+	if err != nil {
+		return "", "", fmt.Errorf("marshal private key: %w", err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(privBlock), 0600); err != nil {
+		return "", "", fmt.Errorf("write %s: %w", keyPath, err)
+	}
+
+	sshPub, err := ssh.NewPublicKey(edPub)
+	if err != nil {
+		os.Remove(keyPath) //nolint:errcheck
+		return "", "", fmt.Errorf("marshal public key: %w", err)
+	}
+	pubKey = strings.TrimSuffix(string(ssh.MarshalAuthorizedKey(sshPub)), "\n") + " ubo-client"
+
+	if err := os.WriteFile(pubPath, []byte(pubKey+"\n"), 0644); err != nil {
+		os.Remove(keyPath) //nolint:errcheck
+		return "", "", fmt.Errorf("write %s: %w", pubPath, err)
+	}
 
 	return keyPath, pubKey, nil
 }

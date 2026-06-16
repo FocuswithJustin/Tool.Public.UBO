@@ -12,8 +12,6 @@ type toolDef struct {
 }
 
 var runTools = []toolDef{
-	{"wg", "wireguard-tools"},
-	{"ssh-keygen", "openssh-client"},
 	{"ssh", "openssh-client"},
 }
 
