@@ -3,6 +3,9 @@ package setup
 import (
 	"strings"
 	"testing"
+
+	"ubo/internal/config"
+	"ubo/internal/keygen"
 )
 
 // ── isValidInterfaceName ──────────────────────────────────────────────────────
@@ -261,5 +264,83 @@ func TestFirstInetAddr_loopbackSkipped(t *testing.T) {
 	ip, prefix := firstInetAddr(out)
 	if ip != "127.0.0.1" || prefix != 8 {
 		t.Errorf("firstInetAddr loopback = (%q, %d); want (127.0.0.1, 8)", ip, prefix)
+	}
+}
+
+// ── buildSetupScriptData: bridge topology ─────────────────────────────────────
+
+// minCfg returns a Config with the minimum fields needed by buildSetupScriptData.
+func minCfg() *config.Config {
+	return &config.Config{
+		WireGuard: config.WGConfig{
+			Port:     51820,
+			ServerIP: "10.42.0.1/24",
+			ClientIP: "10.42.0.2/32",
+		},
+		Dropbear: config.DBConfig{Port: 22},
+	}
+}
+
+// minKeys returns a Keys struct with the minimum fields needed by buildSetupScriptData.
+func minKeys() *keygen.Keys {
+	return &keygen.Keys{
+		ServerWGPrivate: "privatekey",
+		ServerWGPublic:  "publickey",
+		ClientWGPublic:  "clientpub",
+		ClientSSHPubKey: "ssh-ed25519 AAAA ubo-client",
+	}
+}
+
+// minNetInfo returns a plain-NIC NetworkInfo.
+func minNetInfo() *NetworkInfo {
+	return &NetworkInfo{
+		Interface: "eth0",
+		IP:        "192.168.1.100",
+		Prefix:    24,
+		Gateway:   "192.168.1.1",
+		Hostname:  "server",
+	}
+}
+
+// TestBuildSetupScriptData_bridgeUsesFirstPort verifies that when the default-
+// route interface is a bridge (e.g. br0), buildSetupScriptData substitutes the
+// first bridge port for both the initramfs WireGuard script and the GRUB ip=
+// parameter. br0 does not exist in initramfs; the physical NIC does.
+func TestBuildSetupScriptData_bridgeUsesFirstPort(t *testing.T) {
+	ni := minNetInfo()
+	ni.Interface = "br0"
+	ni.BridgePorts = []string{"enp0s3", "enp0s4"}
+
+	data, err := buildSetupScriptData(minCfg(), minKeys(), ni)
+	if err != nil {
+		t.Fatalf("buildSetupScriptData: %v", err)
+	}
+
+	if data.NetInterface != "enp0s3" {
+		t.Errorf("NetInterface = %q; want enp0s3 (first bridge port)", data.NetInterface)
+	}
+	if strings.Contains(data.InitramfsScript, `IFACE="br0"`) {
+		t.Error("initramfs script must not reference br0 (bridge not present in initramfs)")
+	}
+	if !strings.Contains(data.InitramfsScript, `IFACE="enp0s3"`) {
+		t.Error("initramfs script should reference enp0s3 (first bridge port)")
+	}
+}
+
+// TestBuildSetupScriptData_plainNIC verifies that a plain NIC passes through
+// unchanged — the bridge fix must not alter non-bridge setups.
+func TestBuildSetupScriptData_plainNIC(t *testing.T) {
+	ni := minNetInfo() // Interface = "eth0", no BridgePorts
+
+	data, err := buildSetupScriptData(minCfg(), minKeys(), ni)
+	if err != nil {
+		t.Fatalf("buildSetupScriptData: %v", err)
+	}
+
+	if data.NetInterface != "eth0" {
+		t.Errorf("NetInterface = %q; want eth0", data.NetInterface)
+	}
+	if !strings.Contains(data.InitramfsScript, `IFACE="eth0"`) {
+		t.Error("initramfs script should reference eth0")
 	}
 }

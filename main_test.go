@@ -962,6 +962,212 @@ func TestCmdUnlock_missingFiles(t *testing.T) {
 	}
 }
 
+// --- findConfigByHost -------------------------------------------------------
+
+func TestFindConfigByHost_found(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(orig) })
+
+	hostDir := filepath.Join(dir, "ubo-192.168.1.100")
+	if err := os.MkdirAll(hostDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfgFile := filepath.Join(hostDir, "ubo.toml")
+	if err := os.WriteFile(cfgFile, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := findConfigByHost("192.168.1.100")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := filepath.Join("ubo-192.168.1.100", "ubo.toml")
+	if got != want {
+		t.Errorf("got %q; want %q", got, want)
+	}
+}
+
+func TestFindConfigByHost_notFound(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(orig) })
+
+	_, err := findConfigByHost("10.0.0.1")
+	if err == nil {
+		t.Fatal("expected error for missing host dir")
+	}
+	if !strings.Contains(err.Error(), "10.0.0.1") {
+		t.Errorf("error %v should mention host", err)
+	}
+}
+
+// --- pickUnlockConfig -------------------------------------------------------
+
+func TestPickUnlockConfig_none(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(orig) })
+
+	_, err := pickUnlockConfig()
+	if err == nil {
+		t.Fatal("expected error when no ubo dirs exist")
+	}
+	if !strings.Contains(err.Error(), "no ubo output directories") {
+		t.Errorf("error = %v; want 'no ubo output directories'", err)
+	}
+}
+
+func TestPickUnlockConfig_single(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(orig) })
+
+	hostDir := filepath.Join(dir, "ubo-10.0.0.1")
+	if err := os.MkdirAll(hostDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hostDir, "ubo.toml"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := captureStdout(t, func() {
+		p, err := pickUnlockConfig()
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+			return
+		}
+		if p != filepath.Join("ubo-10.0.0.1", "ubo.toml") {
+			t.Errorf("got %q; want ubo-10.0.0.1/ubo.toml", p)
+		}
+	})
+	if !strings.Contains(got, "ubo-10.0.0.1") {
+		t.Errorf("output %q should mention the selected dir", got)
+	}
+}
+
+// --- resolveUnlockConfig ---------------------------------------------------
+
+func TestResolveUnlockConfig_withArg(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(orig) })
+
+	hostDir := filepath.Join(dir, "ubo-1.2.3.4")
+	if err := os.MkdirAll(hostDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hostDir, "ubo.toml"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveUnlockConfig([]string{"1.2.3.4"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != filepath.Join("ubo-1.2.3.4", "ubo.toml") {
+		t.Errorf("got %q; want ubo-1.2.3.4/ubo.toml", got)
+	}
+}
+
+// --- loadOrBootstrap --------------------------------------------------------
+
+func TestLoadOrBootstrap_explicit(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nope.toml")
+	_, err := loadOrBootstrap(missing)
+	if err == nil {
+		t.Fatal("expected error for missing explicit path")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error = %v; want 'not found'", err)
+	}
+}
+
+func TestLoadOrBootstrap_defaultTomlExists(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(orig) })
+
+	p := filepath.Join(dir, "ubo.toml")
+	writeValidConfig(t, dir, filepath.Join(dir, "out")) // writes ubo.toml into dir
+	_ = p
+	cfg, err := loadOrBootstrap("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Host != "192.168.1.100" {
+		t.Errorf("Host = %q; want 192.168.1.100", cfg.Host)
+	}
+}
+
+func TestLoadOrBootstrap_bootstrap(t *testing.T) {
+	// Seam out bootstrapConfigFn so we don't need real stdin.
+	orig := bootstrapConfigFn
+	t.Cleanup(func() { bootstrapConfigFn = orig })
+
+	called := false
+	bootstrapConfigFn = func() (*config.Config, error) {
+		called = true
+		cfg := config.Default()
+		cfg.Host = "bootstrapped-host"
+		return cfg, nil
+	}
+
+	dir := t.TempDir()
+	orig2, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(orig2) })
+
+	// No ubo.toml in dir, no explicit cfgPath → should call bootstrapConfigFn.
+	cfg, err := loadOrBootstrap("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !called {
+		t.Error("bootstrapConfigFn was not called")
+	}
+	if cfg.Host != "bootstrapped-host" {
+		t.Errorf("Host = %q; want bootstrapped-host", cfg.Host)
+	}
+}
+
+// --- cmdRun saves config to outDir -----------------------------------------
+
+func TestCmdRun_savesConfigToOutDir(t *testing.T) {
+	happyRunSeams(t)
+	dir := t.TempDir()
+	outDir := filepath.Join(dir, "out")
+	cfgPath := writeValidConfig(t, dir, outDir)
+	_ = captureStdout(t, func() {
+		if err := cmdRun(context.Background(), cfgPath); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	if _, err := os.Stat(filepath.Join(outDir, "ubo.toml")); err != nil {
+		t.Errorf("expected ubo.toml saved to outDir: %v", err)
+	}
+}
+
 // --- wgEndpoint -------------------------------------------------------------
 
 func TestWgEndpoint_ipv4(t *testing.T) {

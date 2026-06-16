@@ -49,6 +49,9 @@ var (
 	userspaceUnlock = func(ctx context.Context, cfg *config.Config, outDir string, changeKey bool) error {
 		return rootless.Unlock(ctx, cfg, outDir, changeKey)
 	}
+
+	// bootstrapConfigFn is seamed so tests can avoid reading from stdin.
+	bootstrapConfigFn = bootstrapConfig
 )
 
 const usage = `ubo — Unlock Before Operation
@@ -59,18 +62,18 @@ Usage:
   ubo [subcommand] [--config FILE]
 
 Subcommands:
-  configure      Open interactive TUI to create or edit config (default: ./ubo.toml)
-  init           Write a default config file non-interactively
-  run            Configure the remote host — generates keys, installs WireGuard+Dropbear
-  status         Report whether the output dir is configured and ready to unlock
-  unlock         Bring up WireGuard, SSH to Dropbear, unlock disk, tear down tunnel
-  unlock change  Change LUKS passphrase, then optionally unlock
+  configure           Open interactive TUI to create or edit config (default: ./ubo.toml)
+  init                Write a default config file non-interactively
+  run                 Configure the remote host — generates keys, installs WireGuard+Dropbear
+                      If no --config is given and no ubo.toml exists, prompts for connection details
+  status              Report whether the output dir is configured and ready to unlock
+  unlock [HOST]       Bring up WireGuard, SSH to Dropbear, unlock disk, tear down tunnel
+                      HOST: use the config in ./ubo-<HOST>/; omit to pick from available systems
+  unlock change [HOST] Change LUKS passphrase, then optionally unlock
 
 Flags:
-  --config FILE  Config file path (default: ./ubo.toml)
+  --config FILE  Config file path (default: ./ubo.toml for most subcommands)
   --help         Show this help
-
-Run 'ubo init' to generate a starting config, then 'ubo configure' to edit it.
 `
 
 func main() {
@@ -88,9 +91,10 @@ func dispatch(args []string) error {
 		return nil
 	}
 
-	// All subcommands share --config
+	// Default is empty so each handler can distinguish "not given" from
+	// "given as ubo.toml". Unlock resolution and run bootstrap depend on this.
 	fs := flag.NewFlagSet(sub, flag.ContinueOnError)
-	cfgPath := fs.String("config", "ubo.toml", "config file path")
+	cfgPath := fs.String("config", "", "config file path")
 	fs.Usage = func() { fmt.Print(usage) }
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -103,20 +107,53 @@ func dispatch(args []string) error {
 	if !ok {
 		return fmt.Errorf("unknown subcommand %q\nRun 'ubo help' for usage", sub)
 	}
-	return run(context.Background(), *cfgPath)
+	return run(context.Background(), *cfgPath, fs.Args())
 }
 
-// subcommands maps each subcommand name to its handler. Handlers share a common
-// signature so dispatch can invoke them from a table.
-var subcommands = map[string]func(ctx context.Context, cfgPath string) error{
-	"configure": func(_ context.Context, cfgPath string) error { return tuiRun(cfgPath) },
-	"init":      func(_ context.Context, cfgPath string) error { return cmdInit(cfgPath) },
-	"run":       cmdRun,
-	"status":    func(_ context.Context, cfgPath string) error { return cmdStatus(cfgPath) },
-	"unlock":    func(ctx context.Context, cfgPath string) error { return cmdUnlock(ctx, cfgPath, false) },
-	"unlock-change": func(ctx context.Context, cfgPath string) error {
+// subcommands maps each subcommand name to its handler. The third parameter
+// carries any remaining positional arguments after flag parsing (e.g. the
+// optional HOST argument for unlock).
+var subcommands = map[string]func(context.Context, string, []string) error{
+	"configure": func(_ context.Context, cfgPath string, _ []string) error {
+		return tuiRun(orDefault(cfgPath, "ubo.toml"))
+	},
+	"init": func(_ context.Context, cfgPath string, _ []string) error {
+		return cmdInit(orDefault(cfgPath, "ubo.toml"))
+	},
+	"run": func(ctx context.Context, cfgPath string, _ []string) error {
+		return cmdRun(ctx, cfgPath)
+	},
+	"status": func(_ context.Context, cfgPath string, _ []string) error {
+		return cmdStatus(orDefault(cfgPath, "ubo.toml"))
+	},
+	"unlock": func(ctx context.Context, cfgPath string, args []string) error {
+		if cfgPath == "" {
+			var err error
+			cfgPath, err = resolveUnlockConfig(args)
+			if err != nil {
+				return err
+			}
+		}
+		return cmdUnlock(ctx, cfgPath, false)
+	},
+	"unlock-change": func(ctx context.Context, cfgPath string, args []string) error {
+		if cfgPath == "" {
+			var err error
+			cfgPath, err = resolveUnlockConfig(args)
+			if err != nil {
+				return err
+			}
+		}
 		return cmdUnlock(ctx, cfgPath, true)
 	},
+}
+
+// orDefault returns s if non-empty, otherwise def.
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }
 
 // parseSubcommand extracts the subcommand name (defaulting to "run") and returns
@@ -173,7 +210,6 @@ func cmdRun(ctx context.Context, cfgPath string) error {
 		return err
 	}
 
-	// Generate all keys locally
 	keys, err := keygenGenerateAll(outDir)
 	if err != nil {
 		return err
@@ -185,27 +221,33 @@ func cmdRun(ctx context.Context, cfgPath string) error {
 	}
 	defer client.Close()
 
-	// Run all 11 setup steps on the remote
 	if err := setupConfigure(ctx, client, cfg, keys, outDir); err != nil {
 		return err
 	}
 
-	readmePath, err := writeRunArtifacts(cfg, keys, outDir, cfgPath)
+	// Always save a copy of the config to outDir so that
+	// 'ubo unlock <host>' and 'ubo unlock' (picker) find it.
+	outCfgPath := filepath.Join(outDir, "ubo.toml")
+	if err := config.Save(cfg, outCfgPath); err != nil {
+		fmt.Printf("[ubo] warning: could not save config to %s: %v\n", outCfgPath, err)
+	}
+
+	readmePath, err := writeRunArtifacts(cfg, keys, outDir, outCfgPath)
 	if err != nil {
 		return err
 	}
 
 	fmt.Printf("\n[ubo] configuration complete!\n")
 	fmt.Printf("[ubo] output directory: %s\n", outDir)
-	fmt.Printf("[ubo] to unlock on next boot: ubo unlock --config %s\n", cfgPath)
+	fmt.Printf("[ubo] to unlock on next boot: ubo unlock %s\n", cfg.Host)
 	fmt.Printf("[ubo] see %s for manual instructions\n", readmePath)
 	return nil
 }
 
-// prepareRun loads and validates the config, checks required tools, and creates
-// the output directory, returning the config and output dir for cmdRun.
+// prepareRun loads (or bootstraps) the config, validates it, checks tools,
+// and creates the output directory.
 func prepareRun(cfgPath string) (*config.Config, string, error) {
-	cfg, err := loadConfig(cfgPath)
+	cfg, err := loadOrBootstrap(cfgPath)
 	if err != nil {
 		return nil, "", err
 	}
@@ -221,6 +263,155 @@ func prepareRun(cfgPath string) (*config.Config, string, error) {
 	}
 	fmt.Printf("[ubo] output directory: %s\n", outDir)
 	return cfg, outDir, nil
+}
+
+// loadOrBootstrap returns a Config. When cfgPath is non-empty it is loaded
+// directly (error if absent or invalid). When cfgPath is empty it tries
+// ./ubo.toml; if that is absent it falls back to an interactive prompt.
+func loadOrBootstrap(cfgPath string) (*config.Config, error) {
+	if cfgPath != "" {
+		return loadConfig(cfgPath)
+	}
+	cfg, err := config.Load("ubo.toml")
+	if err == nil {
+		return cfg, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("load config ubo.toml: %w", err)
+	}
+	return bootstrapConfigFn()
+}
+
+// bootstrapConfig interactively prompts for the minimum required fields and
+// returns a Config with all other fields set to defaults.
+func bootstrapConfig() (*config.Config, error) {
+	fmt.Fprintln(os.Stderr, "[ubo] no config file found — enter connection details to continue")
+	fmt.Fprintln(os.Stderr)
+	r := bufio.NewReader(os.Stdin)
+	cfg := config.Default()
+
+	host, err := promptRequired(r, "  Server host/IP: ")
+	if err != nil {
+		return nil, err
+	}
+	cfg.Host = host
+
+	user, err := promptLine(r, "SSH user", cfg.SSH.User)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SSH.User = user
+
+	portStr, err := promptLine(r, "SSH port", fmt.Sprintf("%d", cfg.SSH.Port))
+	if err != nil {
+		return nil, err
+	}
+	if _, scanErr := fmt.Sscanf(portStr, "%d", &cfg.SSH.Port); scanErr != nil {
+		return nil, fmt.Errorf("invalid SSH port %q", portStr)
+	}
+
+	key, err := promptLine(r, "SSH private key path (blank = agent/default keys)", "")
+	if err != nil {
+		return nil, err
+	}
+	cfg.SSH.Key = key
+
+	fmt.Fprintln(os.Stderr)
+	return cfg, nil
+}
+
+// promptRequired prints prompt to stderr and reads a non-empty line, looping
+// until the user provides one.
+func promptRequired(r *bufio.Reader, prompt string) (string, error) {
+	for {
+		fmt.Fprint(os.Stderr, prompt)
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+		if v := strings.TrimSpace(line); v != "" {
+			return v, nil
+		}
+	}
+}
+
+// promptLine prints "  <label> [<def>]: " to stderr and returns def when the
+// user enters nothing. def may be empty for optional fields.
+func promptLine(r *bufio.Reader, label, def string) (string, error) {
+	if def != "" {
+		fmt.Fprintf(os.Stderr, "  %s [%s]: ", label, def)
+	} else {
+		fmt.Fprintf(os.Stderr, "  %s: ", label)
+	}
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return def, err
+	}
+	if v := strings.TrimSpace(line); v != "" {
+		return v, nil
+	}
+	return def, nil
+}
+
+// resolveUnlockConfig finds a config path when --config is not given.
+// args[0], if present, is treated as a host/IP and ./ubo-<host>/ubo.toml is
+// returned. Otherwise all ubo-*/ubo.toml directories in the current directory
+// are found; a single match is auto-selected; multiple matches prompt a list.
+func resolveUnlockConfig(args []string) (string, error) {
+	if len(args) > 0 {
+		return findConfigByHost(args[0])
+	}
+	return pickUnlockConfig()
+}
+
+// findConfigByHost returns the path ./ubo-<host>/ubo.toml if it exists.
+func findConfigByHost(host string) (string, error) {
+	p := filepath.Join("ubo-"+host, "ubo.toml")
+	if _, err := os.Stat(p); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf("no output directory found for %q (looked for ./%s)\nRun 'ubo run' to configure this host first",
+		host, filepath.Dir(p))
+}
+
+// pickUnlockConfig scans for ubo-*/ubo.toml in the current directory.
+// One match: auto-selected. Multiple: numbered prompt. None: error.
+func pickUnlockConfig() (string, error) {
+	matches, _ := filepath.Glob("ubo-*/ubo.toml")
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("no ubo output directories found in the current directory\n" +
+			"Run 'ubo run' to configure a system first, or use 'ubo unlock --config FILE'")
+	case 1:
+		fmt.Printf("[ubo] using %s\n", filepath.Dir(matches[0]))
+		return matches[0], nil
+	default:
+		return promptSelectConfig(matches)
+	}
+}
+
+// promptSelectConfig prints a numbered list of host dirs and returns the chosen
+// config path. Pressing Enter selects the first entry.
+func promptSelectConfig(configs []string) (string, error) {
+	fmt.Println("Available systems:")
+	for i, p := range configs {
+		fmt.Printf("  %d) %s\n", i+1, strings.TrimPrefix(filepath.Dir(p), "ubo-"))
+	}
+	fmt.Fprintf(os.Stderr, "\nSelect [1-%d]: ", len(configs))
+	r := bufio.NewReader(os.Stdin)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read selection: %w", err)
+	}
+	s := strings.TrimSpace(line)
+	if s == "" {
+		s = "1"
+	}
+	var idx int
+	if _, scanErr := fmt.Sscanf(s, "%d", &idx); scanErr != nil || idx < 1 || idx > len(configs) {
+		return "", fmt.Errorf("invalid selection %q (choose 1-%d)", s, len(configs))
+	}
+	return configs[idx-1], nil
 }
 
 // connectForRun opens the TOFU SSH connection to the remote host for cmdRun
@@ -382,7 +573,7 @@ func cmdStatus(cfgPath string) error {
 	printArtifactList(present)
 
 	if ready {
-		fmt.Printf("\n[ubo] ready to unlock: ubo unlock --config %s\n", cfgPath)
+		fmt.Printf("\n[ubo] ready to unlock: ubo unlock %s\n", cfg.Host)
 	} else {
 		fmt.Printf("\n[ubo] not ready to unlock — missing required artifacts\n")
 		fmt.Printf("[ubo] run 'ubo run --config %s' to (re)configure the target\n", cfgPath)
@@ -456,4 +647,3 @@ func wgEndpoint(host string, port int) string {
 	}
 	return fmt.Sprintf("%s:%d", host, port)
 }
-
