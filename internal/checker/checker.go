@@ -17,12 +17,6 @@ var runTools = []toolDef{
 	{"ssh", "openssh-client"},
 }
 
-var unlockTools = []toolDef{
-	{"wg-quick", "wireguard-tools"},
-	{"ssh", "openssh-client"},
-	{"ping", "iputils-ping"},
-}
-
 // findMissingTools returns the names of tools not found on PATH and the set of
 // packages that provide them.
 func findMissingTools(tools []toolDef) ([]string, map[string]bool) {
@@ -44,8 +38,6 @@ func CheckTools(subcommand string) error {
 	switch subcommand {
 	case "run":
 		tools = runTools
-	case "unlock", "unlock-change":
-		tools = unlockTools
 	default:
 		return nil
 	}

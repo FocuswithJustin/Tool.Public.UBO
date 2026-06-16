@@ -6,12 +6,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"ubo/contrib/rootless"
 	"ubo/internal/checker"
@@ -23,20 +21,16 @@ import (
 	"ubo/internal/tui"
 )
 
-// Seams: indirections over the few non-deterministic / external operations in
-// the unlock flow, so cmdUnlock can be exercised end-to-end in unit tests
-// without root, a real WireGuard tunnel, or a live Dropbear server. Production
-// code uses the real implementations assigned here; tests reassign them.
+// Seams: indirections over the few non-deterministic / external operations,
+// so functions can be exercised end-to-end in unit tests without network
+// access or external processes. Production code uses the real implementations
+// assigned here; tests reassign them.
 var (
-	osGetuid                     = os.Getuid
-	remoteConnect                = remote.Connect
-	interactiveSession           = remote.InteractiveSession
-	waitForTunnelFn              = waitForTunnel
-	keygenGenerateAll            = keygen.GenerateAll
-	setupConfigure               = setup.Configure
-	checkTools                   = checker.CheckTools
-	tuiRun                       = tui.Run
-	unlockStdin        io.Reader = os.Stdin
+	remoteConnect     = remote.Connect
+	keygenGenerateAll = keygen.GenerateAll
+	setupConfigure    = setup.Configure
+	checkTools        = checker.CheckTools
+	tuiRun            = tui.Run
 
 	// sudoProbe runs a trivial remote command to test whether passwordless sudo
 	// (-n) works. Seamed so tests can stub it without a real SSH connection.
@@ -49,25 +43,8 @@ var (
 	// suppressed. Seamed so tests can inject a fixed password.
 	readSudoPassword = readSudoPasswordTTY
 
-	wgQuickUp = func(ctx context.Context, cfgPath string) error {
-		cmd := exec.CommandContext(ctx, "wg-quick", "up", cfgPath)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return cmd.Run()
-	}
-	wgQuickDown = func(cfgPath string) error {
-		cmd := exec.Command("wg-quick", "down", cfgPath)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return cmd.Run()
-	}
-
-	// kernelUnlock is the root-privilege unlock path: wg-quick + SSH to Dropbear.
-	// Seamed for unit tests that stub wgQuickUp/waitForTunnelFn/remoteConnect.
-	kernelUnlock = defaultDoUnlock
-
-	// userspaceUnlock is the non-root unlock path: wireguard-go netstack +
-	// in-process SSH. No kernel WireGuard module, no wg-quick, no root needed.
+	// userspaceUnlock is the unlock path: wireguard-go netstack + in-process SSH.
+	// No kernel WireGuard module, no wg-quick, no root needed.
 	// Seamed for unit tests.
 	userspaceUnlock = func(ctx context.Context, cfg *config.Config, outDir string, changeKey bool) error {
 		return rootless.Unlock(ctx, cfg, outDir, changeKey)
@@ -220,7 +197,7 @@ func cmdRun(ctx context.Context, cfgPath string) error {
 
 	fmt.Printf("\n[ubo] configuration complete!\n")
 	fmt.Printf("[ubo] output directory: %s\n", outDir)
-	fmt.Printf("[ubo] to unlock on next boot: sudo ubo unlock --config %s\n", cfgPath)
+	fmt.Printf("[ubo] to unlock on next boot: ubo unlock --config %s\n", cfgPath)
 	fmt.Printf("[ubo] see %s for manual instructions\n", readmePath)
 	return nil
 }
@@ -405,7 +382,7 @@ func cmdStatus(cfgPath string) error {
 	printArtifactList(present)
 
 	if ready {
-		fmt.Printf("\n[ubo] ready to unlock: sudo ubo unlock --config %s\n", cfgPath)
+		fmt.Printf("\n[ubo] ready to unlock: ubo unlock --config %s\n", cfgPath)
 	} else {
 		fmt.Printf("\n[ubo] not ready to unlock — missing required artifacts\n")
 		fmt.Printf("[ubo] run 'ubo run --config %s' to (re)configure the target\n", cfgPath)
@@ -430,9 +407,8 @@ func printArtifactList(present map[string]bool) {
 	}
 }
 
-// cmdUnlock loads config, checks artifacts, then delegates to either the kernel
-// (wg-quick, requires root) or userspace (wireguard-go, no root needed) path
-// based on the current process UID.
+// cmdUnlock loads config, checks artifacts, and unlocks using the userspace
+// WireGuard path (wireguard-go netstack). No root required.
 func cmdUnlock(ctx context.Context, cfgPath string, changeKey bool) error {
 	cfg, err := loadUnlockConfig(cfgPath)
 	if err != nil {
@@ -446,66 +422,8 @@ func cmdUnlock(ctx context.Context, cfgPath string, changeKey bool) error {
 	); err != nil {
 		return err
 	}
-	if osGetuid() == 0 {
-		if err := checkTools("unlock"); err != nil {
-			return err
-		}
-		return kernelUnlock(ctx, cfg, outDir, changeKey)
-	}
-	fmt.Println("[ubo] non-root: using userspace WireGuard (wireguard-go netstack)...")
+	fmt.Println("[ubo] using userspace WireGuard (wireguard-go netstack)...")
 	return userspaceUnlock(ctx, cfg, outDir, changeKey)
-}
-
-// defaultDoUnlock is the kernel-path unlock flow (used when root): wg-quick up,
-// wait for tunnel, SSH to Dropbear, cryptroot-unlock, wg-quick down.
-func defaultDoUnlock(ctx context.Context, cfg *config.Config, outDir string, changeKey bool) error {
-	wgConfigPath := filepath.Join(outDir, "client_wg.conf")
-	sshKeyPath := filepath.Join(outDir, "client_auth_ed25519")
-	pinnedKeyPath := filepath.Join(outDir, "dropbear_host_key.pub")
-
-	fmt.Println("[ubo] bringing up WireGuard tunnel...")
-	if err := wgQuickUp(ctx, wgConfigPath); err != nil {
-		return fmt.Errorf("wg-quick up: %w", err)
-	}
-	defer tearDownTunnel(wgConfigPath)
-
-	serverTunnelIP := cfg.WGServerTunnelIP()
-	fmt.Printf("[ubo] waiting for tunnel to %s...\n", serverTunnelIP)
-	if err := waitForTunnelFn(serverTunnelIP, 10); err != nil {
-		return err
-	}
-
-	client, err := connectDropbear(ctx, cfg, serverTunnelIP, sshKeyPath, pinnedKeyPath)
-	if err != nil {
-		return err
-	}
-	defer client.Close()
-	return performUnlock(client, cfg, changeKey)
-}
-
-// performUnlock optionally changes the LUKS passphrase and then unlocks the disk
-// over an established Dropbear connection.
-func performUnlock(client *remote.Client, cfg *config.Config, changeKey bool) error {
-	if changeKey {
-		proceed, err := runChangeKey(client, cfg)
-		if err != nil {
-			return err
-		}
-		if !proceed {
-			return nil
-		}
-	}
-
-	fmt.Println("[ubo] unlocking disk (enter LUKS passphrase when prompted)...")
-	// cryptroot-unlock already loops through all crypttab entries with
-	// x-initrd.attach, so multi-LUKS hosts with sequential prompts are handled
-	// automatically by this single interactive session.
-	if err := interactiveSession(client, "cryptroot-unlock"); err != nil {
-		return fmt.Errorf("cryptroot-unlock: %w", err)
-	}
-
-	fmt.Println("[ubo] unlock complete")
-	return nil
 }
 
 // loadUnlockConfig loads and validates the config. Privilege and tool checks
@@ -531,76 +449,6 @@ func requireUnlockFiles(paths ...string) error {
 	return nil
 }
 
-// connectDropbear opens the SSH connection to Dropbear over the tunnel using the
-// pinned host key.
-func connectDropbear(ctx context.Context, cfg *config.Config, serverTunnelIP, sshKeyPath, pinnedKeyPath string) (*remote.Client, error) {
-	fmt.Printf("[ubo] connecting to Dropbear at %s:%d...\n", serverTunnelIP, cfg.Dropbear.Port)
-	client, err := remoteConnect(ctx, &remote.ConnectOptions{
-		Host:          serverTunnelIP,
-		Port:          cfg.Dropbear.Port,
-		User:          "root",
-		KeyPath:       sshKeyPath,
-		PinnedKeyPath: pinnedKeyPath,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("connect to Dropbear: %w", err)
-	}
-	return client, nil
-}
-
-// tearDownTunnel lowers the WireGuard tunnel, warning (but not failing) on error.
-func tearDownTunnel(wgConfigPath string) {
-	fmt.Println("[ubo] tearing down WireGuard tunnel...")
-	if err := wgQuickDown(wgConfigPath); err != nil {
-		fmt.Fprintf(os.Stderr, "[ubo] warning: wg-quick down failed: %v\n", err)
-		fmt.Fprintf(os.Stderr, "[ubo] you may need to run manually: sudo wg-quick down %s\n", wgConfigPath)
-	}
-}
-
-// crypttabChangeKeyCmd resolves the first LUKS backing device from /etc/crypttab
-// to a usable device path before running cryptsetup luksChangeKey. crypttab
-// field 2 is commonly a tag form (UUID=, PARTUUID=, LABEL=, PARTLABEL=) that
-// cryptsetup rejects directly, so each tag is mapped to a real block device.
-// UUID= is resolved via blkid -U (more reliable than /dev/disk/by-uuid/ which
-// may not exist in early boot or non-interactive SSH sessions). Non-interactive
-// SSH sessions often have a minimal PATH that omits /sbin; prepend it explicitly.
-const crypttabChangeKeyCmd = `PATH=/usr/local/sbin:/usr/sbin:/sbin:$PATH
-SRC=$(awk 'NF && !/^#/{print $2; exit}' /etc/crypttab)
-case "$SRC" in
-  UUID=*) DEV=$(blkid -U "${SRC#UUID=}" 2>/dev/null); [ -z "$DEV" ] && DEV="/dev/disk/by-uuid/${SRC#UUID=}" ;;
-  PARTUUID=*) DEV="/dev/disk/by-partuuid/${SRC#PARTUUID=}" ;;
-  LABEL=*) DEV="/dev/disk/by-label/${SRC#LABEL=}" ;;
-  PARTLABEL=*) DEV="/dev/disk/by-partlabel/${SRC#PARTLABEL=}" ;;
-  *) DEV="$SRC" ;;
-esac
-test -n "$DEV" || { echo "could not determine LUKS device from /etc/crypttab" >&2; exit 1; }
-echo "[ubo] LUKS device: $DEV" >&2
-cryptsetup luksChangeKey "$DEV"`
-
-// runChangeKey performs the interactive LUKS passphrase change and asks whether
-// to continue to unlock. It returns whether the caller should proceed to unlock.
-func runChangeKey(client *remote.Client, cfg *config.Config) (bool, error) {
-	changeCmd := crypttabChangeKeyCmd
-	if cfg.LUKS.Device != "" {
-		changeCmd = fmt.Sprintf("PATH=/usr/local/sbin:/usr/sbin:/sbin:$PATH cryptsetup luksChangeKey %q", cfg.LUKS.Device)
-	}
-
-	fmt.Println("[ubo] changing LUKS passphrase (enter current passphrase, then new passphrase twice)...")
-	if err := interactiveSession(client, changeCmd); err != nil {
-		return false, fmt.Errorf("luksChangeKey: %w", err)
-	}
-
-	fmt.Print("\nChange complete. Unlock and boot now? [Y/n]: ")
-	reader := bufio.NewReader(unlockStdin)
-	answer, _ := reader.ReadString('\n')
-	answer = strings.TrimSpace(strings.ToLower(answer))
-	if answer != "" && answer != "y" {
-		fmt.Println("[ubo] not unlocking; the WireGuard tunnel will be torn down")
-		return false, nil
-	}
-	return true, nil
-}
-
 // wgEndpoint formats a WireGuard endpoint as host:port, bracketing IPv6 addresses.
 func wgEndpoint(host string, port int) string {
 	if strings.Contains(host, ":") {
@@ -609,16 +457,3 @@ func wgEndpoint(host string, port int) string {
 	return fmt.Sprintf("%s:%d", host, port)
 }
 
-// waitForTunnel pings ip once per second for up to maxSec seconds.
-func waitForTunnel(ip string, maxSec int) error {
-	for i := 0; i < maxSec; i++ {
-		cmd := exec.Command("ping", "-c", "1", "-W", "1", ip)
-		cmd.Stdout = nil
-		cmd.Stderr = nil
-		if cmd.Run() == nil {
-			return nil
-		}
-		time.Sleep(time.Second)
-	}
-	return fmt.Errorf("tunnel to %s did not become reachable after %d seconds", ip, maxSec)
-}

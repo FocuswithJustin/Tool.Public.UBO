@@ -439,14 +439,14 @@ func TestRenderReadme(t *testing.T) {
 		DropbearPort:   22,
 		ConfigPath:     "ubo.toml",
 	})
-	if !strings.Contains(got, "10.42.0.1") {
-		t.Errorf("missing server tunnel IP in README, got:\n%s", got)
-	}
 	if !strings.Contains(got, "cryptroot-unlock") {
 		t.Errorf("missing cryptroot-unlock in README, got:\n%s", got)
 	}
 	if !strings.Contains(got, "ubo.toml") {
 		t.Errorf("missing config path in README, got:\n%s", got)
+	}
+	if !strings.Contains(got, "ubo unlock") {
+		t.Errorf("missing 'ubo unlock' command in README, got:\n%s", got)
 	}
 }
 
@@ -617,9 +617,9 @@ func TestRenderReadme_emptyData(t *testing.T) {
 	if !strings.Contains(got, "Remote LUKS Unlock Instructions") {
 		t.Errorf("missing header in README, got:\n%s", got)
 	}
-	// Zero int renders as "0".
-	if !strings.Contains(got, "-p 0 root@") {
-		t.Errorf("expected zero DropbearPort to render as 0, got:\n%s", got)
+	// Template must render without error and contain the unlock command.
+	if !strings.Contains(got, "ubo unlock") {
+		t.Errorf("missing 'ubo unlock' in README, got:\n%s", got)
 	}
 }
 
