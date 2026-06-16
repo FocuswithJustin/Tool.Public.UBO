@@ -3,3 +3,4 @@ ubo-rootless
 tmp/
 ubo-*/
 .claude/
+.out
