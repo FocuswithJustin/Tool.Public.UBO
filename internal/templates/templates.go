@@ -176,9 +176,12 @@ ip link set dev "{{.VLANPhysdev}}" up
 ip link add link "{{.VLANPhysdev}}" name "{{.Interface}}" type vlan id {{.VLANID}} 2>/dev/null || true
 IFACE="{{.Interface}}"
 {{- else if .VLANPhysdev}}
-# VLAN interface: bring up the physical NIC, then create the VLAN on top of it.
+# VLAN interface: bring up the physical NIC, flush its IP (may have been set by
+# the kernel's ip= GRUB param to the same CIDR as the VLAN interface, which
+# would conflict), then create the VLAN on top.
 modprobe 8021q 2>/dev/null || true
 ip link set dev "{{.VLANPhysdev}}" up
+ip addr flush dev "{{.VLANPhysdev}}" 2>/dev/null || true
 ip link add link "{{.VLANPhysdev}}" name "{{.Interface}}" type vlan id {{.VLANID}} 2>/dev/null || true
 IFACE="{{.Interface}}"
 {{- else if .BondSlaves}}

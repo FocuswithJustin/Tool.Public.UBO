@@ -127,10 +127,8 @@ func buildSetupScriptData(cfg *config.Config, keys *keygen.Keys, netInfo *Networ
 	}
 
 	// grubIface: physical NIC name for the GRUB ip= kernel parameter.
-	// The kernel configures this interface before initramfs scripts run, so it
-	// must be a real NIC that exists at kernel boot — not a bond, VLAN, or bridge.
-	// Bond and VLAN interfaces are created by the initramfs script; passing them
-	// as ip= does nothing and may cause boot delays or stale route conflicts.
+	// Must be a real NIC that exists at kernel boot — bond/VLAN/bridge interfaces
+	// are created by initramfs scripts and don't exist yet.
 	grubIface := initramfsIface
 	if len(netInfo.BondSlaves) > 0 {
 		// Bond (and VLAN-on-bond): use the first physical slave NIC.
@@ -144,14 +142,40 @@ func buildSetupScriptData(cfg *config.Config, keys *keygen.Keys, netInfo *Networ
 			grubIface, netInfo.Interface)
 	}
 
+	// initramfs interface overrides for bond and VLAN-on-bond:
+	// Bond virtual interfaces (bond0, bond0.100) don't need to exist in the
+	// initramfs — the physical slave NIC provides the same connectivity for
+	// WireGuard + Dropbear. Not creating bond0 in the initramfs ensures ens3
+	// remains a plain NIC after pivot_root so the full OS can configure it with
+	// DHCP normally (adding an IP to a bond slave fails).
+	initramfsInterface := initramfsIface
+	initramfsVLANPhysdev := netInfo.VLANPhysdev
+	initramfsBondSlaves := strings.Join(netInfo.BondSlaves, " ")
+	if len(netInfo.BondSlaves) > 0 {
+		slaveNIC := netInfo.BondSlaves[0]
+		if netInfo.VLANPhysdev != "" {
+			// VLAN-on-bond: create the VLAN directly on the slave NIC (e.g. ens3.100)
+			// instead of on bond0 (bond0.100). No bond is created in initramfs.
+			initramfsInterface = fmt.Sprintf("%s.%d", slaveNIC, netInfo.VLANID)
+			initramfsVLANPhysdev = slaveNIC
+			initramfsBondSlaves = ""
+			fmt.Printf("[ubo]   VLAN-on-bond: initramfs will use %s as VLAN parent (bond not created in initramfs)\n", slaveNIC)
+		} else {
+			// Plain bond: use the slave NIC directly. No bond0 created in initramfs.
+			initramfsInterface = slaveNIC
+			initramfsBondSlaves = ""
+			fmt.Printf("[ubo]   bond: initramfs will use slave %s directly (bond not created in initramfs)\n", slaveNIC)
+		}
+	}
+
 	initScript, err := templates.RenderInitramfsScript(templates.InitramfsScriptData{
 		ServerIP:    cfg.WireGuard.ServerIP,
 		StaticIP:    fmt.Sprintf("%s/%d", netInfo.IP, netInfo.Prefix),
 		GatewayIP:   netInfo.Gateway,
-		Interface:   initramfsIface,
-		VLANPhysdev: netInfo.VLANPhysdev,
+		Interface:   initramfsInterface,
+		VLANPhysdev: initramfsVLANPhysdev,
 		VLANID:      netInfo.VLANID,
-		BondSlaves:  strings.Join(netInfo.BondSlaves, " "),
+		BondSlaves:  initramfsBondSlaves,
 		BondMode:    netInfo.BondMode,
 	})
 	if err != nil {
@@ -181,7 +205,7 @@ func buildSetupScriptData(cfg *config.Config, keys *keygen.Keys, netInfo *Networ
 		NetGateway:      netInfo.Gateway,
 		NetMask:         prefixToNetmask(netInfo.Prefix),
 		NetHostname:     netInfo.Hostname,
-		NetInterface:    initramfsIface,
+		NetInterface:    initramfsInterface,
 		GrubInterface:   grubIface,
 	}, nil
 }

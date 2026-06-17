@@ -354,9 +354,10 @@ func TestBuildSetupScriptData_plainNIC(t *testing.T) {
 // ── bond topology ─────────────────────────────────────────────────────────────
 
 // TestBuildSetupScriptData_bond verifies that a bond interface generates an
-// initramfs script that creates the bond, sets the mode, and enslaves the
-// physical NICs. NetInterface stays bond0 (for driver detection); GrubInterface
-// uses the first slave (physical NIC for GRUB ip= at kernel boot).
+// initramfs script that uses the first slave NIC directly (no bond created).
+// Bond interfaces don't need to exist in the initramfs; the slave NIC provides
+// the same physical connectivity. Not creating bond0 ensures ens3 is a plain
+// NIC after pivot_root so DHCP works in the full OS.
 func TestBuildSetupScriptData_bond(t *testing.T) {
 	ni := minNetInfo()
 	ni.Interface = "bond0"
@@ -368,25 +369,21 @@ func TestBuildSetupScriptData_bond(t *testing.T) {
 		t.Fatalf("buildSetupScriptData: %v", err)
 	}
 
-	if data.NetInterface != "bond0" {
-		t.Errorf("NetInterface = %q; want bond0 (for driver detection)", data.NetInterface)
+	// NetInterface is the slave NIC (for driver detection in the setup script).
+	if data.NetInterface != "eth0" {
+		t.Errorf("NetInterface = %q; want eth0 (slave NIC, no bond in initramfs)", data.NetInterface)
 	}
 	if data.GrubInterface != "eth0" {
 		t.Errorf("GrubInterface = %q; want eth0 (first bond slave for GRUB ip=)", data.GrubInterface)
 	}
-	if !strings.Contains(data.InitramfsScript, "modprobe bonding") {
-		t.Error("initramfs script missing 'modprobe bonding'")
+	// Initramfs uses the slave NIC directly via the plain-NIC path; no bond.
+	if strings.Contains(data.InitramfsScript, "modprobe bonding") {
+		t.Error("initramfs script must NOT create bond (bond not needed for unlock)")
 	}
-	if !strings.Contains(data.InitramfsScript, "eth0") {
-		t.Error("initramfs script missing slave eth0")
+	if !strings.Contains(data.InitramfsScript, `IFACE="eth0"`) {
+		t.Error("initramfs script must assign IFACE=eth0 (slave NIC directly)")
 	}
-	if !strings.Contains(data.InitramfsScript, "active-backup") {
-		t.Error("initramfs script missing bond mode 'active-backup'")
-	}
-	if !strings.Contains(data.InitramfsScript, `IFACE="bond0"`) {
-		t.Error("initramfs script must assign IFACE=bond0")
-	}
-	// Must NOT set up a VLAN
+	// Must NOT set up a VLAN.
 	if strings.Contains(data.InitramfsScript, "modprobe 8021q") {
 		t.Error("plain bond script must not contain 8021q/VLAN setup")
 	}
@@ -436,9 +433,12 @@ func TestBuildSetupScriptData_vlan(t *testing.T) {
 
 // ── VLAN-on-bond topology ─────────────────────────────────────────────────────
 
-// TestBuildSetupScriptData_vlanOnBond verifies that a VLAN interface stacked on
-// top of a bond generates an initramfs script that sets up the bond, then the
-// VLAN on top of it. GrubInterface uses the bond slave (physical NIC) for GRUB ip=.
+// TestBuildSetupScriptData_vlanOnBond verifies that a VLAN-on-bond topology
+// generates an initramfs script that creates the VLAN directly on the bond slave
+// NIC (eth0.100) rather than on the bond (bond0.100). No bond is created in the
+// initramfs — the slave NIC provides the same physical connectivity for
+// WireGuard + Dropbear unlock, and leaving ens3 un-enslaved ensures DHCP works
+// after pivot_root in the full OS.
 func TestBuildSetupScriptData_vlanOnBond(t *testing.T) {
 	ni := minNetInfo()
 	ni.Interface = "bond0.100"
@@ -452,26 +452,32 @@ func TestBuildSetupScriptData_vlanOnBond(t *testing.T) {
 		t.Fatalf("buildSetupScriptData: %v", err)
 	}
 
-	if data.NetInterface != "bond0.100" {
-		t.Errorf("NetInterface = %q; want bond0.100 (for driver detection)", data.NetInterface)
+	// NetInterface is the slave VLAN (eth0.100) for driver detection.
+	if data.NetInterface != "eth0.100" {
+		t.Errorf("NetInterface = %q; want eth0.100 (slave NIC VLAN, no bond in initramfs)", data.NetInterface)
 	}
 	if data.GrubInterface != "eth0" {
 		t.Errorf("GrubInterface = %q; want eth0 (bond slave for GRUB ip=)", data.GrubInterface)
 	}
-	if !strings.Contains(data.InitramfsScript, "modprobe bonding") {
-		t.Error("initramfs script missing 'modprobe bonding'")
+	// No bond in initramfs; VLAN is created directly on the slave NIC.
+	if strings.Contains(data.InitramfsScript, "modprobe bonding") {
+		t.Error("initramfs script must NOT create bond (bond not needed for unlock)")
 	}
 	if !strings.Contains(data.InitramfsScript, "modprobe 8021q") {
 		t.Error("initramfs script missing 'modprobe 8021q'")
 	}
-	if !strings.Contains(data.InitramfsScript, `IFACE="bond0.100"`) {
-		t.Error("initramfs script must assign IFACE=bond0.100")
+	// IFACE should be the VLAN on the slave NIC, not the bond.
+	if !strings.Contains(data.InitramfsScript, `IFACE="eth0.100"`) {
+		t.Error("initramfs script must assign IFACE=eth0.100 (slave NIC VLAN)")
+	}
+	if strings.Contains(data.InitramfsScript, `IFACE="bond0`) {
+		t.Error("initramfs script must not reference bond0 (bond not created in initramfs)")
 	}
 	if !strings.Contains(data.InitramfsScript, "id 100") {
 		t.Error("initramfs script missing VLAN id 100")
 	}
-	// Bond slave must appear so the initramfs can enslave it
-	if !strings.Contains(data.InitramfsScript, "eth0") {
-		t.Error("initramfs script missing bond slave eth0")
+	// Slave NIC must appear as the VLAN parent (physdev).
+	if !strings.Contains(data.InitramfsScript, `"eth0"`) {
+		t.Error("initramfs script missing slave NIC eth0 as VLAN parent")
 	}
 }
