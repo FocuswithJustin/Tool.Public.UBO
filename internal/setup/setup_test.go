@@ -344,3 +344,118 @@ func TestBuildSetupScriptData_plainNIC(t *testing.T) {
 		t.Error("initramfs script should reference eth0")
 	}
 }
+
+// ── bond topology ─────────────────────────────────────────────────────────────
+
+// TestBuildSetupScriptData_bond verifies that a bond interface generates an
+// initramfs script that creates the bond, sets the mode, and enslaves the
+// physical NICs. The bond name passes through unchanged (no substitution like
+// bridge).
+func TestBuildSetupScriptData_bond(t *testing.T) {
+	ni := minNetInfo()
+	ni.Interface = "bond0"
+	ni.BondSlaves = []string{"eth0", "eth1"}
+	ni.BondMode = "active-backup"
+
+	data, err := buildSetupScriptData(minCfg(), minKeys(), ni)
+	if err != nil {
+		t.Fatalf("buildSetupScriptData: %v", err)
+	}
+
+	if data.NetInterface != "bond0" {
+		t.Errorf("NetInterface = %q; want bond0", data.NetInterface)
+	}
+	if !strings.Contains(data.InitramfsScript, "modprobe bonding") {
+		t.Error("initramfs script missing 'modprobe bonding'")
+	}
+	if !strings.Contains(data.InitramfsScript, "eth0") {
+		t.Error("initramfs script missing slave eth0")
+	}
+	if !strings.Contains(data.InitramfsScript, "active-backup") {
+		t.Error("initramfs script missing bond mode 'active-backup'")
+	}
+	if !strings.Contains(data.InitramfsScript, `IFACE="bond0"`) {
+		t.Error("initramfs script must assign IFACE=bond0")
+	}
+	// Must NOT set up a VLAN
+	if strings.Contains(data.InitramfsScript, "modprobe 8021q") {
+		t.Error("plain bond script must not contain 8021q/VLAN setup")
+	}
+}
+
+// ── VLAN topology ─────────────────────────────────────────────────────────────
+
+// TestBuildSetupScriptData_vlan verifies that a VLAN interface generates an
+// initramfs script that loads the 8021q module, brings up the physical parent
+// NIC, and creates the VLAN interface with the correct ID.
+func TestBuildSetupScriptData_vlan(t *testing.T) {
+	ni := minNetInfo()
+	ni.Interface = "eth0.100"
+	ni.VLANPhysdev = "eth0"
+	ni.VLANID = 100
+
+	data, err := buildSetupScriptData(minCfg(), minKeys(), ni)
+	if err != nil {
+		t.Fatalf("buildSetupScriptData: %v", err)
+	}
+
+	if data.NetInterface != "eth0.100" {
+		t.Errorf("NetInterface = %q; want eth0.100", data.NetInterface)
+	}
+	if !strings.Contains(data.InitramfsScript, "modprobe 8021q") {
+		t.Error("initramfs script missing 'modprobe 8021q'")
+	}
+	if !strings.Contains(data.InitramfsScript, `IFACE="eth0.100"`) {
+		t.Error("initramfs script must assign IFACE=eth0.100")
+	}
+	// Physical parent device must appear (to be brought up before the VLAN)
+	if !strings.Contains(data.InitramfsScript, `"eth0"`) {
+		t.Error("initramfs script missing physical parent device eth0")
+	}
+	if !strings.Contains(data.InitramfsScript, "id 100") {
+		t.Error("initramfs script missing VLAN id 100")
+	}
+	// Must NOT set up a bond
+	if strings.Contains(data.InitramfsScript, "modprobe bonding") {
+		t.Error("plain VLAN script must not contain bonding setup")
+	}
+}
+
+// ── VLAN-on-bond topology ─────────────────────────────────────────────────────
+
+// TestBuildSetupScriptData_vlanOnBond verifies that a VLAN interface stacked on
+// top of a bond generates an initramfs script that sets up the bond, then the
+// VLAN on top of it.
+func TestBuildSetupScriptData_vlanOnBond(t *testing.T) {
+	ni := minNetInfo()
+	ni.Interface = "bond0.100"
+	ni.VLANPhysdev = "bond0"
+	ni.VLANID = 100
+	ni.BondSlaves = []string{"eth0"}
+	ni.BondMode = "active-backup"
+
+	data, err := buildSetupScriptData(minCfg(), minKeys(), ni)
+	if err != nil {
+		t.Fatalf("buildSetupScriptData: %v", err)
+	}
+
+	if data.NetInterface != "bond0.100" {
+		t.Errorf("NetInterface = %q; want bond0.100", data.NetInterface)
+	}
+	if !strings.Contains(data.InitramfsScript, "modprobe bonding") {
+		t.Error("initramfs script missing 'modprobe bonding'")
+	}
+	if !strings.Contains(data.InitramfsScript, "modprobe 8021q") {
+		t.Error("initramfs script missing 'modprobe 8021q'")
+	}
+	if !strings.Contains(data.InitramfsScript, `IFACE="bond0.100"`) {
+		t.Error("initramfs script must assign IFACE=bond0.100")
+	}
+	if !strings.Contains(data.InitramfsScript, "id 100") {
+		t.Error("initramfs script missing VLAN id 100")
+	}
+	// Bond slave must appear so the initramfs can enslave it
+	if !strings.Contains(data.InitramfsScript, "eth0") {
+		t.Error("initramfs script missing bond slave eth0")
+	}
+}
