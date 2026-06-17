@@ -87,25 +87,28 @@ ip route del default via 10.99.0.1 dev "$NIC" 2>/dev/null || true
 NIC=$(ip route show default | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1);exit}}')
 [ -z "$NIC" ] && NIC=$(ls /sys/class/net/ | grep -v lo | head -1)
 echo "bond topology: NIC=$NIC" >&2
+# Kill DHCP clients first so they cannot restore ens3's addresses mid-script
+# or reinstall a default route via ens3 after we remove it.
+pkill -f dhclient 2>/dev/null; pkill -f dhcpcd 2>/dev/null; true
+systemctl stop networking 2>/dev/null || true
+systemctl stop NetworkManager 2>/dev/null || true
 modprobe bonding 2>/dev/null || true
 ip link add name bond0 type bond 2>/dev/null || true
 echo active-backup > /sys/class/net/bond0/bonding/mode 2>/dev/null || true
-# Bring bond0 up with no slaves first, then assign IP (like bridge does).
-# This eliminates the window where 10.99.0.2 is unreachable during enslave.
+# Bring bond0 up before enslaving and assign IP immediately (like bridge does).
 ip link set bond0 up 2>/dev/null || true
 ip addr add 10.99.0.2/24 dev bond0 2>/dev/null || true
+# Remove the DHCP-installed default route (via ens3) before adding ours.
+# 'ip route add' fails with EEXIST if a default already exists; if we leave
+# the ens3 route in place and then enslave ens3, the server loses its default
+# route and cannot send TCP replies → client sees "No route to host".
+ip route del default 2>/dev/null || true
 ip route add default via 10.99.0.1 dev bond0 2>/dev/null || true
-# Remove NIC's addresses (bond0 now owns them) and enslave it.
+# Flush NIC addresses and enslave into bond0.
 ip addr flush dev "$NIC" 2>/dev/null || true
 ip link set "$NIC" down 2>/dev/null || true
 ip link set "$NIC" master bond0 2>/dev/null || true
-# Stop networkd+socket AFTER bond is stable so it cannot reconfigure slaves.
-systemctl stop systemd-networkd.socket 2>/dev/null || true
-systemctl stop systemd-networkd 2>/dev/null || true
-systemctl stop NetworkManager 2>/dev/null || true
-systemctl stop networking 2>/dev/null || true
-pkill -f 'dhclient|dhcpcd' 2>/dev/null || true
-# Restore bond0 connectivity in case networkd cleanup flushed addresses.
+# Ensure bond0 still has the IP/route (defensive restore).
 ip addr show dev bond0 2>/dev/null | grep -q '10\.99\.0\.2' || \
   ip addr add 10.99.0.2/24 dev bond0 2>/dev/null || true
 ip route show 2>/dev/null | grep -q '^default' || \
@@ -159,17 +162,22 @@ ip route add default via 10.99.1.1 dev "$VLAN_IF" 2>/dev/null || true
 NIC=$(ip route show default | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1);exit}}')
 [ -z "$NIC" ] && NIC=$(ls /sys/class/net/ | grep -v lo | head -1)
 echo "vlan-on-bond topology: NIC=$NIC" >&2
+# Kill DHCP clients first — same reason as bond: prevents ens3 route restore.
+pkill -f dhclient 2>/dev/null; pkill -f dhcpcd 2>/dev/null; true
+systemctl stop networking 2>/dev/null || true
+systemctl stop NetworkManager 2>/dev/null || true
 # Disable HW VLAN offload before enslaving.
 ethtool -K "$NIC" rxvlan off txvlan off 2>/dev/null || true
 modprobe bonding 2>/dev/null || true
 modprobe 8021q 2>/dev/null || true
 ip link add name bond0 type bond 2>/dev/null || true
 echo active-backup > /sys/class/net/bond0/bonding/mode 2>/dev/null || true
-# Bring bond0 up before enslaving, assign test-polling IP immediately.
 ip link set bond0 up 2>/dev/null || true
 ip addr add 10.99.0.2/24 dev bond0 2>/dev/null || true
+# Remove the DHCP default route before installing ours (same EEXIST bug as bond).
+ip route del default 2>/dev/null || true
 ip route add default via 10.99.0.1 dev bond0 2>/dev/null || true
-# Remove NIC's address then enslave it into bond0.
+# Flush NIC addresses and enslave into bond0.
 ip addr flush dev "$NIC" 2>/dev/null || true
 ip link set "$NIC" down 2>/dev/null || true
 ip link set "$NIC" master bond0 2>/dev/null || true
@@ -177,18 +185,11 @@ ip link set "$NIC" master bond0 2>/dev/null || true
 ip link add link bond0 name bond0.100 type vlan id 100 2>/dev/null || true
 ip link set bond0.100 up 2>/dev/null || true
 ip addr add 10.99.1.2/24 dev bond0.100 2>/dev/null || true
-# Change default route to go via bond0.100 so ubo run detects bond0.100
-# as the initramfs interface. bond0 keeps 10.99.0.2 so TOPOLOGY_DONE
-# polling at serverLinkIP (doneIP) continues to work via local routing.
+# Change default route to go via bond0.100 so ubo run detects bond0.100.
+# bond0 keeps 10.99.0.2 so TOPOLOGY_DONE polling at serverLinkIP still works.
 ip route del default 2>/dev/null || true
 ip route add default via 10.99.1.1 dev bond0.100 2>/dev/null || true
-# Stop networkd+socket AFTER topology is stable to prevent reconfiguration.
-systemctl stop systemd-networkd.socket 2>/dev/null || true
-systemctl stop systemd-networkd 2>/dev/null || true
-systemctl stop NetworkManager 2>/dev/null || true
-systemctl stop networking 2>/dev/null || true
-pkill -f 'dhclient|dhcpcd' 2>/dev/null || true
-# Restore addresses if networkd cleanup flushed them.
+# Defensive restore.
 ip addr show dev bond0 2>/dev/null | grep -q '10\.99\.0\.2' || \
   ip addr add 10.99.0.2/24 dev bond0 2>/dev/null || true
 ip addr show dev bond0.100 2>/dev/null | grep -q '10\.99\.1\.2' || \
