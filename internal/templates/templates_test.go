@@ -654,6 +654,7 @@ func fullSetupScriptData() SetupScriptData {
 		NetMask:         "255.255.255.0",
 		NetHostname:     "host1",
 		NetInterface:    "eth0",
+		GrubInterface:  "eth0",
 	}
 }
 
@@ -720,6 +721,7 @@ func TestRenderSetupScript_missingFields(t *testing.T) {
 		{"NetMask", func(d *SetupScriptData) { d.NetMask = "" }},
 		{"NetHostname", func(d *SetupScriptData) { d.NetHostname = "" }},
 		{"NetInterface", func(d *SetupScriptData) { d.NetInterface = "" }},
+		{"GrubInterface", func(d *SetupScriptData) { d.GrubInterface = "" }},
 	}
 	for _, tc := range fields {
 		t.Run(tc.name, func(t *testing.T) {

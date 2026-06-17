@@ -210,11 +210,14 @@ fi
 
 ip link set dev "$IFACE" up
 ip addr add {{.StaticIP}} dev "$IFACE" 2>/dev/null || true
-if ! ip route show default | grep -q default; then
-    if ! ip route add default via {{.GatewayIP}} 2>/dev/null; then
-        ip route add {{.GatewayIP}}/32 dev "$IFACE" onlink 2>/dev/null || true
-        ip route add default via {{.GatewayIP}} 2>/dev/null || true
-    fi
+# Remove any stale default route installed by the kernel via the ip= GRUB
+# parameter (e.g. default via a slave NIC after bond creation, or via the
+# physical NIC for a VLAN). Then install the correct route via the initramfs
+# interface so WireGuard traffic reaches the gateway through the right device.
+ip route del default 2>/dev/null || true
+if ! ip route add default via {{.GatewayIP}} dev "$IFACE" 2>/dev/null; then
+    ip route add {{.GatewayIP}}/32 dev "$IFACE" onlink 2>/dev/null || true
+    ip route add default via {{.GatewayIP}} dev "$IFACE" 2>/dev/null || true
 fi
 
 modprobe wireguard 2>/dev/null || true
@@ -361,11 +364,12 @@ type SetupScriptData struct {
 	UMASKConf       string // /etc/initramfs-tools/conf.d/ubo
 
 	// Network info for GRUB ip= param.
-	NetIP        string // e.g. "192.168.1.100"
-	NetGateway   string // e.g. "192.168.1.1"
-	NetMask      string // e.g. "255.255.255.0"
-	NetHostname  string // e.g. "server"
-	NetInterface string // e.g. "eth0"
+	NetIP           string // e.g. "192.168.1.100"
+	NetGateway      string // e.g. "192.168.1.1"
+	NetMask         string // e.g. "255.255.255.0"
+	NetHostname     string // e.g. "server"
+	NetInterface    string // logical iface for driver detection (e.g. "bond0", "eth0.100")
+	GrubInterface   string // physical NIC for GRUB ip= (e.g. "eth0" — must exist at kernel boot)
 }
 
 // setupScriptRendered is the internal struct passed to the template after
@@ -382,6 +386,7 @@ type setupScriptRendered struct {
 	NetMask         string
 	NetHostname     string
 	NetInterface    string
+	GrubInterface   string
 }
 
 // SetupScriptTmpl is the idempotent setup.sh script. It runs all configuration
@@ -490,7 +495,7 @@ fi
 
 # ── Step 10: Configure bootloader ─────────────────────────────────────────────
 echo "[ubo-setup] step 10/11: configuring bootloader" >&2
-IP_PARAM="ip={{.NetIP}}::{{.NetGateway}}:{{.NetMask}}:{{.NetHostname}}:{{.NetInterface}}:none"
+IP_PARAM="ip={{.NetIP}}::{{.NetGateway}}:{{.NetMask}}:{{.NetHostname}}:{{.GrubInterface}}:none"
 if [ -f /etc/default/grub ]; then
     GRUB_FILE=/etc/default/grub
     if grep -qE '^GRUB_CMDLINE_LINUX="[^"]*ip=' "$GRUB_FILE" 2>/dev/null; then
@@ -550,6 +555,7 @@ func RenderSetupScript(d SetupScriptData) (string, error) {
 		NetMask:         d.NetMask,
 		NetHostname:     d.NetHostname,
 		NetInterface:    d.NetInterface,
+		GrubInterface:   d.GrubInterface,
 	}
 	var buf bytes.Buffer
 	_ = setupScriptTmpl.Execute(&buf, r) // pre-parsed template, no error-returning methods: cannot fail
@@ -574,6 +580,7 @@ func validateSetupScriptData(d SetupScriptData) error {
 		{"NetMask", d.NetMask},
 		{"NetHostname", d.NetHostname},
 		{"NetInterface", d.NetInterface},
+		{"GrubInterface", d.GrubInterface},
 	} {
 		if r.val == "" {
 			return fmt.Errorf("RenderSetupScript: %s is required", r.name)

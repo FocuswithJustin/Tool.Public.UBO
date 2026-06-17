@@ -116,15 +116,32 @@ func buildSetupScriptData(cfg *config.Config, keys *keygen.Keys, netInfo *Networ
 		return templates.SetupScriptData{}, err
 	}
 
-	// Bridge interfaces (e.g. br0) don't exist in initramfs. Use the first
-	// bridge port (physical NIC) for both the initramfs WireGuard script and
-	// the GRUB ip= kernel parameter. The NIC driver is still detected
-	// correctly because the port name resolves directly to its driver.
+	// initramfsIface: logical interface name used in the initramfs WireGuard script
+	// (bond0, eth0.100, br0-port, or plain NIC). Bridge interfaces don't exist in
+	// initramfs, so substitute the first bridge port.
 	initramfsIface := netInfo.Interface
 	if len(netInfo.BridgePorts) > 0 {
 		initramfsIface = netInfo.BridgePorts[0]
 		fmt.Printf("[ubo]   bridge detected: using port %s for initramfs networking (bridge %s is not present in initramfs)\n",
 			initramfsIface, netInfo.Interface)
+	}
+
+	// grubIface: physical NIC name for the GRUB ip= kernel parameter.
+	// The kernel configures this interface before initramfs scripts run, so it
+	// must be a real NIC that exists at kernel boot — not a bond, VLAN, or bridge.
+	// Bond and VLAN interfaces are created by the initramfs script; passing them
+	// as ip= does nothing and may cause boot delays or stale route conflicts.
+	grubIface := initramfsIface
+	if len(netInfo.BondSlaves) > 0 {
+		// Bond (and VLAN-on-bond): use the first physical slave NIC.
+		grubIface = netInfo.BondSlaves[0]
+		fmt.Printf("[ubo]   bond detected: using slave %s for GRUB ip= parameter (bond %s is not present at kernel boot)\n",
+			grubIface, netInfo.Interface)
+	} else if netInfo.VLANPhysdev != "" {
+		// VLAN (plain): use the physical parent NIC.
+		grubIface = netInfo.VLANPhysdev
+		fmt.Printf("[ubo]   VLAN detected: using physdev %s for GRUB ip= parameter (VLAN %s is not present at kernel boot)\n",
+			grubIface, netInfo.Interface)
 	}
 
 	initScript, err := templates.RenderInitramfsScript(templates.InitramfsScriptData{
@@ -165,6 +182,7 @@ func buildSetupScriptData(cfg *config.Config, keys *keygen.Keys, netInfo *Networ
 		NetMask:         prefixToNetmask(netInfo.Prefix),
 		NetHostname:     netInfo.Hostname,
 		NetInterface:    initramfsIface,
+		GrubInterface:   grubIface,
 	}, nil
 }
 

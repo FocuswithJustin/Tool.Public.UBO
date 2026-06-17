@@ -131,15 +131,20 @@ NIC=$(ip route show default | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1)
 [ -z "$NIC" ] && NIC=$(ls /sys/class/net/ | grep -v lo | head -1)
 VLAN_IF="${NIC}.100"
 echo "vlan topology: NIC=$NIC VLAN_IF=$VLAN_IF" >&2
+# Kill DHCP clients first so they cannot restore the ens3 default route after
+# we remove it. Same EEXIST fix as bond: 'ip route add default' fails silently
+# when a route already exists (installed by dhclient on NIC).
+pkill -f dhclient 2>/dev/null; pkill -f dhcpcd 2>/dev/null; true
+systemctl stop networking 2>/dev/null || true
 modprobe 8021q 2>/dev/null || true
 ip link set "$NIC" up
 ip link add link "$NIC" name "$VLAN_IF" type vlan id 100 2>/dev/null || true
 ip link set "$VLAN_IF" up
 ip addr add 10.99.1.2/24 dev "$VLAN_IF" 2>/dev/null || true
-# Change default route to go via the VLAN interface so ubo run detects
-# VLAN_IF (not NIC) as the initramfs interface. The original IP stays on NIC
-# so TOPOLOGY_DONE polling at serverLinkIP (doneIP) continues to work, since
-# local routing to 10.99.0.0/24 is via NIC regardless of the default route.
+# Remove the DHCP-installed default route (via NIC) before adding the VLAN route.
+# Without this, 'ip route add default via 10.99.1.1' fails with EEXIST and the
+# default route stays on NIC, so ubo run detects NIC (not VLAN_IF) as the iface.
+ip route del default 2>/dev/null || true
 ip route add default via 10.99.1.1 dev "$VLAN_IF" 2>/dev/null || true
 `,
 		host:   vlanServerIP,

@@ -319,6 +319,9 @@ func TestBuildSetupScriptData_bridgeUsesFirstPort(t *testing.T) {
 	if data.NetInterface != "enp0s3" {
 		t.Errorf("NetInterface = %q; want enp0s3 (first bridge port)", data.NetInterface)
 	}
+	if data.GrubInterface != "enp0s3" {
+		t.Errorf("GrubInterface = %q; want enp0s3 (first bridge port for GRUB ip=)", data.GrubInterface)
+	}
 	if strings.Contains(data.InitramfsScript, `IFACE="br0"`) {
 		t.Error("initramfs script must not reference br0 (bridge not present in initramfs)")
 	}
@@ -328,7 +331,7 @@ func TestBuildSetupScriptData_bridgeUsesFirstPort(t *testing.T) {
 }
 
 // TestBuildSetupScriptData_plainNIC verifies that a plain NIC passes through
-// unchanged — the bridge fix must not alter non-bridge setups.
+// unchanged — the bridge/bond/VLAN fix must not alter non-virtual-iface setups.
 func TestBuildSetupScriptData_plainNIC(t *testing.T) {
 	ni := minNetInfo() // Interface = "eth0", no BridgePorts
 
@@ -340,6 +343,9 @@ func TestBuildSetupScriptData_plainNIC(t *testing.T) {
 	if data.NetInterface != "eth0" {
 		t.Errorf("NetInterface = %q; want eth0", data.NetInterface)
 	}
+	if data.GrubInterface != "eth0" {
+		t.Errorf("GrubInterface = %q; want eth0", data.GrubInterface)
+	}
 	if !strings.Contains(data.InitramfsScript, `IFACE="eth0"`) {
 		t.Error("initramfs script should reference eth0")
 	}
@@ -349,8 +355,8 @@ func TestBuildSetupScriptData_plainNIC(t *testing.T) {
 
 // TestBuildSetupScriptData_bond verifies that a bond interface generates an
 // initramfs script that creates the bond, sets the mode, and enslaves the
-// physical NICs. The bond name passes through unchanged (no substitution like
-// bridge).
+// physical NICs. NetInterface stays bond0 (for driver detection); GrubInterface
+// uses the first slave (physical NIC for GRUB ip= at kernel boot).
 func TestBuildSetupScriptData_bond(t *testing.T) {
 	ni := minNetInfo()
 	ni.Interface = "bond0"
@@ -363,7 +369,10 @@ func TestBuildSetupScriptData_bond(t *testing.T) {
 	}
 
 	if data.NetInterface != "bond0" {
-		t.Errorf("NetInterface = %q; want bond0", data.NetInterface)
+		t.Errorf("NetInterface = %q; want bond0 (for driver detection)", data.NetInterface)
+	}
+	if data.GrubInterface != "eth0" {
+		t.Errorf("GrubInterface = %q; want eth0 (first bond slave for GRUB ip=)", data.GrubInterface)
 	}
 	if !strings.Contains(data.InitramfsScript, "modprobe bonding") {
 		t.Error("initramfs script missing 'modprobe bonding'")
@@ -387,7 +396,8 @@ func TestBuildSetupScriptData_bond(t *testing.T) {
 
 // TestBuildSetupScriptData_vlan verifies that a VLAN interface generates an
 // initramfs script that loads the 8021q module, brings up the physical parent
-// NIC, and creates the VLAN interface with the correct ID.
+// NIC, and creates the VLAN interface with the correct ID. GrubInterface uses
+// the physical parent NIC (not the VLAN) for the GRUB ip= kernel parameter.
 func TestBuildSetupScriptData_vlan(t *testing.T) {
 	ni := minNetInfo()
 	ni.Interface = "eth0.100"
@@ -400,7 +410,10 @@ func TestBuildSetupScriptData_vlan(t *testing.T) {
 	}
 
 	if data.NetInterface != "eth0.100" {
-		t.Errorf("NetInterface = %q; want eth0.100", data.NetInterface)
+		t.Errorf("NetInterface = %q; want eth0.100 (for driver detection)", data.NetInterface)
+	}
+	if data.GrubInterface != "eth0" {
+		t.Errorf("GrubInterface = %q; want eth0 (VLAN physdev for GRUB ip=)", data.GrubInterface)
 	}
 	if !strings.Contains(data.InitramfsScript, "modprobe 8021q") {
 		t.Error("initramfs script missing 'modprobe 8021q'")
@@ -425,7 +438,7 @@ func TestBuildSetupScriptData_vlan(t *testing.T) {
 
 // TestBuildSetupScriptData_vlanOnBond verifies that a VLAN interface stacked on
 // top of a bond generates an initramfs script that sets up the bond, then the
-// VLAN on top of it.
+// VLAN on top of it. GrubInterface uses the bond slave (physical NIC) for GRUB ip=.
 func TestBuildSetupScriptData_vlanOnBond(t *testing.T) {
 	ni := minNetInfo()
 	ni.Interface = "bond0.100"
@@ -440,7 +453,10 @@ func TestBuildSetupScriptData_vlanOnBond(t *testing.T) {
 	}
 
 	if data.NetInterface != "bond0.100" {
-		t.Errorf("NetInterface = %q; want bond0.100", data.NetInterface)
+		t.Errorf("NetInterface = %q; want bond0.100 (for driver detection)", data.NetInterface)
+	}
+	if data.GrubInterface != "eth0" {
+		t.Errorf("GrubInterface = %q; want eth0 (bond slave for GRUB ip=)", data.GrubInterface)
 	}
 	if !strings.Contains(data.InitramfsScript, "modprobe bonding") {
 		t.Error("initramfs script missing 'modprobe bonding'")
