@@ -194,6 +194,17 @@ func buildSetupScriptData(cfg *config.Config, keys *keygen.Keys, netInfo *Networ
 		return templates.SetupScriptData{}, fmt.Errorf("validate network fields: %w", err)
 	}
 
+	// netInterfaceForDetection is used in the setup script's driver detection
+	// block (ls /sys/class/net/<NIC>/...). It must be an interface that actually
+	// exists in sysfs on the *remote server* at ubo-run time.
+	// For VLAN-on-bond: initramfsInterface is "ens3.100" (which we'll create in
+	// initramfs) but sysfs on the server only has "bond0.100" — so use that instead.
+	netInterfaceForDetection := initramfsInterface
+	if len(netInfo.BondSlaves) > 0 && netInfo.VLANPhysdev != "" {
+		// VLAN-on-bond: the real sysfs NIC is bond0.100, not ens3.100.
+		netInterfaceForDetection = netInfo.Interface
+	}
+
 	return templates.SetupScriptData{
 		WGServerConf:    wgServerINI,
 		InitramfsHook:   templates.InitramfsHookTmpl,
@@ -205,7 +216,7 @@ func buildSetupScriptData(cfg *config.Config, keys *keygen.Keys, netInfo *Networ
 		NetGateway:      netInfo.Gateway,
 		NetMask:         prefixToNetmask(netInfo.Prefix),
 		NetHostname:     netInfo.Hostname,
-		NetInterface:    initramfsInterface,
+		NetInterface:    netInterfaceForDetection,
 		GrubInterface:   grubIface,
 	}, nil
 }

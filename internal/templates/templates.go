@@ -490,7 +490,15 @@ elif ls /sys/class/net/"$_NIC"/lower_* >/dev/null 2>&1; then
     _add_mod 8021q
     for _lw in /sys/class/net/"$_NIC"/lower_*; do
         _pd=$(basename "$(readlink "$_lw" 2>/dev/null)" 2>/dev/null || true)
-        [ -n "$_pd" ] && _add_mod "$(_drv_for "$_pd")"
+        [ -n "$_pd" ] || continue
+        if [ -f /sys/class/net/"$_pd"/bonding/slaves ]; then
+            _add_mod bonding
+            for _sl in $(cat /sys/class/net/"$_pd"/bonding/slaves 2>/dev/null); do
+                _add_mod "$(_drv_for "$_sl")"
+            done
+        else
+            _add_mod "$(_drv_for "$_pd")"
+        fi
     done
 else
     _add_mod "$(_drv_for "$_NIC")"

@@ -452,9 +452,10 @@ func TestBuildSetupScriptData_vlanOnBond(t *testing.T) {
 		t.Fatalf("buildSetupScriptData: %v", err)
 	}
 
-	// NetInterface is the slave VLAN (eth0.100) for driver detection.
-	if data.NetInterface != "eth0.100" {
-		t.Errorf("NetInterface = %q; want eth0.100 (slave NIC VLAN, no bond in initramfs)", data.NetInterface)
+	// NetInterface is the real sysfs interface (bond0.100) for driver detection —
+	// ens3.100 doesn't exist in sysfs on the remote server at ubo-run time.
+	if data.NetInterface != "bond0.100" {
+		t.Errorf("NetInterface = %q; want bond0.100 (real sysfs NIC for driver detection)", data.NetInterface)
 	}
 	if data.GrubInterface != "eth0" {
 		t.Errorf("GrubInterface = %q; want eth0 (bond slave for GRUB ip=)", data.GrubInterface)
